@@ -23,10 +23,21 @@ objects, return candidates and ask for disambiguation rather than guessing.
 ## Coordinate rules
 
 - Positions are TTS world coordinates in `{x, y, z}` order.
+- For Kill Team, `x` and `z` form the horizontal combat-zone plane; `y` is
+  height above the board plane. Rules distance uses calibrated game inches,
+  not raw world units.
 - Rotations are Euler angles in degrees unless a tool explicitly says otherwise.
 - Object centers are not object extents; use bounds for placement decisions.
 - Smooth movement can mean the immediate response is a target state, not yet a
   settled physical state.
+
+## Semantic game actions
+
+Game-specific adapters should expose intent-level actions such as
+`move_operative`, `shoot`, `roll_attack_dice`, `score_objective`, `gain_cp`,
+and `spend_cp`. These actions validate rules and state before translating into
+bounded TTS mutations. Raw GUID-based movement and counter writes remain
+bridge primitives, not the gameplay API.
 
 ## Safety classes
 

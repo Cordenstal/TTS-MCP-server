@@ -10,6 +10,8 @@ tool contracts, safety boundaries, or roadmap priorities change.
 - [Roadmap](roadmap.md) — prioritized ongoing goals and implementation order.
 - [Architecture](architecture.md) — process boundaries and data flow.
 - [API and rules](api-and-rules.md) — tool-contract and domain-knowledge plan.
+- [Kill Team opponent](killteam.md) — agreed hidden-information opponent
+  architecture and first vertical slice.
 - [Observation and spatial reasoning](observation-and-visuals.md) — structured
   state, screenshots, and exact object location.
 - [Development workflow](development.md) — how to change, test, and verify the

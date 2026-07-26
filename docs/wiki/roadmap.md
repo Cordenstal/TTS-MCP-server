@@ -178,6 +178,30 @@ Completion criteria:
 - `[next]` Run an opt-in live Save 128 full-game validation and calibrate search
   depth/time against the local AI backend and TTS physics.
 
+## 11. Kill Team semantic opponent — planned
+
+The first high-level game adapter targets the `Kill Team 3.0 Quick and Easy`
+variant and the canonical `TS_Save_129.json` fixture. The complete design is
+recorded in [the Kill Team wiki page](killteam.md) and [ADR-0009](../adr/0009-killteam-semantic-opponent.md).
+
+- `[planned]` Implement the agreed AI-opponent role, hidden-information boundary, and
+  host-adjudication policy.
+- `[planned]` Implement tagged setup discovery, AI-side dice/counters, map
+  calibration, mutable terrain, and player-perspective observation.
+- `[planned]` Define the versioned Kill Team state schema and event types.
+- `[planned]` Build setup ingestion and fail-closed invariant validation.
+- `[planned]` Add role-filtered structured observations and approved camera
+  views for activation/attack preparation.
+- `[planned]` Implement calibrated combat-zone geometry, terrain overrides,
+  LOS/range queries, map revisions, and evidence capture.
+- `[planned]` Implement the typed rules adapter for one ranged activation.
+- `[planned]` Implement semantic movement, shooting, dice rolling, saves,
+  damage, wounds, resources, and scoring projections.
+- `[planned]` Add human-event reconciliation, host rulings, uncertain-commit
+  recovery, and action idempotency.
+- `[planned]` Validate all of the above against a deterministic fake bridge,
+  then run opt-in live-TTS smoke tests with the canonical fixture.
+
 ## Later implementation order
 
 After the generic MVP is stable, build in this order unless a production issue
@@ -192,6 +216,8 @@ changes the priority:
 7. Add game setup and invariant validators.
 8. Add high-level placement tools.
 9. Add snapshots, rollback, and asynchronous jobs.
+10. Add the Kill Team setup, observation, rules, semantic-action, and
+    reconciliation vertical slice described in section 11.
 
 Every step should update the relevant wiki page, README tool inventory, Lua
 dispatcher, Python tests, and live-TTS validation notes where applicable.

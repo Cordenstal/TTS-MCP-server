@@ -44,6 +44,18 @@ the live TTS object model and must remain an explicit allowlisted dispatcher.
 belongs in the wiki/API reference layer; game rules must remain separately
 scoped so they do not contaminate generic tool behavior.
 
+### Kill Team adapter
+
+The Kill Team opponent is a role-specific adapter over the generic control
+plane. Its detailed contract is in [Kill Team opponent](killteam.md) and the
+decision record is [ADR-0009](../adr/0009-killteam-semantic-opponent.md).
+
+The adapter owns a versioned canonical state, hidden-information projection,
+typed rules validation, semantic actions, map/line-of-sight revisions, and
+event reconciliation. TTS remains the physical projection. The AI may inspect
+its player-perspective object list and approved camera views, but neither raw
+TTS saves nor unrestricted object queries may bypass visibility rules.
+
 ## Request lifecycle
 
 ```text

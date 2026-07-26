@@ -10,6 +10,9 @@ game_rules/
   chess/
     README.md
     rules.md
+  killteam/
+    README.md
+    rules.md
   go/
     README.md
     rules.md
@@ -41,3 +44,10 @@ The AI uses that file as the rules authority and plays as a participant; it is
 not a D&D Dungeon Master or a general-purpose narrator. Add the game's board
 mapping, AI side, turn detection, legal-move rules, visibility limits, and
 TTS-specific action mapping here.
+
+For Kill Team, the executable rules adapter is authoritative for legality;
+`rules.md` is a host-managed context/reference for the selected
+`Kill Team 3.0 Quick and Easy` variant. It must document the setup contract,
+turning points, phases, visibility, terrain conventions, semantic actions,
+dice workflow, scoring, and uncertainty/ruling behavior without embedding
+concealed opponent state.

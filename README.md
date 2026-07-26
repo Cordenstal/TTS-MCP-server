@@ -170,6 +170,16 @@ plain-text files. PDF extraction and retrieval-augmented generation (RAG) can
 be added later for complex or extensive rule systems while preserving
 read-only, host-managed access.
 
+### Kill Team opponent
+
+The first planned high-level game adapter targets the `Kill Team 3.0 Quick and
+Easy` variant represented by the canonical `TS_Save_129.json` fixture. The AI
+plays one side as an opponent using role-filtered observations, a versioned
+canonical state, executable rules, semantic actions, tagged dice/counters,
+and map/line-of-sight validation. It may inspect the table like a player, but
+hidden opponent state is never exposed. See the [Kill Team design](docs/wiki/killteam.md)
+and [ADR-0009](docs/adr/0009-killteam-semantic-opponent.md).
+
 ## 1. Install the Python environment
 
 From PowerShell:

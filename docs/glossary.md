@@ -36,6 +36,36 @@ or an on-demand screenshot.
 A state-changing operation, such as moving, rotating, spawning, locking,
 destroying, naming an object, changing the camera, or broadcasting chat.
 
+## Semantic game action
+
+An intent-level action defined by a game adapter, such as Kill Team
+`move_operative` or `shoot`. The adapter validates it against canonical game
+state and translates it into bounded TTS mutations.
+
+## Canonical game state
+
+The versioned, runtime-owned representation of rules state, visibility,
+entities, resources, objectives, and event history. TTS is a physical
+projection of this state for game-specific adapters.
+
+## Visibility projection
+
+A role-filtered view of canonical state. It determines which structured
+objects, private values, last-known facts, and camera observations a
+participant may receive.
+
+## Map revision
+
+The version identifier for a combat-zone geometry model. Terrain or objective
+changes create a new revision and invalidate dependent spatial results such as
+line of sight.
+
+## Rules gap
+
+A mechanic or interpretation not covered by the selected executable ruleset.
+The runtime pauses and requests a host ruling instead of allowing the AI to
+guess.
+
 ## Hidden information
 
 Game state that should not automatically be visible to every participant,
