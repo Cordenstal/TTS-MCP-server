@@ -62,6 +62,21 @@ is normal gameplay and does not require host approval. Keep captured pieces
 neatly grouped by color so the capture state remains visually legible during
 reconciliation.
 
+## Tabletop Simulator move execution
+
+The board has one invisible locked `LayoutZone` for every square, tagged
+`A1` through `H8`. These tags are the authoritative destinations for chess
+moves. Treat tags case-insensitively: `A1` means a1, `E4` means e4, and so on.
+
+For a normal piece move, call `tts_place_in_tagged_zone` with the moving piece
+GUID as `target_guid` and the destination square as `zone_tag`, for example
+`zone_tag: "E4"`. Do not calculate or supply world-space X/Z coordinates for
+chess moves. The tool resolves the unique tagged LayoutZone and moves the piece
+to its center. Verify the returned live position before continuing.
+
+Use the same operation for castling's king and rook as two coordinated
+placements. Move captured pieces off-board as described above.
+
 ## Special moves
 
 - Castling is permitted only if the king and involved rook have not moved,
@@ -120,8 +135,9 @@ the players how to proceed.
 - Use human-readable piece names such as `White King` and `Black Pawn`.
 - Use piece tags such as `chess-piece white king` and
   `chess-piece black pawn`.
-- Use square tags such as `chess-square e4`; square names may mirror the
-  algebraic coordinate (`e4`) when practical.
+- Use invisible square zones tagged `A1` through `H8` as the canonical
+  destinations. Optional metadata tags such as `chess-square e4` may also be
+  present, but are not required when the LayoutZone tags exist.
 - Treat tag matching as case-insensitive; the lowercase forms shown here are
   canonical for documentation and diagnostics.
 - Treat tags as canonical and names as display/fallback metadata.

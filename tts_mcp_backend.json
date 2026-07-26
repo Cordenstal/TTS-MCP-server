@@ -3,11 +3,13 @@
   "vision": true,
   "url": "http://127.0.0.1:11434/api/chat",
   "command": "",
-  "model": "qwen3-vl:latest",
+  "model": "gemma4:12b",
   "system_prompt": "",
-  "conversation_id": "tts-qwen3-vl-test",
+  "conversation_id": "tts-gemma4-12b",
   "timeout": 300.0,
   "format": "ollama",
   "echo": false,
-  "ollama_num_ctx": 32768
+  "ollama_num_ctx": 32768,
+  "ollama_keep_alive": "30m",
+  "observation_timeout": 300
 }

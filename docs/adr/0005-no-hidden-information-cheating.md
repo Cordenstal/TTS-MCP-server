@@ -13,8 +13,9 @@ players.
 
 ## Decision
 
-The AI must not view or receive other players' hidden, private, or concealed
-information. Camera movement, screenshots, object inspection, chat handling,
+The configured control-plane player identity (Blue by default) must not view or
+receive other players' hidden, private, or concealed information. Camera
+movement, screenshots, object inspection, chat handling,
 rules retrieval, and future RAG integrations must preserve this boundary.
 
 The AI may receive a private message addressed to Player 2/Blue. It must not
@@ -29,6 +30,10 @@ instruct the model to ignore information after exposure. If the bridge cannot
 reliably determine whether an observation is permitted, it must omit the
 observation and ask the players or host for clarification.
 
+The generic control plane has no host-only privileged-observer mode. Host
+identity does not override the visibility boundary; any cooperative exception
+must be designed as an explicit game-specific capability with its own policy.
+
 ## Consequences
 
 Screenshot capture may require visibility-aware framing or redaction. Generic
@@ -39,5 +44,3 @@ The AI may have less information than a host, by design.
 ## Open questions
 
 - Which TTS visibility/ownership signals can the bridge enforce reliably?
-- Should the host be able to temporarily grant access for cooperative games?
-- Should the AI be able to send private messages to individual players?

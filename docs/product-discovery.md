@@ -241,5 +241,39 @@ autonomy, and auditability.
 - Decision: implementation proceeds through SQLite sessions/audit, rules MCP
   tools, host chat controls/queues, chess mapping validation, autonomous turn
   loop, and smoke-test verification in that order.
-- Next question: begin implementation of the first vertical slice or continue
-  grilling a specific subsystem.
+### 2026-07-25
+
+- Decision: the primary product is a safe MCP control plane for explicit,
+  bounded inspection and manipulation of live TTS scenes, not a generic
+  autonomous game-playing framework.
+- Decision: bounded scene action plans are first-class, but plans are
+  scene-only, exclusive, fail-fast, capped at 20 steps and 60 seconds, and
+  never automatically rolled back or queued behind another plan.
+- Decision: reversible MVP mutations are limited to moving, rotating,
+  renaming, and locking/unlocking existing visible objects.
+- Decision: natural-language references are read-only discovery hints;
+  mutations require a current, unique exact GUID and just-in-time
+  preconditions.
+- Decision: numeric postconditions use 0.05 world-unit position tolerance and
+  1-degree-per-axis rotation tolerance by default; callers may request only
+  stricter tolerances.
+- Decision: Blue is the default control-plane identity. Host-only identity
+  changes occur only at plan/session boundaries and invalidate pending work.
+- Decision: visibility filtering is defense-in-depth and deny-by-uncertainty
+  before MCP or gateway exposure; host identity does not grant a generic
+  privileged-observer mode.
+- Decision: destructive exceptions are host-managed, versioned, and audited;
+  the first allowed exception is plan-scoped cleanup of objects created by
+  that plan, never pre-existing objects.
+- Decision: save editing/loading, chat/HTTP gateway, camera/screenshots,
+  spawning/destruction, game rules, and arbitrary Lua are outside the MVP and
+  require separate capabilities.
+- Decision: results and failures carry versioned schemas, freshness metadata,
+  stable failure classes, and audit correlation. Audit records remain in
+  local SQLite until explicit host-controlled cleanup.
+- Decision: restart or uncertain bridge state enters read-only recovery;
+  unknown commits are never retried automatically.
+- Decision: validation uses deterministic fake-bridge tests by default and
+  opt-in live-TTS smoke tests against a dedicated game-neutral fixture.
+- Decision: implementation begins with the capability registry and schemas,
+  then the fake bridge, executor, compatibility tests, and live fixture.

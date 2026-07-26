@@ -13,8 +13,15 @@ include destroying objects, spawning objects, and changing broad scene state.
 ## Decision
 
 Destructive or broad-scene actions require explicit host approval before the
-MCP server sends them to TTS. The policy applies during autonomous play and
+MCP server sends them to TTS unless a separately defined safety condition
+authorizes the specific action. The policy applies during autonomous play and
 remains in force until intentionally revised.
+
+The first condition-authorized exception is plan-scoped cleanup: a bounded
+plan may destroy an object it created itself when the object is identified by
+an exact GUID or creation token, still matches the plan's expected state, and
+did not exist before the plan began. This exception does not authorize
+destruction of pre-existing objects or broader cleanup.
 
 Normal in-game actions that implement the selected rules are not treated as
 destructive scene actions. For chess, a capture moves the captured piece off

@@ -3,6 +3,7 @@ setlocal EnableExtensions
 title TTS MCP Server - Quick Start
 
 cd /d "%~dp0"
+call "%~dp0stop_existing_servers.bat"
 set "PYTHON=python"
 if exist "%~dp0.venv\Scripts\python.exe" (
     set "PYTHON=%~dp0.venv\Scripts\python.exe"
@@ -39,6 +40,8 @@ if errorlevel 1 (
 echo Starting gateway-only server in this window...
 set "TTS_GATEWAY_ONLY=1"
 set "AI_CHAT_HISTORY_TURNS=12"
+if not defined TTS_TRACE set "TTS_TRACE=1"
+if not defined PYTHONUNBUFFERED set "PYTHONUNBUFFERED=1"
 if not exist "%~dp0tts_mcp_backend.json" (
     echo Configuring direct Ollama backend...
     set "AI_BACKEND_KIND=http"
@@ -49,6 +52,7 @@ if not exist "%~dp0tts_mcp_backend.json" (
 )
 echo Open the AI control panel at http://127.0.0.1:8765/admin
 echo Runtime traces are written under .tmp\.
+echo This console will show live AI and TTS trace events.
 echo.
 "%PYTHON%" "%~dp0server.py"
 set "SERVER_EXIT=%ERRORLEVEL%"

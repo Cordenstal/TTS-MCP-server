@@ -31,6 +31,23 @@ Global Lua bridge (tts_mcp_global.lua)
 TTS must run on the same Windows computer as this MCP server because the
 External Editor API is localhost-only.
 
+## Current product boundary
+
+The core product is a safe MCP control plane for explicit, bounded,
+game-neutral scene inspection and manipulation. The MVP proves visibility-safe
+structured reads and verified reversible actions on existing visible objects:
+move, rotate, rename, and lock/unlock.
+
+Blue is the default control-plane identity, but identity is explicitly
+configurable. Mutations require a current exact GUID, just-in-time
+preconditions, serialized fail-fast plans, and verified post-state. Hidden or
+ambiguous observations are denied before they reach the MCP client.
+
+Chat/HTTP integration, camera and screenshots, game rules, container/zone
+operations, spawning/destruction, save-file administration, and arbitrary Lua
+are separate adapters or later capabilities. See the [implementation plan](docs/implementation-plan.md)
+and [roadmap](docs/wiki/roadmap.md) for their validation boundaries.
+
 ## Included MCP tools
 
 Read tools:
@@ -56,6 +73,7 @@ Read tools:
 - `tts_validate_zone_occupancy`
 - `tts_place_adjacent_to`
 - `tts_place_in_zone`
+- `tts_place_in_tagged_zone` (place a piece at an invisible tagged board square, such as chess `E4`)
 - `tts_align_to_object`
 - `tts_get_scene_summary`
 - `tts_capture_view_info`
@@ -63,6 +81,7 @@ Read tools:
 - `tts_focus_object_and_capture`
 - `tts_wait_for_object_settle`
 - `tts_get_object`
+- `tts_list_objects`
 - `tts_capture_view`
 - `tts_recent_chat`
 - `tts_wait_for_chat`
@@ -75,12 +94,14 @@ Read tools:
 - `tts_get_session`
 - `tts_checkpoint_session`
 - `tts_audit_events`
+- `tts_inspect_save_file`
 
 Write tools:
 
 - `tts_set_camera`
 - `tts_set_camera_and_capture`
 - `tts_move_object`
+- `tts_move_checkers_piece` (validated black-piece movement; accepts tagged square zones such as `A1`)
 - `tts_rotate_object`
 - `tts_set_object_name`
 - `tts_set_object_lock`
@@ -88,6 +109,8 @@ Write tools:
 - `tts_destroy_object`
 - `tts_broadcast`
 - `tts_execute_action_plan`
+- `tts_edit_save_file`
+- `tts_load_save_file`
 
 `tts_get_scene_summary` provides a bounded complete-scene snapshot with rich
 object summaries including bounds, motion state, velocities, transform axes,
@@ -108,6 +131,31 @@ results are retained in a bounded in-memory cache and replayed without repeating
 the TTS mutations.
 
 The initial version intentionally does not expose arbitrary Lua execution.
+
+### Numbered save editing and GUI loading
+
+`tts_inspect_save_file` reads the default numbered save
+`C:\Users\Gaming\Documents\My Games\Tabletop Simulator\Saves\TS_Save_128.json`
+without changing it. `tts_edit_save_file` accepts bounded JSON Pointer
+`add`/`replace`/`remove` operations. A real write requires
+`allow_irreversible=true` and creates a timestamped sibling backup before the
+file is atomically replaced; use `dry_run=true` to preview the hashes first.
+
+`tts_load_save_file` then uses Windows GUI automation to open the TTS Games
+menu, choose Save & Load, search for the numbered save, select it, and confirm
+the load. Because TTS renders this menu in Unity rather than exposing stable
+Windows controls, the tool requires four coordinate pairs relative to the
+detected TTS window: `games_button`, `save_load_button`, `search_box`, and
+`result_row`. The confirmation button is optional; when omitted, Enter is sent
+to the confirmation dialog. Loading requires `allow_irreversible=true`, and
+the result reports whether a post-load External Editor script-state callback
+was observed. The callback does not identify the save filename, so the tool
+also verifies that the edited file hash stayed unchanged during loading.
+
+The documented TTS External Editor API does not provide a command to load an
+arbitrary save from disk; this GUI layer is intentionally explicit and
+coordinate-configured for that reason. Keep TTS focused and do not interact
+with the mouse or keyboard while the load tool is running.
 
 Persistent AI sessions and audit history are stored in a local SQLite database
 at `tts_mcp_sessions.sqlite3` by default. Override the location with
@@ -151,6 +199,7 @@ When `server.py` starts, it also exposes a local HTTP gateway:
 - `GET /health`
 - `POST /chat`
 - `POST /v1/chat`
+- `POST /chat/tool` (bounded read-only observation calls for queue adapters)
 - `POST /v1/ai/commands`
 - `GET /chat/next?timeout=30` (for queue/MCP adapters)
 
@@ -209,20 +258,27 @@ Other messages beginning with `!ai` are explicit questions for the configured
 AI backend, such as `!ai check the state of the board`; they are not treated as
 unknown lifecycle commands.
 
-When a selected game is running, each AI request receives a best-effort live
-board context. The context includes tagged object GUIDs, names, tags,
-positions, rotations, and lock state. With `AI_GAME_VISION=1` (the default),
-the gateway also moves the configured TTS camera and attaches a JPEG snapshot
-for vision-capable backends. Configure the screen rectangle and camera with
-`AI_VISION_LEFT`, `AI_VISION_TOP`, `AI_VISION_WIDTH`, `AI_VISION_HEIGHT`,
-`AI_VISION_PLAYER_COLOR`, `AI_VISION_X`, `AI_VISION_Y`, `AI_VISION_Z`,
-`AI_VISION_PITCH`, `AI_VISION_YAW`, and `AI_VISION_DISTANCE`. Structured tags
-remain the authoritative source for exact piece identity; the image helps a
-vision model resolve the visible board and verify the mapping.
+Chat requests begin without an object list or screenshot. The configured AI
+backend receives an allowlisted read-only tool registry and may request
+targeted object lookup/search, zone contents, a bounded scene summary, or the
+current view when that evidence is needed. Image review is deliberate and is
+limited to one screenshot per turn; failed object lookup does not automatically
+capture an image. Tool calls are sequential but bounded by 4 calls and 300
+seconds by default; configure these limits with
+`AI_OBSERVATION_MAX_CALLS` and `AI_OBSERVATION_TIMEOUT`. AI-requested TTS
+observations use a separate 300-second transport limit via
+`AI_OBSERVATION_TTS_TIMEOUT`. Results are compacted
+and ephemeral, and only the final natural-language response reaches TTS chat.
+Screenshots capture the current view without moving a player's camera;
+structured object data remains authoritative for exact identity and
+coordinates. Backends with native tool calling use it directly. Generic and
+CLI backends use the strict JSON fallback described in the gateway prompt.
 
-For direct local Ollama use the native chat HTTP endpoint. Native Ollama vision
-requests carry screenshots in the `images` base64 array, which avoids relying
-on OpenAI-compatibility translation:
+For direct local Ollama use the native chat HTTP endpoint. The gateway sends
+`keep_alive: "30m"` by default so the model remains loaded between requests;
+override it with `OLLAMA_KEEP_ALIVE` or the admin panel's Ollama keep-alive
+field. Native Ollama vision requests carry screenshots in the `images` base64
+array, which avoids relying on OpenAI-compatibility translation:
 
 ```powershell
 $env:AI_BACKEND_KIND = "http"
@@ -247,21 +303,32 @@ $env:AI_BACKEND_KIND = "queue"
 ```
 
 External adapters can long-poll `GET /chat/next?timeout=30`; the response
-contains `pending`, an `id`, and the original `payload`. The MCP chat tools are
-the preferred Codex integration because they preserve the MCP session.
+contains `pending`, an `id`, the original `payload`, the tool registry, and the
+observation budget. They can execute an allowlisted observation through
+`POST /chat/tool` with `{"name":"tts_search_scene","arguments":{...}}`.
+The MCP chat tools remain the preferred Codex integration because they preserve
+the MCP session.
 
-### D&D gameplay layer
+### General game-opponent layer
 
 When a game is selected with `!ai game <name>`, the gateway loads
-`game_rules/<name>/rules.md` and builds an intent-aware gameplay prompt. It
-uses only live top-level TTS object summaries for scene/search context. AI
+`game_rules/<name>/rules.md` and builds an intent-aware opponent prompt. The AI
+acts as a normal participant playing the selected game, not as a D&D Dungeon
+Master or narrator. The selected rules file is authoritative; if the AI cannot
+identify its side, the active turn, or a legal action, it asks for clarification
+instead of guessing. It requests live scene/search context through the
+allowlisted observation tools. AI
 responses may contain only these bounded commands:
 `SPAWN`, `PLACE`, `MOVE`, `ROTATE`, `LOCK`, `UNLOCK`, `SPAWN_BUILTIN`,
 `BROADCAST`, and `DESTROY`. Catalog-based `SPAWN` and `PLACE` resolution is
 disabled; use live object GUIDs or built-in object spawning. Safe commands execute only while `!ai` is running; destructive
 commands become persisted host approvals. Executed move/rotate/lock commands
-are read back from TTS and retried up to `AI_COMMAND_RETRIES` times when
-verification fails.
+are read back from TTS. A failed action is an uncertainty stop: the gateway
+does not automatically retry it or execute later actions from the same
+response. If a move is more than 0.5 TTS world units from its expected
+position on any axis, the gateway captures a visual review for the AI; the
+resulting failure is reported in player chat and the gateway waits for further
+player instructions.
 
 For a backend that expects the original request body instead of chat-completion
 messages, set `AI_BACKEND_FORMAT=generic`. Use `AI_BACKEND_ECHO=1` to test the
@@ -277,6 +344,23 @@ machine-readable JSON-lines sidecar is written to `.tmp/tts_mcp_trace.jsonl` by
 default and can be changed with `TTS_TRACE_JSON_LOG`. Inspect recent records
 through the `tts_recent_trace` tool. Set `TTS_TRACE=0` to disable tracing or
 set `TTS_TRACE_LOG` to choose another human-readable log path.
+Trace writes are asynchronous and best-effort: a locked or slow log file never
+blocks TTS chat, bridge callbacks, or the HTTP gateway.
+
+The Windows `quick_start.bat` console keeps tracing enabled by default and
+shows live TTS, AI-message, backend-request, and AI-response events. When
+running `bridge_supervisor.py`, the child server's trace stderr is mirrored to
+the supervisor console while MCP protocol output remains in
+`tts_mcp_server.log`.
+The live console uses compact one-line summaries; full structured payloads
+remain in `.tmp/tts_mcp_trace.jsonl` for detailed debugging.
+Player chat contains only the AI response text. Bridge diagnostics and HTTP
+errors stay in the server trace; set `MCP_DEBUG_PRINT = true` in the Lua
+bridge only when Lua-side troubleshooting is specifically needed.
+MCP responses use both `sendExternalMessage` and a private localhost HTTP
+callback for compatibility with TTS builds that drop custom-message callbacks.
+Neither transport is forwarded to player chat; scene/object data remains in
+the Python trace and the AI tool result only.
 
 With echo mode enabled, verify the gateway before opening TTS:
 
@@ -299,8 +383,10 @@ be tested directly from PowerShell. Normal `python server.py` startup should
 be performed by the MCP client, not by typing into an interactive terminal.
 
 On Windows, double-click `quick_start.bat` for the TTS-only launch in a new
-console window. Use `quick_restart.bat` to stop the existing gateway on port
-8765 and start it again. Both scripts prefer `.venv\Scripts\python.exe`.
+console window. Startup first stops existing listeners on ports 8765/8770 and
+older TTS MCP Python processes from this workspace, then starts one fresh
+instance. Use `quick_restart.bat` for the same clean restart. Both scripts
+prefer `.venv\Scripts\python.exe`.
 If Hermes is installed and no `tts_mcp_backend.json` exists, quick start uses
 `hermes_tts_backend.py` automatically; otherwise configure an HTTP, command,
 or queue backend explicitly through `/admin`.
@@ -354,7 +440,8 @@ python bridge_supervisor.py
 Open `http://127.0.0.1:8770/admin`. **Stop all bridge processes** terminates
 the managed `server.py` process and its children; the supervisor remains alive
 so Start and Restart continue to work. The supervisor launches the MCP server
-on its normal ports and writes child output to `tts_mcp_server.log`.
+on its normal ports, mirrors the live trace to the supervisor console, and
+writes child output to `tts_mcp_server.log`.
 
 ## 2. Install the bridge in Tabletop Simulator
 
@@ -484,7 +571,7 @@ handlers as described in `tts_mcp_global.lua`.
 - Dice rolling and result collection
 - Save-state snapshots and restore
 - Script update tools with diff/approval safeguards
-- Game-specific tools for D&D initiative, movement, fog, and encounter state
+- Game-specific tools for supported games, including turn state, movement, and rule validation
 
 ## Primary documentation
 

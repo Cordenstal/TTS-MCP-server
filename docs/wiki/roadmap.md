@@ -19,7 +19,32 @@ Status labels:
 - Preserve request IDs, callback semantics, and compatibility with existing
   Global scripts.
 
-## 1. Current foundation
+## 1. Safe generic control-plane MVP — current priority
+
+- `[done]` Select the product boundary: explicit MCP scene control, not
+  autonomous generic game play.
+- `[done]` Define visibility-safe observations, configurable player identity,
+  exact-GUID mutation, scene epochs, and fail-closed uncertainty behavior.
+- `[done]` Define scene-only, fail-fast plans with single-owner serialization,
+  20-step/60-second budgets, durable idempotency, and post-state verification.
+- `[next]` Build the capability registry and versioned result/error schemas.
+- `[next]` Add the deterministic fake bridge and policy-focused test fixture.
+- `[next]` Implement the MVP reversible action set: move, rotate, rename, and
+  lock/unlock existing visible objects.
+- `[next]` Add Python/Lua compatibility tests and opt-in live-TTS validation.
+
+Completion criteria:
+
+1. A client can inspect visible structured state and resolve one object
+   uniquely.
+2. A bounded plan can perform one reversible action and return verified
+   post-state with freshness metadata.
+3. Ambiguity, hidden state, stale preconditions, concurrent plans, bridge
+   disconnects, and unknown commits fail closed with stable error classes.
+4. The same contract passes deterministic tests and an opt-in live-TTS smoke
+   test against a dedicated game-neutral fixture.
+
+## 2. Current foundation
 
 - `[done]` `tts_ping`, object listing, object detail, camera, screenshots.
 - `[done]` Move, rotate, name, lock, spawn, destroy, and broadcast actions.
@@ -28,8 +53,11 @@ Status labels:
   state and six-character alphanumeric action IDs.
 - `[done]` Bounded `tts_execute_action_plan` with destructive-action opt-in.
 - `[done]` Compile check and unit tests for action-plan validation.
+- `[done]` Guarded numbered-save inspection/editing with timestamped backups.
+- `[done]` Explicit Windows GUI save loading with bounded coordinate profiles and
+  post-load callback reporting.
 
-## 2. Exact structured observation — next
+## 3. Exact structured observation — next
 
 Make the AI able to answer “where exactly is this object?” without relying on
 an image.
@@ -50,7 +78,7 @@ Completion criteria:
 2. The MCP can distinguish their centers, extents, and nearest neighbors.
 3. A placement request can report overlap, clearance, and final error.
 
-## 3. API knowledge and tool contracts — next
+## 4. API knowledge and tool contracts — next
 
 Give the AI a searchable, local explanation of what the MCP and TTS API can do.
 
@@ -70,7 +98,7 @@ Completion criteria:
 2. The model can determine whether an action is safe and what it returns.
 3. API docs and actual bridge handlers are checked for drift.
 
-## 4. Visual connectivity and verification — next
+## 5. Visual connectivity and verification — next
 
 - `[done]` Add screenshot metadata: rectangle, dimensions, timestamp, output
   size, mean color, contrast, and blank-frame health.
@@ -88,7 +116,7 @@ Completion criteria:
 2. A camera move waits for settlement before capture.
 3. A mutation can return structured and visual verification evidence.
 
-## 5. Reliable action planning
+## 6. Reliable action planning
 
 - `[done]` Add `dry_run` to action plans.
 - `[done]` Add per-step preconditions and postconditions.
@@ -98,7 +126,7 @@ Completion criteria:
 - `[planned]` Add affected-object summaries before and after every plan.
 - `[planned]` Separate reversible, approval-required, and forbidden operations.
 
-## 6. Semantic scene index
+## 7. Semantic scene index
 
 - `[done]` Resolve natural-language references into ranked candidate GUIDs with
   evidence and confidence scores.
@@ -107,7 +135,7 @@ Completion criteria:
 - `[done]` Return ambiguity instead of guessing tied or weak matches.
 - `[done]` Persist aliases in SQLite and support game-scoped roles.
 
-## 7. Game-domain tools
+## 8. Game-domain tools
 
 - `[done]` Inspect and manipulate bounded container contents.
 - `[done]` Read zone occupancy and snap-point definitions.
@@ -116,8 +144,9 @@ Completion criteria:
 - `[done]` Add placement tools for adjacent-to, inside-zone, and align-to.
 - `[next]` Add on-top-of, snap-to-point, stack, and arrange operations.
 
-## 8. Recovery and asynchronous execution — later
+## 9. Recovery and asynchronous execution — later
 
+- `[planned]` Add save-file backup discovery and operator-assisted rollback.
 - `[later]` Scene snapshots for affected objects.
 - `[later]` Rollback for reversible action plans.
 - `[later]` Quarantine workflow for destructive operations.
@@ -125,21 +154,26 @@ Completion criteria:
   multi-frame operations.
 - `[later]` Headless or live-TTS integration fixtures for protocol testing.
 
-## 9. AI-to-game interaction — next
+## 10. AI-to-game interaction — later adapter work
 
 - `[done]` Forward ordinary in-game chat to the configured AI backend.
 - `[done]` Add host-only lifecycle/status controls and persisted approvals.
-- `[done]` Add D&D/game-specific prompt construction and intent-aware context.
+- `[done]` Add game-specific opponent prompt construction and intent-aware context.
 - `[done]` Add bounded AI command parsing with host approval for destruction.
 - `[done]` Add post-command readback verification and bounded retries.
 - `[done]` Serialize AI command execution at persisted autonomous turn boundaries.
+- `[done]` Start player chat without automatic scene lists or screenshots.
+- `[done]` Add a validated, read-only observation tool loop with native and
+  strict-JSON backend protocols, compact ephemeral results, and 4-call/15-second
+  defaults.
 - `[next]` Add priority/FIFO scheduling for multiple queued autonomous turns.
 - `[planned]` Add chess move planning, object mapping, and transition
   verification.
 
-## Implementation order
+## Later implementation order
 
-Build in this order unless a production issue changes the priority:
+After the generic MVP is stable, build in this order unless a production issue
+changes the priority:
 
 1. Expand structured object observation.
 2. Add spatial queries and placement validation.

@@ -55,16 +55,27 @@ SQLite database. The gateway interprets host-only `!ai` lifecycle and approval
 commands, while ordinary chat is forwarded to the configured AI backend for
 proactive participation.
 
+Ordinary chat starts without automatic screenshots or object lists. The
+gateway exposes only bounded, read-only observation tools to the AI backend;
+the backend may request targeted scene data or the current view when needed.
+Tool results are compact and ephemeral, and player-facing chat must contain
+only the final natural-language response.
+
 ## Development guidance
 
 - Keep the Python and Lua bridge action names synchronized.
 - Prefer read/inspect tools before mutating tools.
 - Identify objects by GUID rather than display name alone.
+- For the bundled checkers save, use the game-specific validated movement
+  tool for black pieces; keep `tts_move_object` as an unrestricted primitive.
 - Preserve the existing External Editor callback protocol and request IDs.
 - Do not add arbitrary Lua execution without explicit safeguards and approval.
 - Treat object destruction and broad scene changes as irreversible operations.
 - Keep action plans bounded and allowlisted; do not expose arbitrary Lua through
   batch execution. Require explicit opt-in for destructive plan steps.
+- Player-facing AI chat must contain only non-empty natural-language text. Never
+  print JSON, command syntax, board/state dumps, diagnostic payloads, or blank
+  and whitespace-only responses to the TTS chat.
 - Keep screenshot capture configurable by screen rectangle; do not assume TTS
   is always on the primary monitor in new code.
 - Update this file and `README.md` when adding major tools or changing the

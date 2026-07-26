@@ -6,8 +6,10 @@ import functools
 import json
 import os
 import queue
+import re
 import socket
 import sys
+from statistics import median
 import threading
 import time
 import uuid
@@ -35,6 +37,9 @@ from runtime_trace import (
     recent as _recent_trace,
     snapshot as _trace_value,
 )
+from save_file import apply_operations, inspect_save, resolve_save_path
+from windows_gui import load_save_via_gui
+from gameplay_runtime import checkers_capture_holding_position, should_capture_game_vision
 
 
 class TTSBridgeError(RuntimeError):
@@ -214,6 +219,31 @@ class TTSBridge:
             self._events.append(event)
         session_store.record_event(event_type, data)
 
+    def deliver_response(self, response: dict[str, Any], *, transport: str) -> bool:
+        """Release a pending bridge request from an approved private transport."""
+        request_id = response.get("requestId")
+        if not isinstance(request_id, str) or not request_id:
+            return False
+        with self._pending_guard:
+            waiter = self._pending.get(request_id)
+        if waiter is None:
+            _record_trace(
+                "tts_response_unmatched",
+                trace_id=request_id[:12],
+                transport=transport,
+            )
+            return False
+        try:
+            waiter.put_nowait(response)
+        except queue.Full:
+            return False
+        _record_trace(
+            "tts_response_delivered",
+            trace_id=request_id[:12],
+            transport=transport,
+        )
+        return True
+
     def _handle_message(self, message: dict[str, Any]) -> None:
         _record_trace(
             "tts_inbound",
@@ -236,16 +266,14 @@ class TTSBridge:
                 if isinstance(decoded_custom, dict):
                     custom = decoded_custom
             if isinstance(custom, dict):
-                request_id = custom.get("requestId")
-                if isinstance(request_id, str):
-                    with self._pending_guard:
-                        waiter = self._pending.get(request_id)
-                    if waiter is not None:
-                        try:
-                            waiter.put_nowait(custom)
-                        except queue.Full:
-                            pass
+                self.deliver_response(custom, transport="external_editor")
                 if custom.get("event") == "chat_message":
+                    _record_trace(
+                        "tts_chat_event",
+                        direction="tts_to_python",
+                        message_id=message_id,
+                        message=str(custom.get("message") or "")[:12000],
+                    )
                     with self._events_guard:
                         self._chat_events.append(custom)
                     try:
@@ -271,6 +299,15 @@ class TTSBridge:
 
         if message_id == "2":
             printed = str(message.get("message", ""))
+            # Mirror every TTS print into the bridge trace. This includes
+            # normal/system chat and Lua-side print output; it is diagnostic
+            # output only and is not sent back into the game chat.
+            _record_trace(
+                "tts_print",
+                direction="tts_to_python",
+                message_id=message_id,
+                message=printed,
+            )
             response_prefix = "[tts-mcp-response]"
             if printed.startswith(response_prefix):
                 try:
@@ -278,15 +315,7 @@ class TTSBridge:
                 except json.JSONDecodeError:
                     response = None
                 if isinstance(response, dict):
-                    request_id = response.get("requestId")
-                    if isinstance(request_id, str):
-                        with self._pending_guard:
-                            waiter = self._pending.get(request_id)
-                        if waiter is not None:
-                            try:
-                                waiter.put_nowait(response)
-                            except queue.Full:
-                                pass
+                    self.deliver_response(response, transport="legacy_print")
                     self._record_event("mcp_response_print", response)
                     return
             chat_prefix = "[tts-mcp-chat]"
@@ -309,6 +338,14 @@ class TTSBridge:
                     self._record_event("chat_message", chat)
             self._record_event("tts_print", {"message": printed})
         elif message_id == "3":
+            _record_trace(
+                "tts_lua_error",
+                direction="tts_to_python",
+                message_id=message_id,
+                error=message.get("error", ""),
+                guid=message.get("guid"),
+                prefix=message.get("errorMessagePrefix", ""),
+            )
             self._record_event(
                 "tts_lua_error",
                 {
@@ -414,8 +451,8 @@ class TTSBridge:
                 )
                 recent = self.recent_events(5)
                 raise TTSConnectionError(
-                    f"TTS did not answer action '{action}'. Confirm that "
-                    "tts_mcp_global.lua is installed in the loaded game's Global script. "
+                    f"TTS did not answer action '{action}'. The bridge response timed out; "
+                    "this does not establish whether the Global Lua script is installed. "
                     f"Recent callback events: {json.dumps(recent, default=str)}"
                 ) from exc
         finally:
@@ -711,6 +748,13 @@ CAPABILITY_MANIFEST: list[dict[str, Any]] = [
         "verification": "returned object state then zone query",
     },
     {
+        "name": "tts_place_in_tagged_zone",
+        "category": "placement",
+        "mutates": True,
+        "confirmation": "normal intent; resolve unique destination tag",
+        "verification": "preserved board height, returned zone, and settled object state",
+    },
+    {
         "name": "tts_align_to_object",
         "category": "placement",
         "mutates": True,
@@ -723,6 +767,13 @@ CAPABILITY_MANIFEST: list[dict[str, Any]] = [
         "mutates": True,
         "confirmation": "normal intent; verify post-state",
         "verification": "returned object summary and optional screenshot",
+    },
+    {
+        "name": "tts_move_checkers_piece",
+        "category": "game-domain",
+        "mutates": True,
+        "confirmation": "normal intent; validate live checkers move",
+        "verification": "validated diagonal, final coordinate, and settled state",
     },
     {
         "name": "tts_rotate_object",
@@ -787,6 +838,27 @@ CAPABILITY_MANIFEST: list[dict[str, Any]] = [
         "confirmation": "destructive steps require allow_irreversible=true",
         "verification": "per-step result; use scene summary afterward",
     },
+    {
+        "name": "tts_inspect_save_file",
+        "category": "save-file",
+        "mutates": False,
+        "confirmation": "none",
+        "verification": "JSON parses and returns file hash/object count",
+    },
+    {
+        "name": "tts_edit_save_file",
+        "category": "save-file",
+        "mutates": True,
+        "confirmation": "allow_irreversible=true required to write; backup is created",
+        "verification": "pre/post hashes and backup path are returned",
+    },
+    {
+        "name": "tts_load_save_file",
+        "category": "save-file",
+        "mutates": True,
+        "confirmation": "explicit GUI coordinates and allow_irreversible=true required",
+        "verification": "GUI action result plus post-load bridge event check",
+    },
 ]
 
 _ACTION_PLAN_RESULTS: dict[str, dict[str, Any]] = {}
@@ -846,6 +918,39 @@ def _safe_game_rules_path(game_name: str, relative_path: str = "") -> Path:
     return target
 
 
+def _object_identity(obj: dict[str, Any]) -> str:
+    return " ".join(
+        str(obj.get(key, ""))
+        for key in ("name", "type", "description")
+    ).strip().lower()
+
+
+def _is_square_zone(obj: dict[str, Any]) -> bool:
+    identity = _object_identity(obj)
+    return any(
+        marker in identity
+        for marker in ("layoutzone", "scriptingtrigger", "fogofwar", "zone", "trigger")
+    )
+
+
+def _find_unique_tagged_zone(objects: list[dict[str, Any]], zone_tag: str) -> dict[str, Any]:
+    wanted_tag = zone_tag.strip().lower()
+    if not wanted_tag:
+        raise ValueError("zone_tag must not be empty")
+    tagged = [
+        obj for obj in objects
+        if isinstance(obj, dict)
+        and wanted_tag in {str(tag).strip().lower() for tag in obj.get("tags") or []}
+    ]
+    zone_candidates = [obj for obj in tagged if _is_square_zone(obj)]
+    matches = zone_candidates or tagged
+    if len(matches) != 1:
+        raise ValueError(
+            f"zone tag {zone_tag!r} must resolve to exactly one live zone; found {len(matches)}"
+        )
+    return matches[0]
+
+
 def _validate_chess_objects(objects: list[dict[str, Any]]) -> list[str]:
     files = {f"{letter}{rank}" for letter in "abcdefgh" for rank in range(1, 9)}
     seen_squares: dict[str, list[str]] = {}
@@ -858,18 +963,24 @@ def _validate_chess_objects(objects: list[dict[str, Any]]) -> list[str]:
         tags = obj.get("tags") or []
         if not isinstance(tags, list):
             continue
+        square_tags: set[str] = set()
         for raw_tag in tags:
             tag = str(raw_tag).strip().lower()
             parts = tag.split()
+            if tag in files and _is_square_zone(obj):
+                square_tags.add(tag)
+                continue
             if not parts or parts[0] not in {"chess-square", "chess-piece"}:
                 continue
             if parts[0] == "chess-square":
                 if len(parts) != 2 or parts[1] not in files:
                     failures.append(f"{guid}: malformed or unknown chess-square tag '{raw_tag}'")
                     continue
-                seen_squares.setdefault(parts[1], []).append(guid)
+                square_tags.add(parts[1])
             elif len(parts) != 3 or parts[1] not in valid_colors or parts[2] not in valid_types:
                 failures.append(f"{guid}: malformed or unknown chess-piece tag '{raw_tag}'")
+        for square in square_tags:
+            seen_squares.setdefault(square, []).append(guid)
 
     for square in sorted(files):
         guids = seen_squares.get(square, [])
@@ -991,6 +1102,7 @@ async def tts_list_objects(
     name_contains: str = "",
     tag: str = "",
     max_results: int = 200,
+    compact: bool = True,
 ) -> dict[str, Any]:
     """List in-scene objects with GUIDs, names, types, transforms, lock state, and tags."""
     result = await call_tts(
@@ -999,6 +1111,7 @@ async def tts_list_objects(
             "name_contains": name_contains,
             "tag": tag,
             "max_results": max(1, min(max_results, 1000)),
+            "compact": compact,
         },
     )
     return result
@@ -1363,6 +1476,79 @@ async def tts_place_in_zone(
 
 
 @mcp.tool()
+async def tts_place_in_tagged_zone(
+    target_guid: str,
+    zone_tag: str,
+    offset_x: float = 0,
+    offset_y: float = 0,
+    offset_z: float = 0,
+    smooth: bool = True,
+    timeout_seconds: float = 5,
+    poll_seconds: float = 0.1,
+) -> dict[str, Any]:
+    """Place an object at the unique live zone carrying ``zone_tag``.
+
+    This is the destination primitive for board games with invisible tagged
+    square zones, including the chess A1-H8 LayoutZone grid. The target's
+    current Y is preserved because board LayoutZones commonly span vertically
+    through the table and their bounds center is not the piece surface.
+    """
+    listing = await tts_list_objects(max_results=1000)
+    objects = listing.get("objects", []) if isinstance(listing, dict) else []
+    if not isinstance(objects, list):
+        objects = []
+    zone = _find_unique_tagged_zone(objects if isinstance(objects, list) else [], zone_tag)
+    center = (zone.get("bounds") or {}).get("center") or zone.get("position") or {}
+    target = next(
+        (
+            obj for obj in objects
+            if isinstance(obj, dict)
+            and str(obj.get("guid") or "").lower() == target_guid.strip().lower()
+        ),
+        None,
+    )
+    if target is None:
+        raise ValueError(f"no live object exists with GUID {target_guid}")
+    target_position = (target or {}).get("position") or {}
+    target_y = float(target_position.get("y", center.get("y", 0))) + offset_y
+    move = await tts_move_object(
+        target_guid,
+        x=float(center.get("x", 0)) + offset_x,
+        y=target_y,
+        z=float(center.get("z", 0)) + offset_z,
+        smooth=smooth,
+    )
+    settled = await tts_wait_for_object_settle(
+        target_guid,
+        timeout_seconds=timeout_seconds,
+        poll_seconds=poll_seconds,
+    )
+    final_position = (settled.get("object") or {}).get("position") or {}
+    expected = {
+        "x": float(center.get("x", 0)) + offset_x,
+        "y": target_y,
+        "z": float(center.get("z", 0)) + offset_z,
+    }
+    final_error = max(
+        abs(float(final_position.get(axis, 0)) - expected[axis])
+        for axis in ("x", "y", "z")
+    )
+    if not settled.get("settled") or final_error > 0.2:
+        raise RuntimeError(
+            f"object {target_guid} did not settle at tagged zone {zone_tag!r}; "
+            f"final_error={final_error:.3f}, settled={settled.get('settled')}"
+        )
+    return {
+        "zone_tag": zone_tag.strip(),
+        "zone": zone,
+        "move": move,
+        "settled": settled,
+        "expected_position": expected,
+        "final_error": final_error,
+    }
+
+
+@mcp.tool()
 async def tts_align_to_object(
     target_guid: str,
     reference_guid: str,
@@ -1579,6 +1765,115 @@ async def tts_execute_action_plan(
 
 
 @mcp.tool()
+async def tts_inspect_save_file(save_path: str = "") -> dict[str, Any]:
+    """Inspect a numbered local TTS JSON save without changing it."""
+    return await asyncio.to_thread(inspect_save, save_path)
+
+
+@mcp.tool()
+async def tts_edit_save_file(
+    operations: list[dict[str, Any]],
+    save_path: str = "",
+    allow_irreversible: bool = False,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Apply bounded JSON-pointer edits to a numbered save, with a backup."""
+    return await asyncio.to_thread(
+        apply_operations,
+        save_path,
+        operations,
+        allow_irreversible=allow_irreversible,
+        dry_run=dry_run,
+    )
+
+
+@mcp.tool()
+async def tts_load_save_file(
+    save_path: str = "",
+    games_button_x: int = -1,
+    games_button_y: int = -1,
+    save_load_button_x: int = -1,
+    save_load_button_y: int = -1,
+    search_box_x: int = -1,
+    search_box_y: int = -1,
+    result_row_x: int = -1,
+    result_row_y: int = -1,
+    confirm_button_x: int | None = None,
+    confirm_button_y: int | None = None,
+    title_contains: str = "Tabletop Simulator",
+    settle_seconds: float = 8.0,
+    allow_irreversible: bool = False,
+) -> dict[str, Any]:
+    """Load a numbered save through the configured TTS Windows GUI profile.
+
+    Coordinates are relative to the detected TTS window. Because TTS renders
+    its menu in Unity, callers must supply coordinates calibrated for the
+    current layout/window size.
+    """
+    if not allow_irreversible:
+        raise ValueError("set allow_irreversible=true to load a save and replace the live scene")
+    points = {
+        "games_button": (games_button_x, games_button_y),
+        "save_load_button": (save_load_button_x, save_load_button_y),
+        "search_box": (search_box_x, search_box_y),
+        "result_row": (result_row_x, result_row_y),
+    }
+    if any(value < 0 for point in points.values() for value in point):
+        raise ValueError("all four required GUI coordinate pairs must be supplied")
+    if (confirm_button_x is None) != (confirm_button_y is None):
+        raise ValueError("confirm_button_x and confirm_button_y must be supplied together")
+    confirm = (
+        (confirm_button_x, confirm_button_y)
+        if confirm_button_x is not None and confirm_button_y is not None
+        else None
+    )
+    path = resolve_save_path(save_path)
+    before_hash = inspect_save(str(path))["sha256"]
+    started = time.time()
+    gui_result = await asyncio.to_thread(
+        load_save_via_gui,
+        path,
+        games_button=points["games_button"],
+        save_load_button=points["save_load_button"],
+        search_box=points["search_box"],
+        result_row=points["result_row"],
+        confirm_button=confirm,
+        title_contains=title_contains,
+        settle_seconds=settle_seconds,
+    )
+    after = await asyncio.to_thread(inspect_save, str(path))
+    events = await asyncio.to_thread(bridge.recent_events, 100)
+    scripts_loaded_after = any(
+        event.get("event_type") == "scripts_loaded"
+        and float(event.get("received_at_unix", 0)) >= started
+        for event in events
+        if isinstance(event, dict)
+    )
+    session_store.record_event(
+        "save_file_loaded_via_gui",
+        {
+            "path": str(path),
+            "sha256": after["sha256"],
+            "scripts_loaded_after": scripts_loaded_after,
+        },
+    )
+    return {
+        "path": str(path),
+        "sha256_before": before_hash,
+        "sha256_after": after["sha256"],
+        "file_unchanged_during_load": before_hash == after["sha256"],
+        "gui": gui_result,
+        "scripts_loaded_after": scripts_loaded_after,
+        "verification_note": (
+            "TTS reported a script-state load callback after the GUI action. "
+            "The External Editor protocol does not expose the loaded save filename."
+            if scripts_loaded_after
+            else "The GUI action completed, but no script-state load callback was observed."
+        ),
+    }
+
+
+@mcp.tool()
 async def tts_get_object(guid: str) -> dict[str, Any]:
     """Inspect one in-scene object by its six-character Tabletop Simulator GUID."""
     return await call_tts("get_object", {"guid": guid})
@@ -1594,7 +1889,11 @@ async def tts_move_object(
     collide: bool = False,
     fast: bool = True,
 ) -> dict[str, Any]:
-    """Move an object to an absolute Tabletop Simulator world position."""
+    """Move an object to an absolute world position without game-rule checks.
+
+    For the bundled checkers save, use ``tts_move_checkers_piece`` when the
+    move must be validated as a legal black-piece move.
+    """
     return await call_tts(
         "move_object",
         {
@@ -1605,6 +1904,311 @@ async def tts_move_object(
             "fast": fast,
         },
     )
+
+
+def _checker_identity(obj: dict[str, Any]) -> str:
+    tags = obj.get("tags") or []
+    tag_text = " ".join(str(tag) for tag in tags) if isinstance(tags, list) else str(tags)
+    return f"{obj.get('name', '')} {tag_text}".strip().lower()
+
+
+def _checker_axis_step(values: list[float]) -> float:
+    ordered = sorted(float(value) for value in values)
+    differences = [
+        second - first
+        for first, second in zip(ordered, ordered[1:])
+        if 0.75 <= second - first <= 3.0
+    ]
+    if not differences:
+        raise ValueError("could not infer the live checkers square spacing")
+    return float(median(differences))
+
+
+def _checker_position(obj: dict[str, Any]) -> tuple[float, float, float]:
+    position = obj.get("position") or {}
+    try:
+        return float(position["x"]), float(position["y"]), float(position["z"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"checker {obj.get('guid', '')} has no usable position") from exc
+
+
+def _checker_is_king(source: dict[str, Any], pieces: list[dict[str, Any]]) -> bool:
+    bounds = source.get("bounds") or {}
+    size = bounds.get("size") or {}
+    try:
+        if float(size.get("y", 0)) >= 0.4:
+            return True
+    except (TypeError, ValueError):
+        pass
+    source_x, source_y, source_z = _checker_position(source)
+    source_guid = str(source.get("guid") or "").lower()
+    for candidate in pieces:
+        if str(candidate.get("guid") or "").lower() == source_guid:
+            continue
+        x, y, z = _checker_position(candidate)
+        if (x - source_x) ** 2 + (z - source_z) ** 2 <= 0.16 and 0.05 <= abs(y - source_y) <= 1.0:
+            return True
+    return False
+
+
+def _checker_stack_companions(source: dict[str, Any], pieces: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    source_x, source_y, source_z = _checker_position(source)
+    source_guid = str(source.get("guid") or "").lower()
+    companions: list[dict[str, Any]] = []
+    for candidate in pieces:
+        if str(candidate.get("guid") or "").lower() == source_guid:
+            continue
+        x, y, z = _checker_position(candidate)
+        if (x - source_x) ** 2 + (z - source_z) ** 2 <= 0.16 and 0.05 <= abs(y - source_y) <= 1.0:
+            companions.append(candidate)
+    return companions
+
+
+def _is_black_king_row(target_z: float, objects: list[dict[str, Any]]) -> bool:
+    centers: list[float] = []
+    for obj in objects:
+        if not isinstance(obj, dict):
+            continue
+        if not any(re.fullmatch(r"[A-H][1-8]", str(tag).strip(), re.I) for tag in obj.get("tags") or []):
+            continue
+        position = obj.get("position") or {}
+        try:
+            centers.append(float(position["z"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+    unique = sorted(set(centers))
+    if len(unique) < 2:
+        return False
+    spacing = min(second - first for first, second in zip(unique, unique[1:]))
+    return abs(float(target_z) - unique[0]) <= max(0.25, spacing * 0.30)
+
+
+def _validate_checkers_target(
+    source: dict[str, Any],
+    pieces: list[dict[str, Any]],
+    target_x: float,
+    target_z: float,
+) -> dict[str, Any]:
+    """Validate and normalize a black-piece move on the save's live lattice."""
+    identity = _checker_identity(source)
+    if "checker" not in identity or "black" not in identity:
+        raise ValueError("tts_move_checkers_piece only moves black Checker pieces")
+    if source.get("locked") is True:
+        raise ValueError("the black checker is locked")
+
+    source_x, source_y, source_z = _checker_position(source)
+    checker_positions = [_checker_position(piece) for piece in pieces]
+    step_x = _checker_axis_step([position[0] for position in checker_positions])
+    step_z = _checker_axis_step([position[2] for position in checker_positions])
+    raw_dx = float(target_x) - source_x
+    raw_dz = float(target_z) - source_z
+    steps_x = round(raw_dx / step_x)
+    steps_z = round(raw_dz / step_z)
+    tolerance = max(0.32, min(step_x, step_z) * 0.22)
+
+    if steps_x == 0 or steps_z == 0 or abs(steps_x) != abs(steps_z) or abs(steps_x) not in {1, 2}:
+        raise ValueError("checkers moves must be one- or two-square diagonals; X-only moves are invalid")
+    normalized_x = source_x + steps_x * step_x
+    normalized_z = source_z + steps_z * step_z
+    if abs(float(target_x) - normalized_x) > tolerance or abs(float(target_z) - normalized_z) > tolerance:
+        raise ValueError("target is not a live checkers square center")
+
+    def near(x: float, z: float, position: tuple[float, float, float]) -> bool:
+        return abs(position[0] - x) <= tolerance and abs(position[2] - z) <= tolerance
+
+    occupied = []
+    for piece in pieces:
+        if str(piece.get("guid") or "").lower() == str(source.get("guid") or "").lower():
+            continue
+        position = _checker_position(piece)
+        if near(normalized_x, normalized_z, position):
+            occupied.append(piece)
+    if occupied:
+        raise ValueError("target checkers square is occupied")
+
+    is_king = _checker_is_king(source, pieces)
+    if not is_king and steps_z >= 0:
+        if steps_z != 2:
+            raise ValueError("black men must advance toward negative world Z")
+
+    if abs(steps_x) == 2:
+        midpoint_x = source_x + steps_x * step_x / 2
+        midpoint_z = source_z + steps_z * step_z / 2
+        midpoint = next(
+            (piece for piece in pieces if near(midpoint_x, midpoint_z, _checker_position(piece))),
+            None,
+        )
+        if midpoint is None or "red" not in _checker_identity(midpoint):
+            raise ValueError("a two-square checkers move must jump an opposing red checker")
+        captured_guid = str(midpoint.get("guid") or "")
+    else:
+        captured_guid = ""
+
+    return {
+        "guid": source.get("guid"),
+        "source": {"x": source_x, "y": source_y, "z": source_z},
+        "target": {"x": normalized_x, "y": source_y, "z": normalized_z},
+        "steps": {"x": steps_x, "z": steps_z},
+        "king": is_king,
+        "step": {"x": step_x, "z": step_z},
+        "tolerance": tolerance,
+        "captured_guid": captured_guid,
+    }
+
+
+@mcp.tool()
+async def tts_move_checkers_piece(
+    guid: str,
+    target_zone_tag: str = "",
+    target_x: float | None = None,
+    target_z: float | None = None,
+    timeout_seconds: float = 5,
+    poll_seconds: float = 0.1,
+) -> dict[str, Any]:
+    """Validate and execute one black move, removing its jumped red checker."""
+    zone: dict[str, Any] | None = None
+    if target_zone_tag.strip():
+        listing = await tts_list_objects(max_results=200)
+        wanted_tag = target_zone_tag.strip().lower()
+        tagged = [
+            obj for obj in listing.get("objects", [])
+            if isinstance(obj, dict)
+            and wanted_tag in {str(tag).strip().lower() for tag in obj.get("tags") or []}
+            and "checker" not in _checker_identity(obj)
+        ]
+        zone_candidates = [
+            obj for obj in tagged
+            if any(word in _checker_identity(obj) for word in ("zone", "trigger", "fogofwar"))
+        ]
+        matches = zone_candidates or tagged
+        if len(matches) != 1:
+            raise ValueError(
+                f"zone tag {target_zone_tag!r} must resolve to exactly one live square zone; "
+                f"found {len(matches)}"
+            )
+        zone = matches[0]
+        bounds = zone.get("bounds") or {}
+        target_position = bounds.get("center") or zone.get("position") or {}
+        try:
+            target_x = float(target_position["x"])
+            target_z = float(target_position["z"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"zone {target_zone_tag!r} has no usable world position") from exc
+    else:
+        listing = await tts_list_objects(max_results=200)
+        if target_x is None or target_z is None:
+            raise ValueError("provide target_zone_tag or both target_x and target_z")
+
+    pieces = [
+        obj for obj in listing.get("objects", [])
+        if isinstance(obj, dict) and "checker" in _checker_identity(obj)
+    ]
+    source = next(
+        (obj for obj in pieces if str(obj.get("guid") or "").lower() == guid.strip().lower()),
+        None,
+    )
+    if source is None:
+        raise ValueError(f"no live checker exists with GUID {guid}")
+    validated = _validate_checkers_target(source, pieces, target_x, target_z)
+    king_companions = _checker_stack_companions(source, pieces)
+    target = validated["target"]
+    move = await tts_move_object(
+        guid=str(source["guid"]),
+        x=target["x"],
+        y=target["y"],
+        z=target["z"],
+        smooth=True,
+        collide=False,
+        fast=True,
+    )
+    settled = await tts_wait_for_object_settle(
+        str(source["guid"]),
+        timeout_seconds=timeout_seconds,
+        poll_seconds=poll_seconds,
+    )
+    final_object = settled.get("object") or {}
+    final_position = final_object.get("position") or {}
+    final_error = max(
+        abs(float(final_position.get(axis, 0)) - float(target[axis]))
+        for axis in ("x", "y", "z")
+    )
+    if not settled.get("settled") or final_error > validated["tolerance"]:
+        raise RuntimeError(
+            f"checker {guid} did not settle at the validated target; "
+            f"final_error={final_error:.3f}, settled={settled.get('settled')}"
+        )
+    king_stack: list[dict[str, Any]] = []
+    for companion in king_companions:
+        _, companion_y, _ = _checker_position(companion)
+        companion_guid = str(companion["guid"])
+        companion_target = {"x": target["x"], "y": target["y"] + companion_y - validated["source"]["y"], "z": target["z"]}
+        companion_move = await tts_move_object(
+            guid=companion_guid,
+            x=companion_target["x"],
+            y=companion_target["y"],
+            z=companion_target["z"],
+            smooth=False,
+            collide=False,
+            fast=False,
+        )
+        companion_settled = await tts_wait_for_object_settle(companion_guid, timeout_seconds=timeout_seconds, poll_seconds=poll_seconds)
+        companion_position = (companion_settled.get("object") or {}).get("position") or {}
+        companion_error = max(abs(float(companion_position.get(axis, 0)) - companion_target[axis]) for axis in ("x", "y", "z"))
+        if not companion_settled.get("settled") or companion_error > validated["tolerance"]:
+            raise RuntimeError(f"king marker {companion_guid} did not follow the crowned checker")
+        king_stack.append({"guid": companion_guid, "move": companion_move, "settled": companion_settled})
+    capture: dict[str, Any] | None = None
+    captured_guid = str(validated.get("captured_guid") or "")
+    if captured_guid:
+        captured_checker = next(piece for piece in pieces if str(piece.get("guid") or "").lower() == captured_guid.lower())
+        holding_position = checkers_capture_holding_position(captured_checker, listing.get("objects", []))
+        capture_move = await tts_move_object(
+            guid=captured_guid,
+            x=holding_position["x"],
+            y=holding_position["y"],
+            z=holding_position["z"],
+            smooth=False,
+            collide=False,
+            fast=False,
+        )
+        capture_settled = await tts_wait_for_object_settle(captured_guid, timeout_seconds=timeout_seconds, poll_seconds=poll_seconds)
+        capture_object = capture_settled.get("object") or {}
+        capture_position = capture_object.get("position") or {}
+        capture_error = max(abs(float(capture_position.get(axis, 0)) - holding_position[axis]) for axis in ("x", "y", "z"))
+        if not capture_settled.get("settled") or capture_error > validated["tolerance"]:
+            raise RuntimeError(f"captured checker {captured_guid} did not reach its off-board holding position")
+        capture = {
+            "guid": captured_guid,
+            "off_board_position": holding_position,
+            "move": capture_move,
+            "settled": capture_settled,
+            "final_error": capture_error,
+        }
+    crown: dict[str, Any] | None = None
+    if not validated["king"] and _is_black_king_row(target["z"], listing.get("objects", [])):
+        crown_position = {"x": target["x"], "y": target["y"] + 0.5, "z": target["z"]}
+        spawned = await call_tts("spawn_catalog", {"guid": str(source["guid"]), "position": crown_position})
+        marker = spawned.get("object") or {}
+        marker_guid = str(marker.get("guid") or "")
+        if not marker_guid:
+            raise RuntimeError("king marker clone returned no GUID")
+        marker_settled = await tts_wait_for_object_settle(marker_guid, timeout_seconds=timeout_seconds, poll_seconds=poll_seconds)
+        marker_position = (marker_settled.get("object") or {}).get("position") or {}
+        marker_error = max(abs(float(marker_position.get(axis, 0)) - crown_position[axis]) for axis in ("x", "y", "z"))
+        if not marker_settled.get("settled") or marker_error > validated["tolerance"]:
+            raise RuntimeError("king marker did not settle on the crowned checker")
+        crown = {"marker_guid": marker_guid, "position": crown_position, "result": spawned}
+    return {
+        "action": "move_checkers_piece",
+        "validated": validated,
+        "target_zone": zone,
+        "move": move,
+        "settled": settled,
+        "final_error": final_error,
+        "capture": capture,
+        "king_stack": king_stack,
+        "crown": crown,
+    }
 
 
 @mcp.tool()
@@ -1744,6 +2348,9 @@ def _ai_game_context() -> dict[str, Any]:
     if state.get("current_turn"):
         lines.append(f"Current turn: {state['current_turn']}")
     context: dict[str, Any] = {"text": "\n".join(lines)}
+    # Chat begins context-light. The gateway acquires scene evidence only via
+    # its bounded read-only observation tool loop.
+    return context
     # A selected game may still be inactive while the host is preparing the
     # table.  Location inspection remains useful in that state; only vision
     # capture and autonomous mutations require running/paused lifecycle state.
@@ -1751,11 +2358,6 @@ def _ai_game_context() -> dict[str, Any]:
         return context
 
     try:
-        rules_path = _safe_game_rules_path(game, "rules.md")
-        if rules_path.is_file():
-            rules = rules_path.read_text(encoding="utf-8").strip()
-            if rules:
-                lines.append("Game rules reference:\n" + rules[:8000])
         # Use the compact response mode so the External Editor callback is not
         # dropped when a table contains many objects and rich metadata.
         result = bridge.request("list_objects", {
@@ -1801,21 +2403,117 @@ def _ai_game_context() -> dict[str, Any]:
                 "locked": obj.get("locked"),
             }, ensure_ascii=False, separators=(",", ":")))
         lines.append("Live table location data is authoritative. Positions are world coordinates (x,y,z); bounds are world-space extents. Use GUIDs to disambiguate objects.")
-        lines.append("All live top-level table objects (authoritative inventory; catalog entries are excluded):")
-        for obj in compact_objects:
-            lines.append(json.dumps({
-                "guid": obj.get("guid"),
-                "name": obj.get("name"),
-                "type": obj.get("type"),
-                "tags": obj.get("tags") or [],
-                "position": obj.get("position"),
-                "rotation": obj.get("rotation"),
-                "bounds": obj.get("bounds"),
-                "locked": obj.get("locked"),
-                "zone_guids": obj.get("zone_guids") or [],
-            }, ensure_ascii=False, separators=(",", ":")))
-        lines.append("Tagged board objects (use tags and positions as structured evidence):")
-        lines.extend(tagged or ["none found"])
+        if game.strip().lower() == "chess":
+            chess_zone_tags = sorted({
+                str(tag).strip().upper()
+                for obj in compact_objects
+                if _is_square_zone(obj)
+                for tag in obj.get("tags") or []
+                if str(tag).strip().lower() in {f"{letter}{rank}" for letter in "abcdefgh" for rank in range(1, 9)}
+            })
+            if chess_zone_tags:
+                lines.append(
+                    "CHESS DESTINATION ZONES (authoritative): "
+                    + ", ".join(chess_zone_tags)
+                    + ". Move a piece by calling tts_place_in_tagged_zone with the piece GUID and the destination zone_tag; do not calculate world X/Z coordinates."
+                )
+        if game.strip().lower() == "checkers":
+            checker_square_tags = sorted({
+                str(tag).strip().upper()
+                for obj in compact_objects
+                if _is_square_zone(obj)
+                for tag in obj.get("tags") or []
+                if str(tag).strip().lower() in {f"{letter}{rank}" for letter in "abcdefgh" for rank in range(1, 9)}
+            })
+            if checker_square_tags:
+                lines.append(
+                    "CHECKERS DESTINATION ZONES (authoritative): "
+                    + ", ".join(checker_square_tags)
+                    + ". Call tts_move_checkers_piece with the piece GUID and target_zone_tag; do not calculate world X/Z coordinates."
+                )
+            checker_positions = [
+                (
+                    str(obj.get("guid") or ""),
+                    obj.get("position") or {},
+                )
+                for obj in compact_objects
+                if str(obj.get("type", "")).lower() == "checker"
+            ]
+            x_values = sorted({
+                round(float(position["x"]), 4)
+                for _, position in checker_positions
+                if isinstance(position, dict) and "x" in position
+            })
+            z_values = sorted({
+                round(float(position["z"]), 4)
+                for _, position in checker_positions
+                if isinstance(position, dict) and "z" in position
+            })
+            if not checker_square_tags and len(x_values) >= 2 and len(z_values) >= 2:
+                x_steps = [b - a for a, b in zip(x_values, x_values[1:]) if b - a > 0.75]
+                z_steps = [b - a for a, b in zip(z_values, z_values[1:]) if b - a > 0.75]
+                if x_steps and z_steps:
+                    step_x = min(x_steps)
+                    step_z = min(z_steps)
+                    lines.append(
+                        "CHECKERS COORDINATE LATTICE (authoritative): use these live square-center spacings, "
+                        f"x step={step_x:.4f}, z step={step_z:.4f}. Do not use sqrt(2) or visual pixel offsets. "
+                        "A normal diagonal changes x and z by exactly one listed step; a capture changes both by two steps."
+                    )
+                    lines.append(
+                        "Checker source positions (use exact live values; target must be another square center): "
+                        + "; ".join(
+                            f"{guid}=({float(position.get('x', 0)):.4f},{float(position.get('z', 0)):.4f})"
+                            for guid, position in checker_positions
+                            if isinstance(position, dict) and "x" in position and "z" in position
+                        )
+                    )
+        if game.strip().lower() == "checkers":
+            # Checkers needs only piece identity/position and the canonical
+            # square centers. The previous full-scene and tagged-object dumps
+            # repeated the same data and consumed a large fraction of the
+            # local vision model's context window.
+            lines.append("CHECKERS LIVE PIECES (authoritative; one row per occupied piece):")
+            for obj in compact_objects:
+                if str(obj.get("type", "")).lower() != "checker":
+                    continue
+                position = obj.get("position") or {}
+                lines.append(json.dumps({
+                    "guid": obj.get("guid"),
+                    "name": obj.get("name"),
+                    "position": {
+                        "x": position.get("x"),
+                        "y": position.get("y"),
+                        "z": position.get("z"),
+                    },
+                    "locked": obj.get("locked"),
+                    "zone_guids": obj.get("zone_guids") or [],
+                }, ensure_ascii=False, separators=(",", ":")))
+            lines.append("CHECKERS SQUARE CENTERS (authoritative destination tags; use the tag and its x/z center):")
+            for obj in compact_objects:
+                if not _is_square_zone(obj):
+                    continue
+                tags = [str(tag).strip().upper() for tag in obj.get("tags") or []]
+                square_tags = [tag for tag in tags if re.fullmatch(r"[A-H][1-8]", tag)]
+                position = obj.get("position") or {}
+                for tag in square_tags:
+                    lines.append(f"{tag}=({position.get('x')},{position.get('z')})")
+        else:
+            lines.append("All live top-level table objects (authoritative inventory; catalog entries are excluded):")
+            for obj in compact_objects:
+                lines.append(json.dumps({
+                    "guid": obj.get("guid"),
+                    "name": obj.get("name"),
+                    "type": obj.get("type"),
+                    "tags": obj.get("tags") or [],
+                    "position": obj.get("position"),
+                    "rotation": obj.get("rotation"),
+                    "bounds": obj.get("bounds"),
+                    "locked": obj.get("locked"),
+                    "zone_guids": obj.get("zone_guids") or [],
+                }, ensure_ascii=False, separators=(",", ":")))
+            lines.append("Tagged board objects (use tags and positions as structured evidence):")
+            lines.extend(tagged or ["none found"])
     except (OSError, RuntimeError, ValueError, TTSBridgeError) as exc:
         lines.append(f"Live board object inspection unavailable this turn: {exc}")
 
@@ -1823,7 +2521,9 @@ def _ai_game_context() -> dict[str, Any]:
     # timeout must not prevent the image from reaching a vision-capable model.
     try:
         vision_setting = backend_config_store.load().get("vision", os.getenv("AI_GAME_VISION", "1"))
-        if str(vision_setting).strip().lower() in {"1", "true", "yes", "on"}:
+        vision_enabled = str(vision_setting).strip().lower() in {"1", "true", "yes", "on"}
+        vision_requested = should_capture_game_vision(message, game, lifecycle)
+        if vision_enabled and vision_requested:
             if os.getenv("AI_VISION_SET_CAMERA", "1").strip().lower() in {"1", "true", "yes", "on"}:
                 try:
                     bridge.request("set_camera", {
@@ -1861,11 +2561,111 @@ def _ai_game_context() -> dict[str, Any]:
                 },
             )
             lines.append("A fresh overhead camera snapshot is attached; reconcile it with the tagged object data.")
+        elif vision_enabled:
+            _record_trace(
+                "ai_vision_skipped",
+                game=game,
+                lifecycle=lifecycle,
+                reason="vision is reserved for explicit move preparation",
+            )
     except Exception as exc:
         _record_trace("ai_vision_capture", game=game, lifecycle=lifecycle, attached=False, error=str(exc))
         lines.append(f"Vision snapshot unavailable this turn: {exc}")
     context["text"] = "\n".join(lines)
     return context
+
+
+def _ai_observation_bridge_timeout() -> float:
+    """Fail a dead TTS observation quickly enough for player feedback."""
+    try:
+        return max(1.0, min(float(os.getenv("AI_OBSERVATION_TTS_TIMEOUT", "15")), 60.0))
+    except (TypeError, ValueError):
+        return 15.0
+
+
+def _ai_observation_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
+    """Run one gateway-approved read-only observation and compact its result."""
+    if name == "tts_get_object":
+        return bridge.request(
+            "get_object",
+            {"guid": str(args["guid"]).strip()},
+            timeout=_ai_observation_bridge_timeout(),
+        )
+    if name == "tts_list_objects":
+        return bridge.request(
+            "list_objects",
+            {
+                "name_contains": str(args.get("name_contains", "")),
+                "tag": str(args.get("tag", "")),
+                "max_results": max(1, min(int(args.get("max_results", 200)), 1000)),
+                "compact": bool(args.get("compact", True)),
+            },
+            timeout=_ai_observation_bridge_timeout(),
+        )
+    if name == "tts_search_scene":
+        reference = str(args.get("reference", "")).strip()
+        listing = _ai_observation_tool("tts_list_objects", {"max_results": 1000, "compact": True})
+        objects = listing.get("objects", []) if isinstance(listing, dict) else []
+        ranked = rank_scene_objects(reference, objects if isinstance(objects, list) else [], int(args.get("max_results", 10)))
+        return {"reference": reference, "count": len(ranked), "candidates": ranked}
+    if name == "tts_find_nearest_objects":
+        request_args: dict[str, Any] = {
+            "name_contains": str(args.get("name_contains", "")),
+            "tag": str(args.get("tag", "")),
+            "max_results": max(1, min(int(args.get("max_results", 10)), 50)),
+        }
+        if str(args.get("reference_guid", "")).strip():
+            request_args["guid"] = str(args["reference_guid"]).strip()
+        else:
+            request_args["position"] = {axis: float(args[axis]) for axis in ("x", "y", "z")}
+        return bridge.request("find_nearest_objects", request_args, timeout=_ai_observation_bridge_timeout())
+    if name == "tts_find_objects_in_region":
+        request_args = {
+            "minimum": {axis: float(args[f"minimum_{axis}"]) for axis in ("x", "y", "z")},
+            "maximum": {axis: float(args[f"maximum_{axis}"]) for axis in ("x", "y", "z")},
+            "name_contains": str(args.get("name_contains", "")),
+            "tag": str(args.get("tag", "")),
+            "max_results": max(1, min(int(args.get("max_results", 50)), 50)),
+        }
+        return bridge.request("find_objects_in_region", request_args, timeout=_ai_observation_bridge_timeout())
+    if name == "tts_get_zone_objects":
+        return bridge.request(
+            "get_zone_objects",
+            {
+                "guid": str(args["guid"]).strip(),
+                "ignore_tags": bool(args.get("ignore_tags", False)),
+            },
+            timeout=_ai_observation_bridge_timeout(),
+        )
+    if name == "tts_get_scene_summary":
+        maximum = max(1, min(int(args.get("max_results", 50)), 50))
+        result = _ai_observation_tool("tts_list_objects", {"max_results": maximum, "compact": True})
+        objects = result.get("objects", []) if isinstance(result, dict) else []
+        compact = [
+            {
+                key: obj.get(key)
+                for key in ("guid", "name", "type", "tags", "position", "rotation", "bounds", "locked", "zone_guids")
+            }
+            for obj in objects[:maximum]
+            if isinstance(obj, dict)
+        ]
+        return {"count": len(compact), "objects": compact, "truncated": bool(result.get("truncated")) if isinstance(result, dict) else False}
+    if name == "tts_capture_view":
+        image = _capture_view(
+            int(args.get("left", 0)), int(args.get("top", 0)),
+            int(args.get("width", 1920)), int(args.get("height", 1080)),
+            int(args.get("max_width", 1600)), int(args.get("jpeg_quality", 85)),
+        )
+        return {"image_base64": base64.b64encode(image.data).decode("ascii"), "mime_type": "image/jpeg"}
+    if name == "tts_capture_view_info":
+        _, metadata = _capture_view_snapshot(
+            int(args.get("left", 0)), int(args.get("top", 0)),
+            int(args.get("width", 1920)), int(args.get("height", 1080)),
+            int(args.get("max_width", 1600)),
+        )
+        metadata["healthy"] = not metadata["blank_frame_suspected"]
+        return metadata
+    raise ValueError(f"unsupported AI observation tool: {name}")
 
 
 @mcp.tool()
@@ -2016,14 +2816,42 @@ async def tts_wait_for_object_settle(
     interval = max(0.05, min(poll_seconds, 1.0))
     started = time.monotonic()
     last_state: dict[str, Any] = {}
+    previous_position: dict[str, float] | None = None
+    stable_samples = 0
     while True:
         last_state = await tts_get_object(guid)
-        if not last_state.get("smooth_moving", False):
+        if last_state.get("smooth_moving") is False:
             return {
                 "settled": True,
                 "elapsed_seconds": time.monotonic() - started,
                 "object": last_state,
             }
+        # Older bridge scripts may omit isSmoothMoving. In that case require
+        # two consecutive unchanged position samples instead of treating the
+        # first response as settled.
+        if last_state.get("smooth_moving") is None:
+            position = last_state.get("position") or {}
+            try:
+                current_position = {
+                    axis: float(position[axis]) for axis in ("x", "y", "z")
+                }
+            except (KeyError, TypeError, ValueError):
+                current_position = None
+            if current_position is not None and previous_position is not None:
+                if max(
+                    abs(current_position[axis] - previous_position[axis])
+                    for axis in ("x", "y", "z")
+                ) <= 0.02:
+                    stable_samples += 1
+                else:
+                    stable_samples = 0
+                if stable_samples >= 2:
+                    return {
+                        "settled": True,
+                        "elapsed_seconds": time.monotonic() - started,
+                        "object": last_state,
+                    }
+            previous_position = current_position
         if time.monotonic() - started >= timeout:
             return {
                 "settled": False,
@@ -2131,15 +2959,23 @@ async def tts_wait_for_chat(timeout_seconds: float = 30) -> dict[str, Any]:
 
 
 @mcp.tool()
-async def tts_ai_chat(message: str) -> dict[str, Any]:
-    """Send a prompt to the configured local HTTP AI gateway and return its response."""
+async def tts_ai_chat(
+    message: str,
+    conversation_id: str = "",
+    timeout_seconds: float = 300,
+) -> dict[str, Any]:
+    """Send a prompt to the local AI gateway with an optional fresh conversation."""
     if not message.strip():
         raise ValueError("message must not be empty")
+    timeout = max(5.0, min(float(timeout_seconds), 600.0))
 
     host = os.getenv("TTS_HTTP_HOST", "127.0.0.1")
     port = int(os.getenv("TTS_HTTP_PORT", "8765"))
     url = f"http://{host}:{port}/chat"
-    body = json.dumps({"message": message, "player": {"color": "Codex"}}).encode("utf-8")
+    payload: dict[str, Any] = {"message": message, "player": {"color": "Codex"}}
+    if conversation_id.strip():
+        payload["conversation_id"] = conversation_id.strip()
+    body = json.dumps(payload).encode("utf-8")
     request = Request(
         url,
         data=body,
@@ -2149,7 +2985,7 @@ async def tts_ai_chat(message: str) -> dict[str, Any]:
 
     def send() -> dict[str, Any]:
         try:
-            with urlopen(request, timeout=60) as response:
+            with urlopen(request, timeout=timeout) as response:
                 raw = response.read().decode("utf-8")
         except HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
@@ -2177,6 +3013,10 @@ if __name__ == "__main__":
         # The gateway remains import-cycle free, while command execution still
         # goes through the same allowlisted External Editor bridge as MCP.
         http_gateway.configure_gameplay(bridge.request)
+        http_gateway.configure_observation_tools(_ai_observation_tool)
+        http_gateway.configure_bridge_response(
+            lambda response: bridge.deliver_response(response, transport="http")
+        )
         http_gateway.start()
         if os.getenv("TTS_GATEWAY_ONLY", "").strip().lower() in {"1", "true", "yes", "on"}:
             # Useful for checking TTS -> backend connectivity without feeding

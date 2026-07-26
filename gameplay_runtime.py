@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Bounded D&D gameplay intelligence for the TTS AI gateway.
+"""Bounded game-play intelligence for the TTS AI gateway.
 
 This module deliberately knows nothing about MCP or Lua.  It consumes a
 best-effort structured context snapshot and an allowlisted bridge callback.
@@ -37,6 +37,81 @@ def classify_intent(message: str) -> Intent:
     if re.search(r"\b(move|attack|hit|cast|open|take|roll|damage|fight|lock|unlock)\b", text):
         return Intent.ENTITY_ACTION
     return Intent.NARRATIVE
+
+
+def should_capture_game_vision(message: str, game: str, lifecycle: str) -> bool:
+    """Return whether this chat explicitly starts a live move-preparation turn.
+
+    Camera movement and screen capture are expensive side effects. Ordinary
+    conversation, status queries, and setup requests should not trigger them.
+    """
+    if not str(game).strip() or str(lifecycle).strip().lower() != "running":
+        return False
+    text = str(message or "").strip().lower()
+    if not text:
+        return False
+    return bool(
+        re.search(r"\b(?:make|take|play)\s+(?:your\s+|a\s+|the\s+)?move\b", text)
+        or re.search(r"\b(?:move|attack|capture)\b", text)
+    )
+
+
+def checkers_capture_holding_position(captured: dict[str, Any], objects: list[dict[str, Any]]) -> dict[str, float]:
+    """Choose a visible, orderly off-board position for a captured checker."""
+    expected = {f"{letter}{rank}" for letter in "ABCDEFGH" for rank in range(1, 9)}
+    squares: dict[str, tuple[float, float]] = {}
+    for item in objects:
+        if not isinstance(item, dict):
+            continue
+        position = item.get("position") or {}
+        try:
+            x, z = float(position["x"]), float(position["z"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        for tag in item.get("tags") or []:
+            square = str(tag).strip().upper()
+            if re.fullmatch(r"[A-H][1-8]", square):
+                if square in squares:
+                    raise ValueError("checkers square tags are ambiguous; cannot place a captured checker safely")
+                squares[square] = (x, z)
+    if set(squares) != expected:
+        raise ValueError("the complete tagged checkers board is required to place a captured checker off-board")
+
+    x_centers = sorted({position[0] for position in squares.values()})
+    z_centers = sorted({position[1] for position in squares.values()})
+    step = min(
+        min(second - first for first, second in zip(x_centers, x_centers[1:])),
+        min(second - first for first, second in zip(z_centers, z_centers[1:])),
+    )
+    captured_name = f"{captured.get('name', '')} {' '.join(str(tag) for tag in captured.get('tags') or [])}".lower()
+    is_red = "red" in captured_name
+    board_edge = max(x_centers) if is_red else min(x_centers)
+    direction = 1.0 if is_red else -1.0
+    same_color_off_board = 0
+    for item in objects:
+        if not isinstance(item, dict) or str(item.get("guid") or "") == str(captured.get("guid") or ""):
+            continue
+        if str(item.get("type", "")).lower() != "checker":
+            continue
+        position = item.get("position") or {}
+        try:
+            is_off_board = (float(position["x"]) - board_edge) * direction > step * 0.5
+        except (KeyError, TypeError, ValueError):
+            continue
+        item_name = f"{item.get('name', '')} {' '.join(str(tag) for tag in item.get('tags') or [])}".lower()
+        if is_off_board and ("red" in item_name) == is_red:
+            same_color_off_board += 1
+    column, row = divmod(same_color_off_board, len(z_centers))
+    captured_position = captured.get("position") or {}
+    try:
+        y = float(captured_position["y"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("captured checker has no usable height") from exc
+    return {
+        "x": board_edge + direction * step * (2 + column),
+        "y": y,
+        "z": z_centers[row],
+    }
 
 
 @dataclass(frozen=True)
@@ -147,7 +222,7 @@ class CatalogIndex:
         return result
 
 
-class DndPromptBuilder:
+class GamePromptBuilder:
     def __init__(self, rules_root: Path, catalog: CatalogIndex | None = None) -> None:
         self.rules_root = rules_root.resolve()
         self.catalog = catalog or CatalogIndex()
@@ -165,23 +240,53 @@ class DndPromptBuilder:
 
     def build(self, *, game: str, intent: Intent, context: dict[str, Any]) -> str:
         rules = self.rules(game)
+        selected_game = game.strip() or "none"
         base = (
-            "You are the bounded Tabletop Simulator game agent.\n"
-            "For D&D, act as a concise 5e Dungeon Master: narrate consequences, enforce the selected rules, "
-            "and use structured evidence before acting.\n"
-            "Never invent GUIDs. Only emit allowlisted commands using exact six-character hexadecimal GUIDs.\n"
-            "For location questions and movement, use the live top-level table inventory: every GUID, position, rotation, and bounds value comes from the current TTS scene. The position is the exact world x,y,z center. Use the screenshot only to compare visual identity and board alignment; do not replace structured coordinates with visual guesses.\n"
-            "When AI play state is running and it is your verified turn, act independently: select a legal object from the live inventory and emit its MOVE command. A move is complete only if the response contains an executable MOVE[guid,x,y,z] line; prose or board notation such as f6-e5 is not a command. Do not ask a player to move it for you. Preserve the source object's y coordinate unless the table's verified mapping requires another height.\n"
-            "Never select or spawn a bag, master bag, category bag, deck, or container as a scene object.\n"
-            "Commands are explicit text: MOVE[guid,x,y,z], ROTATE[guid,x,y,z], LOCK[guid], UNLOCK[guid], "
-            "SPAWN[guid,x,z], PLACE[guid,x,z], SPAWN_BUILTIN[type,x,y,z], BROADCAST[text], or DESTROY[guid].\n"
-            "Destruction is never executed automatically; it must be proposed for host approval.\n"
-            "Keep responses concise and include commands immediately when an action is requested.\n"
+            "You are a Tabletop Simulator game-playing opponent. Play the selected game as the AI-controlled side against human players.\n"
+            "Use only the selected game's rules; do not import rules or roles from another game. Use only state visible to the AI player.\n"
+            "Before moving, verify the AI side, whose turn it is, the board state, and the legal action. If anything is uncertain, say what is missing and ask for clarification. Never guess.\n"
+            "When play is running and it is the verified AI turn, choose and execute a legal move yourself. State it briefly and emit the executable command; do not ask a human to move for you.\n"
+            "Prefer the fast structured object_list observation. Use a screenshot when object data is missing, contradictory, visually ambiguous, or after a move lands more than 0.5 world units from its expected position on any axis.\n"
+            "If any action or verification fails, stop issuing actions, report the failure in concise natural language, and wait for player instructions. A player's manual correction is not evidence until you re-observe the board.\n"
+            "Use live object data for GUIDs and world coordinates. Never invent GUIDs or use visual guesses instead of structured coordinates. Preserve the source object's y coordinate.\n"
+            "For board games, copy target x/z values from the live square-center mapping. Never calculate a diagonal with sqrt(2), pixel offsets, or an approximate midpoint; a target between square centers is invalid.\n"
+            "For ordinary object actions, emit only these commands: MOVE[guid,x,y,z], ROTATE[guid,x,y,z], LOCK[guid], UNLOCK[guid], SPAWN[guid,x,z], PLACE[guid,x,z], SPAWN_BUILTIN[type,x,y,z], BROADCAST[text], DESTROY[guid]. Destruction requires host approval.\n"
+            "Do not select or spawn bags, decks, or containers as scene objects. Keep responses concise and do not invent narrative scenes. Keep raw inventories, GUID lists, positions, rotations, bounds, tags, and internal diagnostics out of player-facing chat; use them internally and report only the requested conclusion or next action.\n"
         )
-        sections = [base, f"Intent for this turn: {intent.value}", "Authoritative current context:\n" + str(context.get("text", ""))]
+        sections = [
+            base,
+            f"Selected game: {selected_game}",
+            f"Intent for this turn: {intent.value}",
+            "The authoritative current Tabletop Simulator state is supplied separately after this instruction.",
+        ]
         if rules:
             sections.append("Selected game rules:\n" + rules)
+        elif game:
+            sections.append(
+                "No rules file was found for the selected game. Do not make a move until the host provides "
+                "or installs that game's rules under game_rules/<name>/rules.md."
+            )
+        if selected_game.lower() == "checkers":
+            sections.append(
+                "CHECKERS EXECUTION PROTOCOL (mandatory):\n"
+                "In this chat gateway, the direct tts_move_checkers_piece MCP tool is not callable. "
+                "The only way to execute the validated checkers move path is the MOVE line below.\n"
+                "The gateway does not execute prose, algebraic notation, or a tool name. "
+                "For exactly one black move, emit exactly one standalone line in this form:\n"
+                "MOVE[black_piece_guid,target_square_center_x,source_piece_y,target_square_center_z]\n"
+                "The GUID is the live source piece GUID. The x and z values are the destination square center, not the source position. "
+                "Copy the destination x/z from the authoritative live square mapping; preserve the source y. "
+                "Do not write 'from', 'to', a second bracket, a zone name, or explanatory text on that line. "
+                "The server converts this command into the validated checkers movement path, which rejects occupied, non-diagonal, backward, and illegal capture moves. "
+                "Before emitting it, check every black piece for a mandatory capture; if any capture exists, emit only a legal capture. "
+                "If no legal move can be proven, emit no MOVE command and state the missing evidence."
+            )
         return "\n\n".join(sections)
+
+
+# Compatibility alias for integrations that imported the old class name. New
+# code should use GamePromptBuilder because the prompt is not D&D-specific.
+DndPromptBuilder = GamePromptBuilder
 
 
 class ScenePlacementIntelligence:
@@ -213,9 +318,15 @@ class ScenePlacementIntelligence:
 
 
 class CommandExecution:
-    def __init__(self, request: Callable[[str, dict[str, Any]], dict[str, Any]], propose: Callable[[dict[str, Any]], str]) -> None:
+    def __init__(
+        self,
+        request: Callable[[str, dict[str, Any]], dict[str, Any]],
+        propose: Callable[[dict[str, Any]], str],
+        review: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+    ) -> None:
         self.request = request
         self.propose = propose
+        self.review = review
 
     def execute(self, commands: list[ParsedCommand], *, running: bool, active_game: str = "") -> dict[str, Any]:
         results: list[dict[str, Any]] = []
@@ -227,51 +338,141 @@ class CommandExecution:
                 continue
             if not running:
                 results.append({"action": command.action, "status": "blocked", "reason": "AI play is not running", "args": command.args})
-                continue
+                return {
+                    "executed": results,
+                    "approval_required": proposals,
+                    "stopped": True,
+                    "stop_reason": "action was blocked; waiting for player instructions",
+                }
+            effective_command = command
+            position_correction: dict[str, Any] | None = None
+            captured_checker_guid: str | None = None
+            king_companions: list[dict[str, Any]] = []
+            crown_after_move = False
             if active_game.strip().lower() == "checkers" and command.action == "move_object":
                 # The active checkers save is host-mapped with the red side at
                 # negative Z. AI-controlled men must advance toward red, never
                 # sideways or away from it. Validate the source in TTS before
                 # allowing the mutating bridge action.
                 try:
-                    source = self.request("get_object", {"guid": command.args["guid"]})
+                    # Prefer the authoritative scene snapshot for source lookup.
+                    # This avoids failing a safe move when a TTS build drops a
+                    # transient single-object callback.
+                    stack = self.request("list_objects", {"max_results": 250, "compact": True})
+                    live_objects = stack.get("objects") or []
+                    source = next(
+                        (item for item in live_objects if str(item.get("guid", "")).lower() == str(command.args["guid"]).lower()),
+                        None,
+                    )
+                    if source is None:
+                        source = self.request("get_object", {"guid": command.args["guid"]})
                     if str(source.get("type", "")).lower() != "checker":
                         results.append({"action": command.action, "status": "blocked", "reason": "only Checker objects may be moved during a checkers game", "args": command.args})
-                        continue
-                    source_z = float((source.get("position") or {})["z"])
-                    target_z = float(command.args["z"])
-                    stack = self.request("list_objects", {"max_results": 250, "compact": True})
-                    is_king = self._is_double_stacked_checker(source, stack.get("objects") or [])
-                    delta_z = target_z - source_z
+                        return {
+                            "executed": results,
+                            "approval_required": proposals,
+                            "stopped": True,
+                            "stop_reason": "action was blocked; waiting for player instructions",
+                        }
+                    king_companions = self._stacked_checker_companions(source, live_objects)
+                    is_king = bool(king_companions) or self._is_double_stacked_checker(source, live_objects)
+                    corrected_args, position_correction, correction_error = self._normalize_checkers_move(
+                        command.args,
+                        source,
+                        live_objects,
+                    )
+                    if correction_error:
+                        results.append({
+                            "action": command.action,
+                            "status": "blocked",
+                            "reason": correction_error,
+                            "args": command.args,
+                            "source_position": source.get("position"),
+                        })
+                        return {
+                            "executed": results,
+                            "approval_required": proposals,
+                            "stopped": True,
+                            "stop_reason": "action was blocked; waiting for player instructions",
+                        }
+                    if corrected_args != command.args:
+                        effective_command = ParsedCommand(command.action, corrected_args, command.destructive)
+                    captured_checker_guid, capture_error = self._checkers_capture_target(
+                        source,
+                        effective_command.args,
+                        live_objects,
+                    )
+                    if capture_error:
+                        results.append({
+                            "action": command.action,
+                            "status": "blocked",
+                            "reason": capture_error,
+                            "args": effective_command.args,
+                            "source_position": source.get("position"),
+                        })
+                        return {
+                            "executed": results,
+                            "approval_required": proposals,
+                            "stopped": True,
+                            "stop_reason": "action was blocked; waiting for player instructions",
+                        }
                     # A normal step is one row; a potential capture spans two
                     # rows. Men may capture backward under English draughts,
                     # so only reject sideways/backward *ordinary* moves here.
                     # A double-stacked piece is a crowned king and may move in
                     # either direction.
+                    source_position = source.get("position") or {}
+                    target_z = float(effective_command.args["z"])
+                    delta_z = target_z - float(source_position["z"])
                     if not is_king and delta_z >= -0.5 and abs(delta_z) < 3.0:
                         results.append({
                             "action": command.action,
                             "status": "blocked",
                             "reason": "checkers moves must advance toward the red side (negative world Z)",
-                            "args": command.args,
+                            "args": effective_command.args,
                             "source_position": source.get("position"),
                         })
-                        continue
+                        return {
+                            "executed": results,
+                            "approval_required": proposals,
+                            "stopped": True,
+                            "stop_reason": "action was blocked; waiting for player instructions",
+                        }
+                    crown_after_move = not is_king and self._checkers_reaches_black_king_row(
+                        effective_command.args,
+                        live_objects,
+                    )
+                    # A board-square move is verified immediately after the
+                    # bridge callback. Animated motion can still be in flight
+                    # at that point and produces a false postcondition
+                    # failure, so validated checkers moves are atomic.
+                    checkers_args = dict(effective_command.args)
+                    checkers_args["_checkers_instant"] = True
+                    effective_command = ParsedCommand(command.action, checkers_args, command.destructive)
                 except Exception as exc:
                     results.append({"action": command.action, "status": "blocked", "reason": f"could not verify checkers move direction: {exc}", "args": command.args})
-                    continue
+                    return {
+                        "executed": results,
+                        "approval_required": proposals,
+                        "stopped": True,
+                        "stop_reason": "action was blocked; waiting for player instructions",
+                    }
             try:
-                attempts = max(1, min(int(os.getenv("AI_COMMAND_RETRIES", "2")), 3))
+                # A failed mutation is an uncertainty stop. Do not replay an
+                # unknown or unverified TTS action automatically; the next
+                # step requires fresh player feedback.
+                attempts = 1
                 result: dict[str, Any] = {}
                 # A bridge error before the post-action read must never be
                 # reported as a successful move. Verification becomes true
                 # only after _verify observes the requested state in TTS.
                 verification: dict[str, Any] = {"verified": False, "checks": [], "errors": ["move was not verified"]}
+                capture: dict[str, Any] | None = None
                 last_error = ""
                 for attempt in range(1, attempts + 1):
                     try:
-                        result = self.request(command.action, self._bridge_args(command))
-                        verification = self._verify(command)
+                        result = self.request(effective_command.action, self._bridge_args(effective_command))
+                        verification = self._verify(effective_command)
                         if verification.get("verified", False):
                             break
                         last_error = "; ".join(verification.get("errors", []))
@@ -279,14 +480,465 @@ class CommandExecution:
                         last_error = str(exc)
                     if attempt < attempts:
                         continue
+                if verification.get("verified", False) and captured_checker_guid:
+                    try:
+                        captured_checker = next(
+                            item for item in live_objects
+                            if str(item.get("guid", "")).lower() == captured_checker_guid.lower()
+                        )
+                        holding_position = checkers_capture_holding_position(captured_checker, live_objects)
+                        capture_command = ParsedCommand(
+                            "move_object",
+                            {"guid": captured_checker_guid, **holding_position, "_checkers_instant": True},
+                        )
+                        capture_result = self.request("move_object", self._bridge_args(capture_command))
+                        capture_verification = self._verify(capture_command)
+                        if not capture_verification.get("verified", False):
+                            raise RuntimeError("captured checker did not reach its off-board holding position")
+                        capture = {
+                            "guid": captured_checker_guid,
+                            "off_board_position": holding_position,
+                            "result": capture_result,
+                            "verification": capture_verification,
+                        }
+                    except Exception as exc:
+                        last_error = f"captured checker removal was not verified: {exc}"
+                        verification = {
+                            **verification,
+                            "verified": False,
+                            "errors": [*verification.get("errors", []), last_error],
+                        }
+                if verification.get("verified", False) and king_companions:
+                    try:
+                        source_y = float((source.get("position") or {})["y"])
+                        companion_moves: list[dict[str, Any]] = []
+                        for companion in king_companions:
+                            companion_position = companion.get("position") or {}
+                            companion_command = ParsedCommand(
+                                "move_object",
+                                {
+                                    "guid": str(companion["guid"]),
+                                    "x": float(effective_command.args["x"]),
+                                    "y": float(effective_command.args["y"]) + float(companion_position["y"]) - source_y,
+                                    "z": float(effective_command.args["z"]),
+                                    "_checkers_instant": True,
+                                },
+                            )
+                            companion_result = self.request("move_object", self._bridge_args(companion_command))
+                            companion_verification = self._verify(companion_command)
+                            if not companion_verification.get("verified", False):
+                                raise RuntimeError("king marker did not follow the crowned checker")
+                            companion_moves.append({"guid": companion_command.args["guid"], "result": companion_result})
+                        king_stack = {"moved_markers": companion_moves}
+                    except Exception as exc:
+                        last_error = f"king marker movement was not verified: {exc}"
+                        verification = {
+                            **verification,
+                            "verified": False,
+                            "errors": [*verification.get("errors", []), last_error],
+                        }
+                else:
+                    king_stack = None
+                crown: dict[str, Any] | None = None
+                if verification.get("verified", False) and crown_after_move:
+                    try:
+                        crown_position = {
+                            "x": float(effective_command.args["x"]),
+                            "y": float(effective_command.args["y"]) + 0.5,
+                            "z": float(effective_command.args["z"]),
+                        }
+                        spawned = self.request("spawn_catalog", {"guid": str(source["guid"]), "position": crown_position})
+                        marker = spawned.get("object") or {}
+                        marker_guid = str(marker.get("guid") or "")
+                        if not marker_guid:
+                            raise RuntimeError("king marker clone returned no GUID")
+                        marker_command = ParsedCommand("move_object", {"guid": marker_guid, **crown_position})
+                        marker_verification = self._verify(marker_command)
+                        if not marker_verification.get("verified", False):
+                            raise RuntimeError("king marker did not settle on the crowned checker")
+                        crown = {"marker_guid": marker_guid, "position": crown_position, "result": spawned}
+                    except Exception as exc:
+                        last_error = f"crowning was not verified: {exc}"
+                        verification = {
+                            **verification,
+                            "verified": False,
+                            "errors": [*verification.get("errors", []), last_error],
+                        }
                 status = "executed" if verification.get("verified", False) else "unverified"
                 entry = {"action": command.action, "status": status, "attempts": attempt, "result": result, "verification": verification}
+                if position_correction is not None:
+                    entry["position_correction"] = position_correction
+                if capture is not None:
+                    entry["capture"] = capture
+                if king_stack is not None:
+                    entry["king_stack"] = king_stack
+                if crown is not None:
+                    entry["crown"] = crown
                 if last_error and status != "executed":
                     entry["error"] = last_error
+                if status != "executed" and verification.get("visual_review_required") and self.review is not None:
+                    try:
+                        entry["visual_review"] = self.review(entry)
+                    except Exception as exc:
+                        entry["visual_review"] = {
+                            "requested": True,
+                            "attached": False,
+                            "error": str(exc)[:300],
+                        }
                 results.append(entry)
-            except Exception as exc:  # bridge errors become retryable evidence, not crashes
+                if status != "executed":
+                    return {
+                        "executed": results,
+                        "approval_required": proposals,
+                        "stopped": True,
+                        "stop_reason": "action failed; waiting for player instructions",
+                    }
+            except Exception as exc:  # bridge errors become fail-fast evidence, not crashes
                 results.append({"action": command.action, "status": "failed", "error": str(exc), "args": command.args})
-        return {"executed": results, "approval_required": proposals}
+                return {
+                    "executed": results,
+                    "approval_required": proposals,
+                    "stopped": True,
+                    "stop_reason": "action failed; waiting for player instructions",
+                }
+        return {"executed": results, "approval_required": proposals, "stopped": False}
+
+    @staticmethod
+    def _checkers_piece_identity(piece: dict[str, Any]) -> str:
+        tags = piece.get("tags") or []
+        tag_text = " ".join(str(tag) for tag in tags) if isinstance(tags, list) else str(tags)
+        return f"{piece.get('name', '')} {tag_text}".lower()
+
+    @classmethod
+    def _checkers_capture_target(
+        cls,
+        source: dict[str, Any],
+        target: dict[str, Any],
+        objects: list[dict[str, Any]],
+    ) -> tuple[str | None, str | None]:
+        """Resolve the exact red checker removed by a validated two-square jump."""
+        source_position = source.get("position") or {}
+        try:
+            source_x = float(source_position["x"])
+            source_z = float(source_position["z"])
+            target_x = float(target["x"])
+            target_z = float(target["z"])
+        except (KeyError, TypeError, ValueError):
+            return None, "checkers capture requires numeric source and target coordinates"
+
+        tagged_squares = cls._checkers_tagged_square_grid(objects)
+        midpoint_x = (source_x + target_x) / 2
+        midpoint_z = (source_z + target_z) / 2
+        tolerance = 0.5
+        is_capture = False
+        if tagged_squares is not None:
+            def nearest_square(x: float, z: float) -> str:
+                return min(
+                    tagged_squares,
+                    key=lambda square: (tagged_squares[square][0] - x) ** 2 + (tagged_squares[square][1] - z) ** 2,
+                )
+
+            source_square = nearest_square(source_x, source_z)
+            target_square = nearest_square(target_x, target_z)
+            file_delta = ord(target_square[0]) - ord(source_square[0])
+            rank_delta = int(target_square[1]) - int(source_square[1])
+            is_capture = abs(file_delta) == abs(rank_delta) == 2
+            if is_capture:
+                midpoint_square = f"{chr(ord(source_square[0]) + file_delta // 2)}{int(source_square[1]) + rank_delta // 2}"
+                midpoint_x, midpoint_z = tagged_squares[midpoint_square]
+                centers = [position for position in tagged_squares.values()]
+                axis_steps = [
+                    abs(second - first)
+                    for axis in (0, 1)
+                    for first, second in zip(sorted({position[axis] for position in centers}), sorted({position[axis] for position in centers})[1:])
+                ]
+                tolerance = max(0.25, min(axis_steps) * 0.30)
+        else:
+            checker_positions: list[tuple[float, float]] = []
+            for item in objects:
+                if not isinstance(item, dict) or str(item.get("type", "")).lower() != "checker":
+                    continue
+                position = item.get("position") or {}
+                try:
+                    checker_positions.append((float(position["x"]), float(position["z"])))
+                except (KeyError, TypeError, ValueError):
+                    continue
+            if len(checker_positions) >= 2:
+                def step(axis: int) -> float | None:
+                    differences = sorted(
+                        abs(first[axis] - second[axis])
+                        for index, first in enumerate(checker_positions)
+                        for second in checker_positions[index + 1:]
+                        if 0.75 < abs(first[axis] - second[axis]) < 3.0
+                    )
+                    return differences[0] if differences else None
+
+                step_x, step_z = step(0), step(1)
+                if step_x and step_z:
+                    is_capture = round((target_x - source_x) / step_x) in {-2, 2} and round((target_z - source_z) / step_z) in {-2, 2}
+                    tolerance = max(0.25, min(step_x, step_z) * 0.30)
+
+        if not is_capture:
+            return None, None
+        candidates: list[dict[str, Any]] = []
+        source_guid = str(source.get("guid") or "").lower()
+        for item in objects:
+            if not isinstance(item, dict) or str(item.get("guid") or "").lower() == source_guid:
+                continue
+            if str(item.get("type", "")).lower() != "checker":
+                continue
+            position = item.get("position") or {}
+            try:
+                at_midpoint = abs(float(position["x"]) - midpoint_x) <= tolerance and abs(float(position["z"]) - midpoint_z) <= tolerance
+            except (KeyError, TypeError, ValueError):
+                continue
+            if at_midpoint:
+                candidates.append(item)
+        red_candidates = [item for item in candidates if "red" in cls._checkers_piece_identity(item)]
+        if len(red_candidates) != 1:
+            return None, "a two-square checkers move must jump exactly one opposing red checker"
+        return str(red_candidates[0].get("guid") or ""), None
+
+    @classmethod
+    def _checkers_reaches_black_king_row(cls, target: dict[str, Any], objects: list[dict[str, Any]]) -> bool:
+        tagged_squares = cls._checkers_tagged_square_grid(objects)
+        if tagged_squares is None:
+            return False
+        try:
+            target_z = float(target["z"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        z_values = [position[1] for position in tagged_squares.values()]
+        spacing = min(second - first for first, second in zip(sorted(set(z_values)), sorted(set(z_values))[1:]))
+        return abs(target_z - min(z_values)) <= max(0.25, spacing * 0.30)
+
+    @staticmethod
+    def _stacked_checker_companions(source: dict[str, Any], objects: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        source_position = source.get("position") or {}
+        try:
+            source_x = float(source_position["x"])
+            source_y = float(source_position["y"])
+            source_z = float(source_position["z"])
+        except (KeyError, TypeError, ValueError):
+            return []
+        source_guid = str(source.get("guid") or "")
+        companions: list[dict[str, Any]] = []
+        for candidate in objects:
+            if not isinstance(candidate, dict) or str(candidate.get("guid") or "") == source_guid:
+                continue
+            if str(candidate.get("type", "")).lower() != "checker":
+                continue
+            position = candidate.get("position") or {}
+            try:
+                delta_x = float(position["x"]) - source_x
+                delta_y = abs(float(position["y"]) - source_y)
+                delta_z = float(position["z"]) - source_z
+            except (KeyError, TypeError, ValueError):
+                continue
+            if (delta_x * delta_x + delta_z * delta_z) <= 0.16 and 0.05 <= delta_y <= 1.0:
+                companions.append(candidate)
+        return companions
+
+    @classmethod
+    def _checkers_tagged_square_grid(
+        cls,
+        objects: list[dict[str, Any]],
+    ) -> dict[str, tuple[float, float]] | None:
+        """Return the authoritative A1-H8 square centers when TTS exposes them.
+
+        Checkers themselves are movable and can be left a few hundredths of a
+        unit off-center after prior turns.  Their positions are therefore a
+        poor source of board geometry when the save includes tagged Layout
+        zones for every square.
+        """
+        squares: dict[str, tuple[float, float]] = {}
+        for item in objects:
+            if not isinstance(item, dict):
+                continue
+            tags = item.get("tags") or []
+            position = item.get("position") or {}
+            try:
+                x = float(position["x"])
+                z = float(position["z"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            for tag in tags:
+                square = str(tag).strip().upper()
+                if not re.fullmatch(r"[A-H][1-8]", square):
+                    continue
+                if square in squares:
+                    # Ambiguous zones must not control a physical move.
+                    return None
+                squares[square] = (x, z)
+
+        expected = {f"{letter}{rank}" for letter in "ABCDEFGH" for rank in range(1, 9)}
+        return squares if set(squares) == expected else None
+
+    @classmethod
+    def _normalize_checkers_move_with_tagged_squares(
+        cls,
+        args: dict[str, Any],
+        source: dict[str, Any],
+        objects: list[dict[str, Any]],
+        squares: dict[str, tuple[float, float]],
+    ) -> tuple[dict[str, Any], dict[str, Any] | None, str | None]:
+        """Validate a move against fixed board zones instead of movable men."""
+        source_position = source.get("position") or {}
+        try:
+            source_x = float(source_position["x"])
+            source_z = float(source_position["z"])
+            requested_x = float(args["x"])
+            requested_z = float(args["z"])
+        except (KeyError, TypeError, ValueError):
+            return dict(args), None, "checkers move requires numeric x and z coordinates"
+
+        def nearest_square(x: float, z: float) -> tuple[str, float]:
+            square, position = min(
+                squares.items(),
+                key=lambda entry: (entry[1][0] - x) ** 2 + (entry[1][1] - z) ** 2,
+            )
+            return square, ((position[0] - x) ** 2 + (position[1] - z) ** 2) ** 0.5
+
+        source_square, source_distance = nearest_square(source_x, source_z)
+        target_square, target_distance = nearest_square(requested_x, requested_z)
+        column_centers = sorted({position[0] for position in squares.values()})
+        rank_centers = sorted({position[1] for position in squares.values()})
+        step = min(
+            min(abs(second - first) for first, second in zip(column_centers, column_centers[1:])),
+            min(abs(second - first) for first, second in zip(rank_centers, rank_centers[1:])),
+        )
+        source_tolerance = max(0.5, step * 0.30)
+        target_tolerance = max(0.25, step * 0.30)
+        if source_distance > source_tolerance:
+            return dict(args), None, "source checker is not on a known checkers square; refusing an uncertain move"
+        if target_distance > target_tolerance:
+            return dict(args), None, "target is between tagged checkers squares; refusing an imprecise move"
+
+        column_delta = ord(target_square[0]) - ord(source_square[0])
+        rank_delta = int(target_square[1]) - int(source_square[1])
+        if abs(column_delta) != abs(rank_delta) or abs(column_delta) not in {1, 2}:
+            return dict(args), None, "target is not a one-step or capture diagonal on the checkers board"
+
+        target_x, target_z = squares[target_square]
+        for item in objects:
+            if not isinstance(item, dict) or str(item.get("guid") or "") == str(source.get("guid") or ""):
+                continue
+            if str(item.get("type", "")).lower() != "checker":
+                continue
+            position = item.get("position") or {}
+            try:
+                occupied_x = float(position["x"])
+                occupied_z = float(position["z"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if abs(occupied_x - target_x) <= target_tolerance and abs(occupied_z - target_z) <= target_tolerance:
+                return dict(args), None, "target square is occupied; refusing to move onto another checker"
+
+        corrected = dict(args)
+        corrected["x"] = target_x
+        corrected["z"] = target_z
+        if corrected == args:
+            return corrected, None, None
+        return corrected, {
+            "requested": {"x": requested_x, "z": requested_z},
+            "corrected": {"x": target_x, "z": target_z},
+            "source_square": source_square,
+            "target_square": target_square,
+        }, None
+
+    @classmethod
+    def _normalize_checkers_move(
+        cls,
+        args: dict[str, Any],
+        source: dict[str, Any],
+        objects: list[dict[str, Any]],
+    ) -> tuple[dict[str, Any], dict[str, Any] | None, str | None]:
+        """Snap only obvious model rounding to the live checkers square lattice.
+
+        Vision models commonly calculate a diagonal using ``sqrt(2)``. TTS
+        board squares are axis-aligned world-coordinate centers, so that
+        calculation lands between squares. Prefer fixed A1-H8 Layout zones;
+        only fall back to live checker spacing when the board has no complete
+        tagged grid.
+        """
+        tagged_squares = cls._checkers_tagged_square_grid(objects)
+        if tagged_squares is not None:
+            return cls._normalize_checkers_move_with_tagged_squares(args, source, objects, tagged_squares)
+
+        checker_positions: list[tuple[float, float]] = []
+        for item in objects:
+            if not isinstance(item, dict) or str(item.get("type", "")).lower() != "checker":
+                continue
+            position = item.get("position") or {}
+            try:
+                checker_positions.append((float(position["x"]), float(position["z"])))
+            except (KeyError, TypeError, ValueError):
+                continue
+        if len(checker_positions) < 2:
+            return dict(args), None, None
+
+        def spacing(axis: int) -> float | None:
+            differences = sorted(
+                abs(first[axis] - second[axis])
+                for index, first in enumerate(checker_positions)
+                for second in checker_positions[index + 1:]
+                if 0.75 < abs(first[axis] - second[axis]) < 3.0
+            )
+            return differences[0] if differences else None
+
+        step_x = spacing(0)
+        step_z = spacing(1)
+        if step_x is None or step_z is None:
+            return dict(args), None, None
+
+        source_position = source.get("position") or {}
+        try:
+            source_x = float(source_position["x"])
+            source_z = float(source_position["z"])
+            requested_x = float(args["x"])
+            requested_z = float(args["z"])
+        except (KeyError, TypeError, ValueError):
+            return dict(args), None, "checkers move requires numeric x and z coordinates"
+
+        raw_dx = requested_x - source_x
+        raw_dz = requested_z - source_z
+        if abs(raw_dx) < 0.25 or abs(raw_dz) < 0.25:
+            return dict(args), None, "checkers moves must change x and z diagonally; target is not a board square"
+
+        steps_x = round(raw_dx / step_x)
+        steps_z = round(raw_dz / step_z)
+        if steps_x == 0 or steps_z == 0 or abs(steps_x) != abs(steps_z) or abs(steps_x) not in {1, 2}:
+            return dict(args), None, "target is not a one-step or capture diagonal on the live checkers board"
+
+        target_x = source_x + steps_x * step_x
+        target_z = source_z + steps_z * step_z
+        error_x = abs(requested_x - target_x)
+        error_z = abs(requested_z - target_z)
+        tolerance = max(0.25, min(step_x, step_z) * 0.30)
+        if error_x > tolerance or error_z > tolerance:
+            return dict(args), None, "target is between live checkers squares; refusing an imprecise move"
+
+        # A landing square must be empty. This also prevents correcting a
+        # stale model command onto another piece's square.
+        for item in checker_positions:
+            if abs(item[0] - target_x) <= tolerance and abs(item[1] - target_z) <= tolerance:
+                try:
+                    same_source = abs(item[0] - source_x) <= tolerance and abs(item[1] - source_z) <= tolerance
+                except TypeError:
+                    same_source = False
+                if not same_source:
+                    return dict(args), None, "target square is occupied; refusing to move onto another checker"
+
+        corrected = dict(args)
+        corrected["x"] = target_x
+        corrected["z"] = target_z
+        if corrected == args:
+            return corrected, None, None
+        return corrected, {
+            "requested": {"x": requested_x, "z": requested_z},
+            "corrected": {"x": target_x, "z": target_z},
+            "grid_step": {"x": step_x, "z": step_z},
+        }, None
 
     @staticmethod
     def _is_double_stacked_checker(source: dict[str, Any], objects: list[dict[str, Any]]) -> bool:
@@ -307,42 +959,55 @@ class CommandExecution:
         except (TypeError, ValueError):
             pass
 
-        source_guid = str(source.get("guid") or "")
-        for candidate in objects:
-            if not isinstance(candidate, dict) or str(candidate.get("guid") or "") == source_guid:
-                continue
-            if str(candidate.get("type", "")).lower() != "checker":
-                continue
-            position = candidate.get("position") or {}
-            try:
-                delta_x = float(position["x"]) - source_x
-                delta_y = abs(float(position["y"]) - source_y)
-                delta_z = float(position["z"]) - source_z
-            except (KeyError, TypeError, ValueError):
-                continue
-            if (delta_x * delta_x + delta_z * delta_z) <= 0.16 and 0.05 <= delta_y <= 1.0:
-                return True
-        return False
+        return bool(CommandExecution._stacked_checker_companions(source, objects))
 
     def _verify(self, command: ParsedCommand) -> dict[str, Any]:
         guid = command.args.get("guid")
         if not guid or command.action not in {"move_object", "rotate_object", "set_object_lock"}:
             return {"verified": True, "checks": ["bridge acknowledged action"]}
-        actual = self.request("get_object", {"guid": guid})
+        try:
+            actual = self.request("get_object", {"guid": guid})
+        except Exception:
+            # Some TTS builds intermittently drop the compact single-object
+            # callback while still answering list_objects. Keep verification
+            # authoritative without treating a successful move as unverified
+            # solely because that endpoint missed its callback.
+            if command.action != "move_object":
+                raise
+            listing = self.request("list_objects", {"max_results": 250, "compact": True})
+            actual = next(
+                (item for item in listing.get("objects", []) if str(item.get("guid", "")).lower() == str(guid).lower()),
+                None,
+            )
+            if actual is None:
+                raise
         errors: list[str] = []
+        position_delta: dict[str, float] = {}
+        visual_review_required = False
         if command.action == "set_object_lock" and actual.get("locked") != command.args.get("locked"):
             errors.append("lock state did not match requested state")
         if command.action == "move_object":
             position = actual.get("position") or {}
             for axis in ("x", "y", "z"):
-                if abs(float(position.get(axis, 0)) - float(command.args[axis])) > 0.15:
-                    errors.append(f"position.{axis} did not settle at target")
+                delta = abs(float(position.get(axis, 0)) - float(command.args[axis]))
+                position_delta[axis] = delta
+                if delta > 0.15:
+                    errors.append(f"position.{axis} did not settle at target (off by {delta:.3f})")
+                if delta > 0.5:
+                    visual_review_required = True
         if command.action == "rotate_object":
             rotation = actual.get("rotation") or {}
             for axis in ("x", "y", "z"):
                 if abs(float(rotation.get(axis, 0)) - float(command.args[axis])) > 1.0:
                     errors.append(f"rotation.{axis} did not settle at target")
-        return {"verified": not errors, "checks": ["post-action get_object"], "errors": errors, "object": actual}
+        return {
+            "verified": not errors,
+            "checks": ["post-action get_object"],
+            "errors": errors,
+            "object": actual,
+            "position_delta": position_delta,
+            "visual_review_required": visual_review_required,
+        }
 
     @staticmethod
     def _bridge_args(command: ParsedCommand) -> dict[str, Any]:
@@ -354,7 +1019,7 @@ class CommandExecution:
             return {
                 "guid": args["guid"],
                 "position": {axis: float(args[axis]) for axis in ("x", "y", "z")},
-                "smooth": True,
+                "smooth": not bool(args.get("_checkers_instant", False)),
                 "collide": False,
                 "fast": False,
             }

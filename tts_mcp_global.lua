@@ -8,6 +8,17 @@
 
 local MCP_CHANNEL = "tts-mcp"
 local MCP_HTTP_CHAT_URL = "http://127.0.0.1:8765/chat"
+-- A private callback for bridge results. Unlike print(), this never appears
+-- in the in-game player chat or console feed.
+local MCP_HTTP_BRIDGE_RESPONSE_URL = "http://127.0.0.1:8765/bridge/response"
+-- Diagnostics belong in the Python server trace, not in player chat or the
+-- normal TTS output. Enable only for Lua-side troubleshooting.
+local MCP_DEBUG_PRINT = false
+local function mcp_debug(message)
+    if MCP_DEBUG_PRINT then
+        print(message)
+    end
+end
 -- `!ai` is interpreted by the HTTP gateway for controls. All chat is sent to
 -- the gateway so the configured AI can participate proactively.
 -- Empty trigger forwards all player chat to the configured AI backend.
@@ -122,9 +133,9 @@ local function mcp_object_summary(obj)
     }
 end
 
--- External Editor callbacks are size-sensitive. AI scene inspection only
--- needs identity, tags, transforms, bounds, and containment; omit volatile
--- velocity/axis metadata so a populated table still returns one response.
+-- External Editor callbacks are size-sensitive. AI scene inspection needs
+-- identity, transforms, bounds, and the small motion signal used by settle
+-- polling; omit the larger volatile velocity/axis metadata.
 local function mcp_compact_object_summary(obj)
     return {
         guid = mcp_try(function() return obj.getGUID() end),
@@ -135,6 +146,8 @@ local function mcp_compact_object_summary(obj)
         rotation = mcp_vector(mcp_try(function() return obj.getRotation() end)),
         bounds = mcp_bounds(mcp_try(function() return obj.getBounds() end)),
         locked = mcp_try(function() return obj.getLock() end),
+        smooth_moving = mcp_try(function() return obj.isSmoothMoving() end),
+        smooth_position = mcp_vector(mcp_try(function() return obj.getPositionSmooth() end)),
         zone_guids = mcp_zone_guids(obj),
     }
 end
@@ -173,8 +186,28 @@ local function mcp_json_safe(value, depth)
     return tostring(value)
 end
 
+local function mcp_post_bridge_response(response)
+    -- Keep a second, non-player-visible response path for TTS builds that
+    -- drop sendExternalMessage callbacks. The Python gateway correlates the
+    -- requestId with its pending bridge request.
+    WebRequest.custom(
+        MCP_HTTP_BRIDGE_RESPONSE_URL,
+        "POST",
+        true,
+        JSON.encode(response),
+        { ["Content-Type"] = "application/json", ["Accept"] = "application/json" },
+        function(request)
+            if request.is_error then
+                mcp_debug("[tts-mcp] HTTP response callback failed: " .. tostring(request.error))
+            elseif request.response_code < 200 or request.response_code >= 300 then
+                mcp_debug("[tts-mcp] HTTP response callback status: " .. tostring(request.response_code))
+            end
+        end
+    )
+end
+
 local function mcp_send_ok(request_id, result)
-    print("[tts-mcp] sending success response for " .. tostring(request_id))
+    mcp_debug("[tts-mcp] sending success response for " .. tostring(request_id))
     local response = {
         channel = MCP_CHANNEL,
         event = "mcp_response",
@@ -182,20 +215,19 @@ local function mcp_send_ok(request_id, result)
         ok = true,
         result = mcp_json_safe(result),
     }
-    -- Some TTS builds drop sendExternalMessage responses while still sending
-    -- ordinary External Editor print callbacks. Emit a compact JSON fallback
-    -- on that reliable channel; Python matches it by requestId.
-    print("[tts-mcp-response]" .. JSON.encode(response))
-    -- Defer the callback until after onExternalMessage returns. This avoids
-    -- TTS dropping a nested sendExternalMessage call on some versions.
+    -- Send once immediately and once after the callback returns. Different
+    -- TTS builds have dropped one of these timing modes, while the Python
+    -- request waiter safely ignores a duplicate response.
+    mcp_post_bridge_response(response)
+    sendExternalMessage(response)
     Wait.frames(function()
         sendExternalMessage(response)
-        print("[tts-mcp] success response sent")
+        mcp_debug("[tts-mcp] success response sent")
     end, 1)
 end
 
 local function mcp_send_error(request_id, err)
-    print("[tts-mcp] sending error response for " .. tostring(request_id))
+    mcp_debug("[tts-mcp] sending error response for " .. tostring(request_id))
     local response = {
         channel = MCP_CHANNEL,
         event = "mcp_response",
@@ -203,10 +235,11 @@ local function mcp_send_error(request_id, err)
         ok = false,
         error = tostring(err),
     }
-    print("[tts-mcp-response]" .. JSON.encode(response))
+    mcp_post_bridge_response(response)
+    sendExternalMessage(response)
     Wait.frames(function()
         sendExternalMessage(response)
-        print("[tts-mcp] error response sent")
+        mcp_debug("[tts-mcp] error response sent")
     end, 1)
 end
 
@@ -692,10 +725,15 @@ MCP_HANDLERS.move_object = function(args, request_id)
     end
     local position = {x = x, y = y, z = z}
 
-    -- This deliberately matches the V6 movement path: resolve the in-scene
-    -- GUID first, then pass a native Lua position table to TTS.  Do not pass
-    -- any External Editor-provided vector/table to setPositionSmooth.
-    obj.setPositionSmooth(position, false, false)
+    -- Resolve the in-scene GUID first, then pass a native Lua position table
+    -- to TTS. Do not pass any External Editor-provided vector/table to the
+    -- object API. The generic tool remains unrestricted, so honor its motion
+    -- options here rather than silently forcing smooth movement.
+    if args.smooth == false then
+        obj.setPosition(position)
+    else
+        obj.setPositionSmooth(position, args.collide == true, args.fast ~= false)
+    end
 
     -- setPositionSmooth is asynchronous.  Reply after the move has had a
     -- short opportunity to settle so Python's post-command get_object check
@@ -811,24 +849,134 @@ local function mcp_forward_chat(message, sender)
     end, 1)
 end
 
-function mcp_handleExternalMessage(data)
-    -- TTS normally passes the messageID=2 customMessage table directly to
-    -- onExternalMessage.  Some External Editor-compatible hosts pass the
-    -- complete envelope instead, so unwrap that form as well.  Supporting
-    -- both forms keeps the bridge from silently ignoring commands and
-    -- leaving the Python caller waiting for a response.
-    if type(data) == "table" and data.messageID == 2 then
-        data = data.customMessage
-    end
-    -- TTS can pass custom messages directly as a JSON string, rather than in
-    -- the messageID=2 envelope. Decode either delivery form before routing.
-    if type(data) == "string" then
-        local ok, decoded = pcall(function() return JSON.decode(data) end)
-        if not ok then
-            return false
+local function mcp_trim(value)
+    -- Avoid Lua patterns for whole AI responses. MoonSharp can report
+    -- "pattern too complex" when a non-greedy trim pattern scans a large
+    -- multimodal response.
+    local text = tostring(value or "")
+    local first = 1
+    local last = string.len(text)
+    while first <= last do
+        local char = string.sub(text, first, first)
+        if char ~= " " and char ~= "\t" and char ~= "\r" and char ~= "\n" then
+            break
         end
-        data = decoded
+        first = first + 1
     end
+    while last >= first do
+        local char = string.sub(text, last, last)
+        if char ~= " " and char ~= "\t" and char ~= "\r" and char ~= "\n" then
+            break
+        end
+        last = last - 1
+    end
+    if first > last then
+        return ""
+    end
+    return string.sub(text, first, last)
+end
+
+local function mcp_split_lines(text)
+    local lines = {}
+    local start_index = 1
+    local length = string.len(text)
+    for index = 1, length do
+        if string.sub(text, index, index) == "\n" then
+            table.insert(lines, string.sub(text, start_index, index - 1))
+            start_index = index + 1
+        end
+    end
+    table.insert(lines, string.sub(text, start_index, length))
+    return lines
+end
+
+local function mcp_collapse_horizontal_whitespace(value)
+    local text = tostring(value or "")
+    local chars = {}
+    local pending_space = false
+    for index = 1, string.len(text) do
+        local char = string.sub(text, index, index)
+        if char == " " or char == "\t" then
+            pending_space = true
+        else
+            if pending_space and #chars > 0 then
+                table.insert(chars, " ")
+            end
+            table.insert(chars, char)
+            pending_space = false
+        end
+    end
+    return table.concat(chars)
+end
+
+local function mcp_public_chat_text(value)
+    -- Final player-chat boundary: internal board snapshots and telemetry must
+    -- never be broadcast, even if an older Python gateway returns them.
+    local text = tostring(value or "")
+    text = mcp_trim(text)
+    if text == "" then
+        return ""
+    end
+    -- JSON is transport data, not player-facing chat. This also catches
+    -- multi-line JSON responses before row-level filtering below.
+    local json_ok, decoded = pcall(function() return JSON.decode(text) end)
+    if json_ok and type(decoded) == "table" then
+        return ""
+    end
+    local lines = {}
+    for _, raw_line in ipairs(mcp_split_lines(text)) do
+        local line = mcp_trim(raw_line)
+        -- TTS renders tabs and repeated spaces literally; keep the final
+        -- player-facing message compact even if the backend padded a line.
+        line = mcp_collapse_horizontal_whitespace(line)
+        if line ~= "" then
+            local lowered = string.lower(line)
+            local has_guid = string.find(lowered, "guid", 1, true) ~= nil
+            local has_position = string.find(lowered, "position", 1, true) ~= nil
+            local has_rotation = string.find(lowered, "rotation", 1, true) ~= nil
+            local has_bounds = string.find(lowered, "bounds", 1, true) ~= nil
+            local is_internal_header = string.find(lowered, "current tabletop simulator state", 1, true) ~= nil
+                or string.find(lowered, "relevant scene/catalog candidates", 1, true) ~= nil
+                or string.find(lowered, "authoritative current context", 1, true) ~= nil
+            local is_raw_state = (has_guid and (has_position or has_rotation or has_bounds))
+                or (string.sub(line, 1, 1) == "{" and string.sub(line, -1) == "}")
+            if not is_internal_header and not is_raw_state then
+                table.insert(lines, line)
+            end
+        end
+    end
+    text = table.concat(lines, "\n")
+    text = mcp_trim(text)
+    if string.len(text) > 2000 then
+        text = string.sub(text, 1, 1997) .. "..."
+    end
+    return text
+end
+
+local function mcp_decode_message(data)
+    if type(data) ~= "string" then
+        return data
+    end
+    local ok, decoded = pcall(function() return JSON.decode(data) end)
+    if not ok then
+        return nil
+    end
+    return decoded
+end
+
+local function mcp_unwrap_external_message(data)
+    -- TTS can deliver either a Lua table or a JSON string. Decode first, then
+    -- unwrap the messageID=2 envelope; doing this in the opposite order drops
+    -- commands when the decoded envelope still contains messageID=2.
+    data = mcp_decode_message(data)
+    if type(data) == "table" and tostring(data.messageID or "") == "2" then
+        data = mcp_decode_message(data.customMessage)
+    end
+    return data
+end
+
+function mcp_handleExternalMessage(data)
+    data = mcp_unwrap_external_message(data)
 
     if type(data) ~= "table" or data.channel ~= MCP_CHANNEL then
         return false
@@ -848,9 +996,12 @@ function mcp_handleExternalMessage(data)
                 y = tonumber(data.y),
                 z = tonumber(data.z),
             },
+            smooth = data.smooth ~= false,
+            collide = data.collide == true,
+            fast = data.fast ~= false,
         }
         local handler = MCP_HANDLERS[action]
-        print("[tts-mcp] received action: " .. action)
+        mcp_debug("[tts-mcp] received action: " .. action)
         if handler == nil then
             mcp_send_error(request_id, "Unknown MCP action: " .. action)
             return true
@@ -874,7 +1025,7 @@ function mcp_handleExternalMessage(data)
     if args.locked == nil and data.locked ~= nil then args.locked = data.locked end
     local handler = MCP_HANDLERS[action]
 
-    print("[tts-mcp] received action: " .. action)
+    mcp_debug("[tts-mcp] received action: " .. action)
 
     if handler == nil then
         mcp_send_error(request_id, "Unknown MCP action: " .. action)
@@ -903,6 +1054,12 @@ function onChat(message, sender)
     mcp_forward_chat(message, sender)
 
     local raw_message = tostring(message or "")
+    raw_message = mcp_trim(raw_message)
+    if raw_message == "" then
+        mcp_debug("[TTS AI] chat ignored: empty message")
+        return nil
+    end
+    mcp_debug("[TTS AI] chat received; sending to http://127.0.0.1:8765/chat")
     WebRequest.custom(
         MCP_HTTP_CHAT_URL,
         "POST",
@@ -919,24 +1076,32 @@ function onChat(message, sender)
         { ["Content-Type"] = "application/json", ["Accept"] = "application/json" },
         function(request)
             if request.is_error then
-                printToAll("[TTS AI] HTTP error: " .. tostring(request.error), {1, 0.4, 0.4})
+                mcp_debug("[TTS AI] HTTP error: " .. tostring(request.error))
                 return
             end
+            mcp_debug("[TTS AI] HTTP response: " .. tostring(request.response_code))
             if request.response_code < 200 or request.response_code >= 300 then
-                printToAll("[TTS AI] HTTP status: " .. tostring(request.response_code), {1, 0.4, 0.4})
+                local body = tostring(request.text or "")
+                if string.len(body) > 500 then
+                    body = string.sub(body, 1, 497) .. "..."
+                end
+                mcp_debug("[TTS AI] HTTP status: " .. tostring(request.response_code) .. " body: " .. body)
                 return
             end
 
             local ok, response = pcall(function() return JSON.decode(request.text or "") end)
             if not ok or type(response) ~= "table" then
-                printToAll("[TTS AI] Invalid JSON response", {1, 0.4, 0.4})
+                mcp_debug("[TTS AI] Invalid JSON response")
                 return
             end
-            local text = tostring(response.text or "")
+            local text = mcp_public_chat_text(response.text or "")
             if text ~= "" then
-                printToAll(text, {0.65, 0.9, 1.0})
+                -- Explicit alpha avoids TTS's translucent default text.
+                printToAll(text, {r = 1, g = 1, b = 1, a = 1})
             end
         end
     )
-    return true
+    -- Do not consume the original player message. Returning nil preserves
+    -- TTS's normal chat rendering while the AI reply is handled separately.
+    return nil
 end

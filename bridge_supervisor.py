@@ -47,6 +47,7 @@ class ProcessSupervisor:
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self.process: subprocess.Popen[Any] | None = None
+        self._stderr_thread: threading.Thread | None = None
         self.log_path = ROOT / "tts_mcp_server.log"
 
     def _is_running(self) -> bool:
@@ -63,6 +64,29 @@ class ProcessSupervisor:
                 "log": str(self.log_path),
             }
 
+    def _forward_stderr(self, process: subprocess.Popen[Any]) -> None:
+        """Mirror child trace output to this console while retaining a log file."""
+        stream = process.stderr
+        if stream is None:
+            return
+        try:
+            with self.log_path.open("ab") as log:
+                for chunk in iter(stream.readline, b""):
+                    if not chunk:
+                        break
+                    log.write(chunk)
+                    log.flush()
+                    try:
+                        console = getattr(sys.stdout, "buffer", sys.stdout)
+                        console.write(chunk)
+                        console.flush()
+                    except (OSError, TypeError, ValueError):
+                        # The console can disappear during shutdown; the file
+                        # copy remains available for post-mortem inspection.
+                        pass
+        finally:
+            stream.close()
+
     def start(self) -> dict[str, Any]:
         with self._lock:
             if self._is_running():
@@ -75,6 +99,7 @@ class ProcessSupervisor:
             )
             env = os.environ.copy()
             env["TTS_SUPERVISED"] = "1"
+            env.setdefault("PYTHONUNBUFFERED", "1")
             log = self.log_path.open("ab")
             flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
             self.process = subprocess.Popen(
@@ -83,10 +108,18 @@ class ProcessSupervisor:
                 env=env,
                 stdin=subprocess.DEVNULL,
                 stdout=log,
-                stderr=subprocess.STDOUT,
+                stderr=subprocess.PIPE,
+                bufsize=0,
                 creationflags=flags,
             )
             log.close()
+            self._stderr_thread = threading.Thread(
+                target=self._forward_stderr,
+                args=(self.process,),
+                name="tts-mcp-child-trace",
+                daemon=True,
+            )
+            self._stderr_thread.start()
             _record_trace(
                 "process_started",
                 component="mcp_server",
@@ -122,6 +155,9 @@ class ProcessSupervisor:
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait(timeout=5)
+            if self._stderr_thread is not None:
+                self._stderr_thread.join(timeout=2)
+                self._stderr_thread = None
             self.process = None
             _record_trace(
                 "process_stopped",
@@ -171,6 +207,7 @@ def main() -> None:
     try:
         if os.getenv("TTS_SUPERVISOR_AUTOSTART", "1").strip().lower() not in {"0", "false", "no", "off"}:
             supervisor.start()
+        print("Live child server trace is mirrored below; MCP protocol output is saved to tts_mcp_server.log.", flush=True)
         print(f"TTS supervisor: http://{SUPERVISOR_HOST}:{SUPERVISOR_PORT}/admin", flush=True)
         http.serve_forever()
     finally:

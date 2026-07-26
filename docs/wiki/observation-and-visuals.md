@@ -35,12 +35,19 @@ include its rectangle, dimensions, timestamp, camera settings, and health
 status. A useful visual workflow is:
 
 1. Calibrate the screen rectangle containing TTS.
-2. Inspect structured state.
+2. Prefer the fast `tts_list_objects` structured observation.
 3. Move/focus the camera using object bounds.
 4. Wait for the camera and physics to settle.
 5. Capture the image.
 6. Execute the bounded action.
-7. Re-inspect and capture an after image when visual confirmation matters.
+7. Re-inspect the structured state after the action.
+8. If any position axis is more than 0.5 TTS world units from the expected value,
+   capture one diagnostic screenshot for the AI and stop all further actions.
+
+Failed actions are uncertainty stops. The gateway reports the failure in
+player chat, does not retry or continue later commands from the same response,
+and waits for new player instructions. A player may complete the move manually,
+but the AI must re-observe the live board before acting again.
 
 Annotations such as GUID labels and bounds should be rendered into a copy of
 the screenshot in Python, not injected into the TTS scene.

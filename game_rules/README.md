@@ -34,3 +34,10 @@ rules while a game is in progress.
 
 Rules references must also avoid embedding hidden game state, opponent hands,
 or other information that would let the AI cheat.
+
+Each subdirectory is a selectable game. Its `rules.md` is injected into the
+AI opponent's turn prompt after the game is selected with `!ai game <name>`.
+The AI uses that file as the rules authority and plays as a participant; it is
+not a D&D Dungeon Master or a general-purpose narrator. Add the game's board
+mapping, AI side, turn detection, legal-move rules, visibility limits, and
+TTS-specific action mapping here.

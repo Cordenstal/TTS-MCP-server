@@ -23,12 +23,14 @@ variant, stop and ask the host to identify the variant before acting.
   changing `x` diagonally. A move with unchanged or increased `z` is sideways
   or backward and is illegal for the AI's uncrowned pieces.
 - A king is represented by two Checker objects vertically stacked on the same
-  square. A detected double-stacked king may move or capture diagonally in
-  either direction.
+  square. When an uncrowned black checker reaches the red-side back rank, the
+  gateway clones it as the upper marker and verifies that stack. A detected
+  double-stacked king may move or capture diagonally in either direction.
 - Captures are still governed by the standard rules below: an uncrowned man
   may capture forward or backward when a verified capture is available.
-- Use the live source piece's GUID and coordinates. Do not infer forward from
-  the camera view. Never issue `MOVE` merely to reposition sideways.
+- Use the live source piece's GUID and destination square tag. Do not infer
+  forward from the camera view. Never issue `MOVE` merely to reposition
+  sideways.
 
 - Each side begins with 12 pieces on the dark squares of the three ranks
   nearest that side.
@@ -61,12 +63,13 @@ squares, and whether any capture is available anywhere for that side.
 
 When the AI controller is running and the AI's side, piece GUID, and legal
 destination are verified from the current live scene inventory and camera
-image, execute the move itself. Emit `MOVE[guid,x,y,z]` using the exact GUID
-and world coordinates of the chosen landing square; do not ask a player to
-move the piece. Preserve the piece's current `y` coordinate unless the table
-mapping specifies a different resting height. The bridge verifies the final
-transform after execution. If the board mapping or any mandatory capture is
-ambiguous, stop and ask the host rather than guessing.
+image, execute the move itself with `tts_move_checkers_piece`, passing the
+piece GUID and the destination's `target_zone_tag`, such as `C5`. The tagged
+invisible `LayoutZone` is authoritative; do not calculate or supply world X/Z
+coordinates when a tagged square exists. The tool validates the diagonal,
+occupancy, capture, direction, source height, and settled final transform.
+If the board mapping or any mandatory capture is ambiguous, stop and ask the
+host rather than guessing.
 
 If side to move, board orientation, piece identity, square occupancy, or the
 availability of a capture is ambiguous, stop and ask for clarification.
@@ -143,8 +146,9 @@ The save should provide, or allow the AI to verify, all of the following:
 
 - Board object name/tag, orientation, and mapping from dark squares to world
   coordinates.
-- Square names/tags such as `checkers-square a1`; only dark-square tags are
-  valid for movement.
+- One invisible locked `LayoutZone` for each board square, tagged `A1` through
+  `H8`; these tags are the canonical movement destinations. Optional metadata
+  tags such as `checkers-square a1` may also be present.
 - Piece names such as `Red Man`, `Black Man`, `Red King`, and `Black King`.
 - Piece tags such as `checkers-piece red man`,
   `checkers-piece black man`, `checkers-piece red king`, and
@@ -163,3 +167,8 @@ Captures should move the opposing piece to a visible, designated capture area
 or use the table's established removal convention. Do not destroy captured
 objects automatically. Any irreversible scene change or replacement piece
 requires the normal host approval process.
+
+For the bundled tagged board, captured red checkers are placed in orderly
+slots beyond the board's positive-X edge (and captured black checkers beyond
+the negative-X edge). This keeps them visible and recoverable while leaving
+the eight-by-eight play area clear.
