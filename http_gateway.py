@@ -30,6 +30,7 @@ from gameplay_runtime import (
     classify_intent,
     parse_ai_commands,
 )
+from checkers_runtime import AutonomousCheckersTurn, CheckersBoardAdapter
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -673,6 +674,9 @@ class ChatBackend:
         self.observation_tools: dict[str, Callable[[dict[str, Any]], Any]] = {}
         self.controller_provider: Callable[[], dict[str, Any]] | None = None
         self.command_execution: CommandExecution | None = None
+        self._game_position_provider: Callable[[], dict[str, Any] | None] | None = None
+        self._game_position_saver: Callable[[dict[str, Any] | None], None] | None = None
+        self._turn_completed: Callable[[str], Any] | None = None
         self._turn_lock = threading.RLock()
         self._context_local = threading.local()
         catalog_path = os.getenv("TTS_OBJECT_CATALOG", "").strip()
@@ -690,6 +694,9 @@ class ChatBackend:
         controller_provider: Callable[[], dict[str, Any]],
         request: Callable[[str, dict[str, Any]], dict[str, Any]],
         propose: Callable[[dict[str, Any]], str],
+        game_position_provider: Callable[[], dict[str, Any] | None] | None = None,
+        game_position_saver: Callable[[dict[str, Any] | None], None] | None = None,
+        turn_completed: Callable[[str], Any] | None = None,
     ) -> None:
         self.controller_provider = controller_provider
         self.command_execution = CommandExecution(
@@ -697,6 +704,9 @@ class ChatBackend:
             propose,
             review=self._review_execution_failure,
         )
+        self._game_position_provider = game_position_provider
+        self._game_position_saver = game_position_saver
+        self._turn_completed = turn_completed
 
     def configure_observation_tools(
         self, tools: dict[str, Callable[[dict[str, Any]], Any]]
@@ -1204,15 +1214,8 @@ class ChatBackend:
             text = str(result.get("text", ""))
             commands = parse_ai_commands(text)
             controller = self.controller_provider() if self.controller_provider else {}
+            active_checkers = str(controller.get("active_game", "")).strip().lower() == "checkers"
             corrections: list[dict[str, Any]] = []
-            if str(controller.get("active_game", "")).strip().lower() == "checkers":
-                candidates = result.get("_checkers_legal_moves")
-                if isinstance(candidates, list):
-                    commands, corrections = self._normalize_checkers_commands(
-                        commands,
-                        candidates,
-                        mandatory_capture=bool(result.get("_checkers_mandatory_capture", False)),
-                    )
             # Player chat must never receive the internal board snapshot or
             # telemetry, even when the model echoed it without emitting a
             # command. Commands are parsed first, then hidden from chat by
@@ -1228,6 +1231,14 @@ class ChatBackend:
             # chat. Keep only the sanitized player-facing text.
             dispatchable = []
             for command in commands:
+                if active_checkers:
+                    blocked.append({
+                        "action": command.action,
+                        "status": "blocked",
+                        "reason": "checkers moves must come from the deterministic checkers adapter",
+                        "args": command.args,
+                    })
+                    continue
                 if command.action in {"spawn_catalog", "place_catalog"}:
                     catalog_object = self.catalog.get(str(command.args.get("guid", "")))
                     if not catalog_object:
@@ -1258,7 +1269,12 @@ class ChatBackend:
                     "stopped": True,
                     "stop_reason": "action was blocked; waiting for player instructions",
                 }
-                result["text"] = self._failure_report(result["execution"])
+                result["text"] = (
+                    "I will only make Black's checkers moves through the deterministic checkers adapter. "
+                    "Tell me 'Your move' when you want me to play."
+                    if active_checkers
+                    else self._failure_report(result["execution"])
+                )
             elif self.command_execution is not None and dispatchable:
                 execution = self.command_execution.execute(
                     dispatchable,
@@ -1303,6 +1319,106 @@ class ChatBackend:
         if path and str(path[0]).strip().lower() in live_names:
             return True
         return bool(container_name and container_name in live_names)
+
+    @staticmethod
+    def _is_checkers_turn_request(message: str) -> bool:
+        text = re.sub(r"^\s*!ai\s*", "", message, flags=re.IGNORECASE).strip().lower()
+        text = re.sub(r"[.!?]+$", "", text).strip()
+        prefix = r"(?:ai|black|blue)?\s*,?\s*"
+        request = (
+            r"(?:it(?:'s| is)\s+)?(?:make\s+)?your\s+move"
+            r"|play\s+(?:your\s+)?move"
+            r"|make\s+(?:an?\s+|the\s+)?opening\s+move"
+            r"|try\s+again"
+            r"|(?:go\s+ahead|take\s+your\s+turn|make\s+(?:a\s+)?move)"
+            r"|i\s+crowned\s+(?:the\s+)?(?:black\s+)?king\s+(?:for\s+you,?\s*)?(?:it(?:'s| is)\s+)?your\s+turn"
+        )
+        return bool(re.fullmatch(prefix + f"(?:{request})", text))
+
+    def _complete_autonomous_checkers_turn(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Run Save 128 Black through the deterministic rules/search seam."""
+        controller = self.controller_provider() if self.controller_provider else {}
+        if str(controller.get("state", "")) != "running":
+            return {
+                "text": "Autonomous checkers play is not running. Ask the host to resume it first.",
+                "commands": [],
+            }
+        if self.command_execution is None or self._game_position_provider is None or self._game_position_saver is None:
+            return {
+                "text": "I cannot safely play checkers because the verified TTS gameplay adapter is unavailable.",
+                "commands": [],
+            }
+
+        def observe() -> Any:
+            result = self._invoke_observation({
+                "name": "tts_list_objects",
+                "arguments": {"max_results": 1000, "compact": True},
+            })
+            if result.get("ok") is False:
+                raise RuntimeError(str(result.get("error", "TTS observation failed")))
+            board = result.get("checkers")
+            if not isinstance(board, dict):
+                raise RuntimeError("the live scene did not expose a complete Save 128 checkers board")
+            return CheckersBoardAdapter.from_records(
+                pieces=[item for item in board.get("pieces", []) if isinstance(item, dict)],
+                squares=[item for item in board.get("squares", []) if isinstance(item, dict)],
+            )
+
+        def execute_landing(guid: str, position: dict[str, float]) -> dict[str, Any]:
+            command = ParsedCommand("move_object", {
+                "guid": guid,
+                "x": position["x"],
+                "y": position["y"],
+                "z": position["z"],
+            })
+            execution = self.command_execution.execute(
+                [command],
+                running=True,
+                active_game="checkers",
+            )
+            if execution.get("stopped"):
+                raise RuntimeError("the TTS move was not verified")
+            return execution
+
+        try:
+            turn = AutonomousCheckersTurn(
+                observe=observe,
+                execute_landing=execute_landing,
+                load_position=self._game_position_provider,
+                save_position=self._game_position_saver,
+                search_depth=int(os.getenv("CHECKERS_SEARCH_DEPTH", "8")),
+            ).run()
+        except (RuntimeError, ValueError, KeyError) as exc:
+            _record_trace("checkers_autonomous_stop", reason=str(exc))
+            return {
+                "text": f"I stopped checkers play safely: {str(exc)[:240]}",
+                "commands": [],
+                "execution": {"status": "stopped", "reason": str(exc)[:500]},
+            }
+
+        if turn.get("status") == "game_over":
+            text = f"The checkers game is over. {str(turn.get('winner', '')).title()} wins."
+        elif turn.get("status") == "recovered":
+            move = turn.get("move", {})
+            path = " → ".join(str(item) for item in move.get("path", []))
+            text = f"I confirmed Black's completed move {path}. It is Red's turn."
+            if self._turn_completed is not None:
+                self._turn_completed("ai")
+        else:
+            move = turn.get("move", {})
+            path = " → ".join(str(item) for item in move.get("path", []))
+            captures = move.get("captures") or []
+            suffix = f", capturing at {', '.join(captures)}" if captures else ""
+            text = f"Black moves {path}{suffix}."
+            if self._turn_completed is not None:
+                self._turn_completed("ai")
+        result = {"text": text, "commands": [], "execution": turn, "autonomous": True}
+        conversation_id = self._conversation(payload)
+        self.history.append(conversation_id, [
+            {"role": "user", "content": _public_ai_text(str(payload.get("message", "")))},
+            {"role": "assistant", "content": text},
+        ])
+        return result
 
     def reset(self, conversation_id: str | None = None) -> str:
         selected = (conversation_id or self.default_conversation_id).strip() or self.default_conversation_id
@@ -1600,6 +1716,12 @@ class ChatBackend:
         message = str(payload.get("message", ""))
         payload = dict(payload)
         payload.setdefault("message", message)
+        controller = self.controller_provider() if self.controller_provider else {}
+        if (
+            str(controller.get("active_game", "")).strip().lower() == "checkers"
+            and self._is_checkers_turn_request(message)
+        ):
+            return self._complete_autonomous_checkers_turn(payload)
         _record_trace(
             "ai_request_start",
             direction="gateway_to_ai_backend",
@@ -1854,6 +1976,13 @@ class GatewayHandler(BaseHTTPRequestHandler):
             )
             player = payload.get("player")
             is_host = isinstance(player, dict) and bool(player.get("host", False))
+            player_identity = ""
+            if isinstance(player, dict):
+                player_identity = str(player.get("color") or player.get("name") or "").strip()
+            draw_result = self.controller.handle_draw_message(
+                str(payload.get("message", "")),
+                player_identity=player_identity,
+            )
             command_result = self.controller.handle(
                 str(payload.get("message", "")),
                 is_host=is_host,
@@ -1861,7 +1990,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             payload.setdefault("conversation_id", self.controller.conversation_id())
             if str(payload.get("message", "")).strip().lower() == "!ai start fresh":
                 self.backend.reset(payload["conversation_id"])
-            result = command_result or self.backend.complete(payload)
+            result = draw_result or command_result or self.backend.complete(payload)
             _record_trace(
                 "ai_message_response",
                 direction="ai_gateway_to_tts",
@@ -1938,6 +2067,9 @@ class HttpGateway:
             controller_provider=controller.context,
             request=request,
             propose=controller.propose_approval,
+            game_position_provider=controller.game_position,
+            game_position_saver=controller.set_game_position,
+            turn_completed=controller.advance_turn,
         )
         controller.set_approval_executor(
             lambda proposal: request(str(proposal["action"]), dict(proposal.get("args", {})))

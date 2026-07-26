@@ -638,7 +638,7 @@ class PublicAITextTests(unittest.TestCase):
         self.assertTrue(all(move["guid"] == "kingbase" for move in moves))
         self.assertEqual({move["target"]["z"] for move in moves}, {0.0, 4.0})
 
-    def test_invalid_model_checkers_move_is_replaced_with_a_listed_legal_move(self) -> None:
+    def test_invalid_model_checkers_move_is_blocked_instead_of_being_replaced(self) -> None:
         backend = ChatBackend()
         backend.controller_provider = lambda: {"state": "running", "active_game": "checkers"}
         selected: list[dict] = []
@@ -659,10 +659,90 @@ class PublicAITextTests(unittest.TestCase):
             }],
         }, {})
 
-        self.assertEqual(selected, [{"guid": "dccefd", "x": -4.6384, "y": 1.7405, "z": 0.9375}])
-        self.assertIn("G5", result["text"])
+        self.assertEqual(selected, [])
+        self.assertTrue(result["execution"]["stopped"])
+        self.assertIn("deterministic checkers", result["text"].lower())
 
-    def test_mandatory_capture_is_normalized_to_a_listed_capture(self) -> None:
+    def test_retry_uses_deterministic_checkers_search_and_not_the_model(self) -> None:
+        backend = ChatBackend()
+        controller = {"state": "running", "active_game": "checkers"}
+        backend.controller_provider = lambda: controller
+        columns = {letter: float(index) for index, letter in enumerate("ABCDEFGH")}
+        ranks = {rank: float(rank - 1) for rank in range(1, 9)}
+        black = {"guid": "black-1", "name": "Black Checker", "type": "Checker", "position": {"x": 0.0, "y": 1.0, "z": 5.0}}
+        red = {"guid": "red-1", "name": "Red Checker", "type": "Checker", "position": {"x": 1.0, "y": 1.0, "z": 2.0}}
+        objects = [black, red]
+        objects.extend(
+            {
+                "guid": f"zone-{letter}{rank}",
+                "type": "LayoutZone",
+                "tags": [f"{letter}{rank}"],
+                "position": {"x": columns[letter], "y": 0.0, "z": ranks[rank]},
+            }
+            for letter in columns
+            for rank in ranks
+        )
+        observations = []
+
+        def list_objects(_args: dict) -> dict:
+            return {"objects": objects, "count": len(objects)}
+
+        backend.configure_observation_tools({"tts_list_objects": list_objects})
+
+        def request(action: str, args: dict) -> dict:
+            if action == "list_objects":
+                return list_objects(args)
+            if action == "get_object":
+                return dict(black)
+            if action == "move_object":
+                black["position"].update(args["position"])
+                return {"ok": True}
+            raise AssertionError(f"unexpected action: {action}")
+
+        backend.configure_gameplay(
+            controller_provider=lambda: controller,
+            request=request,
+            propose=lambda _: "unused",
+            game_position_provider=lambda: None,
+            game_position_saver=lambda position: observations.append(position),
+            turn_completed=lambda actor: None,
+        )
+
+        result = backend.complete({"message": "Try again"})
+
+        self.assertEqual(result["text"], "Black moves A6 → B5.")
+        self.assertTrue(result["autonomous"])
+        self.assertEqual(black["position"], {"x": 1.0, "y": 1.0, "z": 4.0})
+        self.assertTrue(observations)
+        self.assertEqual(observations[-1]["turn"], "red")
+        self.assertNotIn("MOVE[", result["text"])
+
+    def test_checkers_turn_trigger_does_not_capture_a_question_about_the_move(self) -> None:
+        self.assertTrue(ChatBackend._is_checkers_turn_request("Your move."))
+        self.assertTrue(ChatBackend._is_checkers_turn_request("Black, your move"))
+        self.assertTrue(ChatBackend._is_checkers_turn_request("Make an opening move"))
+        self.assertTrue(ChatBackend._is_checkers_turn_request("Try again"))
+        self.assertFalse(ChatBackend._is_checkers_turn_request("What is your move?"))
+
+    def test_generic_model_move_is_blocked_while_checkers_is_active(self) -> None:
+        backend = ChatBackend()
+        backend.controller_provider = lambda: {"state": "running", "active_game": "checkers"}
+        executed: list[dict] = []
+
+        class Executor:
+            def execute(self, commands, **_kwargs):
+                executed.extend(command.args for command in commands)
+                return {"executed": [], "approval_required": [], "stopped": False}
+
+        backend.command_execution = Executor()
+
+        result = backend._finalize_result({"text": "MOVE[abcdef,1,2,3]"}, {})
+
+        self.assertEqual(executed, [])
+        self.assertTrue(result["execution"]["stopped"])
+        self.assertIn("deterministic checkers", result["text"].lower())
+
+    def test_generic_model_capture_is_blocked_even_when_it_matches_a_legal_move(self) -> None:
         backend = ChatBackend()
         backend.controller_provider = lambda: {"state": "running", "active_game": "checkers"}
         selected: list[dict] = []
@@ -673,7 +753,7 @@ class PublicAITextTests(unittest.TestCase):
                 return {"executed": [{"action": "move_object", "status": "executed"}], "approval_required": [], "stopped": False}
 
         backend.command_execution = Executor()
-        backend._finalize_result({
+        result = backend._finalize_result({
             "text": "MOVE[f6d7a4,-0.844,1.74,0.937]",
             "_checkers_mandatory_capture": True,
             "_checkers_legal_moves": [{
@@ -684,7 +764,9 @@ class PublicAITextTests(unittest.TestCase):
             }],
         }, {})
 
-        self.assertEqual(selected, [{"guid": "black1", "x": -4.0, "y": 1.7405, "z": -2.0}])
+        self.assertEqual(selected, [])
+        self.assertTrue(result["execution"]["stopped"])
+        self.assertIn("deterministic checkers", result["text"].lower())
 
     def test_ollama_disables_thinking_for_bounded_gameplay_replies(self) -> None:
         backend = ChatBackend()

@@ -21,6 +21,9 @@ class ControllerState:
     current_turn: str = "unknown"
     pause_reason: str = ""
     pending_approvals: dict[str, dict[str, Any]] = field(default_factory=dict)
+    game_position: dict[str, Any] | None = None
+    draw_offer_by: str = ""
+    draw_agreed: bool = False
 
 
 class AIController:
@@ -37,6 +40,9 @@ class AIController:
             current_turn=str(saved_state.get("current_turn", "unknown")),
             pause_reason=str(saved_state.get("pause_reason", "")),
             pending_approvals=dict(saved_state.get("pending_approvals", {})),
+            game_position=(dict(saved_state["game_position"]) if isinstance(saved_state.get("game_position"), dict) else None),
+            draw_offer_by=str(saved_state.get("draw_offer_by", "")),
+            draw_agreed=bool(saved_state.get("draw_agreed", False)),
         )
         self._lock = threading.RLock()
         self.approval_executor = approval_executor
@@ -60,6 +66,9 @@ class AIController:
                 "current_turn": self.state.current_turn,
                 "pause_reason": self.state.pause_reason,
                 "pending_approvals": self.state.pending_approvals,
+                "game_position": self.state.game_position,
+                "draw_offer_by": self.state.draw_offer_by,
+                "draw_agreed": self.state.draw_agreed,
             }
         )
 
@@ -84,7 +93,8 @@ class AIController:
         return (
             f"[AI status] game={game}; state={self.state.state}; "
             f"turn={self.state.current_turn}; pending_approval={pending}; "
-            f"pause_reason={reason}"
+            f"pause_reason={reason}; draw_offer_by={self.state.draw_offer_by or 'none'}; "
+            f"draw_agreed={self.state.draw_agreed}"
         )
 
     def conversation_id(self) -> str:
@@ -102,6 +112,16 @@ class AIController:
                 "pause_reason": self.state.pause_reason,
                 "conversation_id": self.conversation_id(),
             }
+
+    def game_position(self) -> dict[str, Any] | None:
+        """Return the durable rules position without exposing it to chat."""
+        with self._lock:
+            return dict(self.state.game_position) if self.state.game_position is not None else None
+
+    def set_game_position(self, position: dict[str, Any] | None) -> None:
+        with self._lock:
+            self.state.game_position = dict(position) if position is not None else None
+            self._persist()
 
     def set_approval_executor(self, executor: Any) -> None:
         self.approval_executor = executor
@@ -131,12 +151,44 @@ class AIController:
             "reject",
         }
 
+    def handle_draw_message(self, message: str, *, player_identity: str) -> dict[str, Any] | None:
+        """Handle only explicit, player-addressed mutual draw controls."""
+        if self.state.active_game.strip().lower() != "checkers":
+            return None
+        normalized = re.sub(r"^\s*!ai\s*", "", message.strip(), flags=re.IGNORECASE).lower()
+        offer = normalized in {"offer draw", "draw offer", "i offer a draw"}
+        accept = normalized in {"accept draw", "agree to draw", "i agree to a draw"}
+        if not offer and not accept:
+            return None
+        identity = player_identity.strip() or "unknown player"
+        with self._lock:
+            if offer:
+                self.state.draw_offer_by = identity
+                self.state.draw_agreed = False
+                self._persist()
+                self._audit("draw_offered", {"by": identity})
+                return self._public(f"[AI] Draw offered by {identity}. The other player must clearly accept.")
+            if not self.state.draw_offer_by:
+                return self._public("[AI] There is no active draw offer to accept.")
+            if self.state.draw_offer_by == identity:
+                return self._public("[AI] A player cannot accept their own draw offer.")
+            self.state.draw_agreed = True
+            self.state.state = "stopped"
+            self.state.pause_reason = "mutual draw agreement"
+            self._persist()
+            self._audit("draw_agreed", {"offered_by": self.state.draw_offer_by, "accepted_by": identity})
+            return self._public("[AI] Draw agreed by both players. The checkers game is over.")
+
     def handle(self, message: str, *, is_host: bool) -> dict[str, Any] | None:
         raw = message.strip()
         if not raw.lower().startswith("!ai"):
             return None
 
         parts = raw.split()
+        # Accept the natural word order players use in chat. Both forms are
+        # host lifecycle controls, never ordinary model prompts.
+        if len(parts) == 3 and parts[1].lower() == "fresh" and parts[2].lower() == "start":
+            parts = [parts[0], "start", "fresh"]
         if len(parts) == 1:
             return self._public("[AI] Available controls: !ai game, start, pause, resume, stop, status.")
 
@@ -165,6 +217,9 @@ class AIController:
                 self.state.active_game = game_name
                 self.state.state = "inactive"
                 self.state.pause_reason = ""
+                self.state.game_position = None
+                self.state.draw_offer_by = ""
+                self.state.draw_agreed = False
                 self._persist()
                 self._audit("game_selected", {"game_name": game_name})
                 return self._public(
@@ -180,6 +235,9 @@ class AIController:
                 if fresh:
                     self.state.current_turn = "unknown"
                     self.state.pending_approvals.clear()
+                    self.state.game_position = None
+                    self.state.draw_offer_by = ""
+                    self.state.draw_agreed = False
                     self._audit("session_start_fresh", {})
                 else:
                     self._audit("session_resumed", {})

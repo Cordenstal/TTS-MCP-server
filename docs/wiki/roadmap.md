@@ -162,6 +162,12 @@ Completion criteria:
 - `[done]` Add bounded AI command parsing with host approval for destruction.
 - `[done]` Add post-command readback verification and bounded retries.
 - `[done]` Serialize AI command execution at persisted autonomous turn boundaries.
+- `[done]` Add the hybrid checkers domain seam: TTS physical observations,
+  durable canonical position, deterministic legal move generation, alpha-beta
+  tactical search, complete multi-jump execution, and post-landing
+  reconciliation.
+- `[done]` Require explicit player prompting for Save 128 Black turns and
+  mutual agreement for draws.
 - `[done]` Start player chat without automatic scene lists or screenshots.
 - `[done]` Add a validated, read-only observation tool loop with native and
   strict-JSON backend protocols, compact ephemeral results, and 4-call/15-second
@@ -169,6 +175,8 @@ Completion criteria:
 - `[next]` Add priority/FIFO scheduling for multiple queued autonomous turns.
 - `[planned]` Add chess move planning, object mapping, and transition
   verification.
+- `[next]` Run an opt-in live Save 128 full-game validation and calibrate search
+  depth/time against the local AI backend and TTS physics.
 
 ## Later implementation order
 

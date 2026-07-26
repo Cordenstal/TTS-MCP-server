@@ -585,3 +585,15 @@ handlers as described in `tts_mcp_global.lua`.
   https://developers.openai.com/codex/mcp
 - Official MCP Python SDK:
   https://py.sdk.modelcontextprotocol.io/
+
+### Save 128 autonomous checkers
+
+The natural-language `Your move` prompt uses a deterministic American/English
+checkers rules and alpha-beta search engine. TTS remains authoritative for
+physical board facts, while the engine owns legal transitions, mandatory
+captures, complete multi-jumps, promotion rules, and tactical move selection.
+The gateway reconciles the user's preceding Red move before each Black turn,
+verifies every landing, persists the canonical position, and stops on any
+mismatch or uncertain commit. Red and Black players crown their own pieces.
+Draws require an explicit offer and clear acceptance by the other player. Set
+`CHECKERS_SEARCH_DEPTH` to bound search depth; the default is 8 plies.

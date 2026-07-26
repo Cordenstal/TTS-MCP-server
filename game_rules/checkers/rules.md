@@ -10,8 +10,8 @@ variant, stop and ask the host to identify the variant before acting.
 - Black moves first; turns alternate after each completed move.
 - A player wins by capturing all opposing pieces or leaving the opponent with
   no legal move.
-- The AI's side must be stated by the table or host. Do not infer that TTS
-  Player 2/Blue is Red or Black from camera position alone.
+- The AI controls Black in Save 128 and the human controls Red. Do not infer
+  a side assignment for a different save from camera position alone.
 
 ## Setup and board coordinates
 
@@ -23,9 +23,10 @@ variant, stop and ask the host to identify the variant before acting.
   changing `x` diagonally. A move with unchanged or increased `z` is sideways
   or backward and is illegal for the AI's uncrowned pieces.
 - A king is represented by two Checker objects vertically stacked on the same
-  square. When an uncrowned black checker reaches the red-side back rank, the
-  gateway clones it as the upper marker and verifies that stack. A detected
-  double-stacked king may move or capture diagonally in either direction.
+  square. Each player crowns their own pieces. The AI verifies Black
+  promotion after moving and does not crown Red pieces for the human. A
+  detected double-stacked king may move or capture diagonally in either
+  direction.
 - Captures are still governed by the standard rules below: an uncrowned man
   may capture forward or backward when a verified capture is available.
 - Use the live source piece's GUID and destination square tag. Do not infer
@@ -40,20 +41,23 @@ variant, stop and ask the host to identify the variant before acting.
   orientation before the AI acts.
 - A piece occupies at most one square. A move destination must be empty.
 
-The AI must first identify the current side to move, all occupied dark
-squares, and whether any capture is available anywhere for that side.
+The AI is prompted explicitly when it is expected to move. Before acting it
+must identify the current board, reconcile the human's preceding Red move
+against the prior verified position, and enumerate whether any Black capture
+is available.
 
 ## Turn state machine
 
-1. Determine the side to move from the visible turn indicator or an explicit
-   host statement.
+1. Confirm that the player explicitly requested the AI's move.
 2. Re-observe all visible pieces and resolve their square locations by GUID,
    tags, and the verified board mapping.
 3. Enumerate every capture for the side to move. If at least one capture
    exists, ordinary non-capturing moves are illegal.
 4. If no capture exists, enumerate legal diagonal moves for the selected side.
 5. Announce the intended move or complete capture sequence publicly as Blue.
-6. Execute each landing and captured-piece removal through TTS actions.
+6. Execute each landing and captured-piece removal through TTS actions. A
+   complete multi-jump is one autonomous turn; verify every landing before
+   continuing.
 7. Verify the final square, piece identity, captured-piece location, crown
    status, and next side to move.
 8. If the move ended the game, announce the result. Otherwise end the turn
@@ -115,20 +119,16 @@ automatically.
   king.
 - A crowned king retains its color and piece identity and may move or capture
   in either diagonal direction on later turns.
-- Do not replace or spawn a piece merely to represent a crown unless the table
-  has no supported crown mechanism. If a replacement is required, request host
-  approval and identify the source piece and destination square.
+- Each player is responsible for physically crowning their own pieces. The AI
+  must verify the resulting Black rank and must not crown Red pieces.
 
 ## Game end and draws
 
 - A player wins when the opponent has no pieces remaining.
 - A player also wins when the opponent has pieces remaining but no legal move.
 - A player who has no legal move loses; do not confuse this with a draw.
-- A draw may be declared by agreement or by the applicable table's official
-  repetition/no-progress rule. The table must state which draw convention it
-  enforces if this matters to play.
-- A draw offer alone does not end the game. Require a clear acceptance or host
-  decision.
+- A draw may be declared only by mutual agreement. A draw offer alone does not
+  end the game; require a clear acceptance from the other player.
 - Treat a clear resignation in ordinary chat as a resignation only when the
   speaker's intent is unambiguous; do not infer resignation from frustration,
   silence, or an ambiguous message.
@@ -153,7 +153,7 @@ The save should provide, or allow the AI to verify, all of the following:
 - Piece tags such as `checkers-piece red man`,
   `checkers-piece black man`, `checkers-piece red king`, and
   `checkers-piece black king`.
-- A reliable turn indicator or explicit host-managed turn state.
+- An explicit player prompt when the AI should take its turn.
 - The side controlled by TTS Player 2/Blue.
 - The table's representation of captures, removed pieces, and crowned kings.
 

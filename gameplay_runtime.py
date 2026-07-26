@@ -487,6 +487,21 @@ class CommandExecution:
                             if str(item.get("guid", "")).lower() == captured_checker_guid.lower()
                         )
                         holding_position = checkers_capture_holding_position(captured_checker, live_objects)
+                        # Save 128 has no physical shelf below the off-board
+                        # capture rows. Lock the captured checker first so it
+                        # cannot fall through the table between the move
+                        # callback and verified readback.
+                        capture_lock_command = ParsedCommand(
+                            "set_object_lock",
+                            {"guid": captured_checker_guid, "locked": True},
+                        )
+                        capture_lock_result = self.request(
+                            "set_object_lock",
+                            self._bridge_args(capture_lock_command),
+                        )
+                        capture_lock_verification = self._verify(capture_lock_command)
+                        if not capture_lock_verification.get("verified", False):
+                            raise RuntimeError("captured checker could not be locked before removal")
                         capture_command = ParsedCommand(
                             "move_object",
                             {"guid": captured_checker_guid, **holding_position, "_checkers_instant": True},
@@ -498,6 +513,10 @@ class CommandExecution:
                         capture = {
                             "guid": captured_checker_guid,
                             "off_board_position": holding_position,
+                            "lock": {
+                                "result": capture_lock_result,
+                                "verification": capture_lock_verification,
+                            },
                             "result": capture_result,
                             "verification": capture_verification,
                         }
@@ -552,11 +571,30 @@ class CommandExecution:
                         marker_guid = str(marker.get("guid") or "")
                         if not marker_guid:
                             raise RuntimeError("king marker clone returned no GUID")
-                        marker_command = ParsedCommand("move_object", {"guid": marker_guid, **crown_position})
-                        marker_verification = self._verify(marker_command)
+                        marker_command = ParsedCommand(
+                            "move_object",
+                            {"guid": marker_guid, **crown_position, "_checkers_instant": True},
+                        )
+                        marker_move_result = self.request(
+                            "move_object",
+                            self._bridge_args(marker_command),
+                        )
+                        try:
+                            marker_verification = self._verify(marker_command)
+                        except Exception:
+                            # TTS merges two stacked checkers into a new
+                            # object in some saves. That destroys the clone's
+                            # GUID even though the physical king is correct.
+                            marker_verification = self._verify_checkers_king_stack(crown_position)
                         if not marker_verification.get("verified", False):
                             raise RuntimeError("king marker did not settle on the crowned checker")
-                        crown = {"marker_guid": marker_guid, "position": crown_position, "result": spawned}
+                        crown = {
+                            "marker_guid": marker_guid,
+                            "position": crown_position,
+                            "result": spawned,
+                            "move": marker_move_result,
+                            "verification": marker_verification,
+                        }
                     except Exception as exc:
                         last_error = f"crowning was not verified: {exc}"
                         verification = {
@@ -943,6 +981,11 @@ class CommandExecution:
     @staticmethod
     def _is_double_stacked_checker(source: dict[str, Any], objects: list[dict[str, Any]]) -> bool:
         """Return true when this table represents a king as two stacked checkers."""
+        try:
+            if float(source.get("quantity", 0)) >= 2:
+                return True
+        except (TypeError, ValueError):
+            pass
         source_position = source.get("position") or {}
         try:
             source_x = float(source_position["x"])
@@ -960,6 +1003,38 @@ class CommandExecution:
             pass
 
         return bool(CommandExecution._stacked_checker_companions(source, objects))
+
+    def _verify_checkers_king_stack(self, crown_position: dict[str, float]) -> dict[str, Any]:
+        """Verify a crown that TTS merged into a new, replacement stack GUID."""
+        listing = self.request("list_objects", {"max_results": 250, "compact": True})
+        objects = [item for item in listing.get("objects", []) if isinstance(item, dict)]
+        matches: list[dict[str, Any]] = []
+        for item in objects:
+            if str(item.get("type", "")).lower() != "checker":
+                continue
+            position = item.get("position") or {}
+            try:
+                at_crown_square = (
+                    abs(float(position["x"]) - float(crown_position["x"])) <= 0.15
+                    and abs(float(position["z"]) - float(crown_position["z"])) <= 0.15
+                    and abs(float(position["y"]) - float(crown_position["y"])) <= 0.75
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+            if at_crown_square and self._is_double_stacked_checker(item, objects):
+                matches.append(item)
+        if len(matches) == 1:
+            return {
+                "verified": True,
+                "checks": ["post-crown merged king stack"],
+                "errors": [],
+                "object": matches[0],
+            }
+        return {
+            "verified": False,
+            "checks": ["post-crown merged king stack"],
+            "errors": ["no unique double-stacked checker was found on the crown square"],
+        }
 
     def _verify(self, command: ParsedCommand) -> dict[str, Any]:
         guid = command.args.get("guid")

@@ -254,6 +254,34 @@ _Avoid_: Autonomous game action, implied permission
 The uncertainty stop reached when the active ruleset or adapter cannot validate the intended transition; the AI may explain the ambiguity and propose alternatives, but only the rules layer or an explicit player clarification may unblock execution.
 _Avoid_: Model-only legality, best-effort move
 
+**Hybrid game state**:
+The game state model in which the live TTS scene is authoritative for visible physical facts and the selected game-rule adapter is authoritative for legal transitions, history, and tactical evaluation; neither source may silently override a contradiction from the other.
+_Avoid_: TTS-only rules, model-only legality, hidden parallel board
+
+**Physical board observation**:
+A fresh, visibility-safe description of the pieces, squares, ranks, and board evidence currently present in TTS.
+_Avoid_: Cached board, screenshot-only state, assumed continuity
+
+**Canonical game position**:
+The rules-level position reconstructed from a physical board observation, including side to move, piece ranks, move history needed by the ruleset, and any in-progress turn sequence.
+_Avoid_: Raw object list, GUID registry, unverified model memory
+
+**Game-state reconciliation**:
+The explicit comparison between the expected canonical game position and a fresh physical board observation after a player or AI action; a contradiction reaches a rules validation stop.
+_Avoid_: Silent correction, optimistic state update, automatic retry
+
+**Autonomous turn request**:
+An explicit player prompt asking the active game opponent to act for its side; it authorizes planning within the selected ruleset but does not bypass observation, reconciliation, or mutation gates.
+_Avoid_: Background polling, implicit turn ownership, blanket scene authorization
+
+**Self-promotion**:
+The rule that the player who controls a side is responsible for crowning that side's piece in the physical TTS scene. The opponent verifies the resulting rank during reconciliation and does not crown the other side's pieces.
+_Avoid_: Opponent promotion, inferred rank, automatic cross-side editing
+
+**Mutual-agreement draw**:
+A draw outcome that exists only after both players clearly agree; repetition, move count, and player silence do not independently end the game.
+_Avoid_: Automatic draw, timeout forfeiture, inferred agreement
+
 **Validated action plan**:
 The structured output of a game-rule adapter containing the intended operation, uniquely resolved object GUIDs, ordered allowlisted actions, preconditions, postconditions, and required approval class.
 _Avoid_: Prose-only move, model-authored legality

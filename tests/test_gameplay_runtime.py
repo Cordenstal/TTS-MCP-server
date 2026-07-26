@@ -115,8 +115,8 @@ class CheckersInstantMoveTests(unittest.TestCase):
     def test_checkers_capture_moves_the_verified_jumped_piece_off_board(self) -> None:
         source_position = {"x": 0.0, "y": 1.74, "z": 4.0}
         objects = [
-            {"guid": "abcdef", "name": "Black Checker", "type": "Checker", "position": source_position},
-            {"guid": "red123", "name": "Red Checker", "type": "Checker", "position": {"x": -2.0, "y": 1.74, "z": 2.0}},
+            {"guid": "abcdef", "name": "Black Checker", "type": "Checker", "locked": False, "position": source_position},
+            {"guid": "red123", "name": "Red Checker", "type": "Checker", "locked": False, "position": {"x": -2.0, "y": 1.74, "z": 2.0}},
         ]
         objects.extend(
             {
@@ -136,6 +136,9 @@ class CheckersInstantMoveTests(unittest.TestCase):
                 return {"objects": objects}
             if action == "get_object":
                 return next(item for item in objects if item["guid"] == args["guid"])
+            if action == "set_object_lock":
+                next(item for item in objects if item["guid"] == args["guid"])["locked"] = args["locked"]
+                return {"ok": True}
             if action == "move_object":
                 next(item for item in objects if item["guid"] == args["guid"])["position"].update(args["position"])
                 return {"ok": True}
@@ -151,6 +154,48 @@ class CheckersInstantMoveTests(unittest.TestCase):
         self.assertFalse(any(action == "destroy_object" for action, _ in calls))
         captured = next(item for item in objects if item["guid"] == "red123")
         self.assertGreater(captured["position"]["x"], 8.0)
+
+    def test_checkers_capture_locks_the_jumped_piece_before_off_board_removal(self) -> None:
+        source_position = {"x": 0.0, "y": 1.74, "z": 4.0}
+        objects = [
+            {"guid": "abcdef", "name": "Black Checker", "type": "Checker", "locked": False, "position": source_position},
+            {"guid": "red123", "name": "Red Checker", "type": "Checker", "locked": False, "position": {"x": -2.0, "y": 1.74, "z": 2.0}},
+        ]
+        objects.extend(
+            {
+                "guid": f"zone-{letter}{rank}",
+                "type": "LayoutZone",
+                "tags": [f"{letter}{rank}"],
+                "position": {"x": float((ord(letter) - ord("D")) * 2), "y": 0.0, "z": float((rank - 4) * 2)},
+            }
+            for letter in "ABCDEFGH"
+            for rank in range(1, 9)
+        )
+
+        def request(action: str, args: dict) -> dict:
+            if action == "list_objects":
+                return {"objects": objects}
+            if action == "get_object":
+                return next(item for item in objects if item["guid"] == args["guid"])
+            if action == "set_object_lock":
+                next(item for item in objects if item["guid"] == args["guid"])["locked"] = args["locked"]
+                return {"ok": True}
+            if action == "move_object":
+                piece = next(item for item in objects if item["guid"] == args["guid"])
+                piece["position"].update(args["position"])
+                if piece["guid"] == "red123" and not piece["locked"]:
+                    piece["position"]["y"] -= 1.0
+                return {"ok": True}
+            raise AssertionError(f"unexpected action: {action}")
+
+        result = CommandExecution(request, lambda _: "unused").execute(
+            parse_ai_commands("MOVE[abcdef, -4, 1.74, 0]"),
+            running=True,
+            active_game="checkers",
+        )
+
+        self.assertEqual(result["executed"][0]["status"], "executed")
+        self.assertTrue(next(item for item in objects if item["guid"] == "red123")["locked"])
 
     def test_checker_reaching_back_rank_is_crowned_with_a_stacked_marker(self) -> None:
         source = {
@@ -179,14 +224,29 @@ class CheckersInstantMoveTests(unittest.TestCase):
             if action == "get_object":
                 return next(item for item in objects if item["guid"] == args["guid"])
             if action == "move_object":
-                next(item for item in objects if item["guid"] == args["guid"])["position"].update(args["position"])
+                if args["guid"] == "king01":
+                    # Save 128 combines the base checker and cloned marker
+                    # into a new stack object, invalidating both old GUIDs.
+                    objects[:] = [item for item in objects if item["guid"] not in {"b1ac01", "king01"}]
+                    objects.append({
+                        "guid": "king-stack",
+                        "name": "Black Checker",
+                        "type": "Checker",
+                        "quantity": 2,
+                        "position": dict(args["position"]),
+                    })
+                else:
+                    next(item for item in objects if item["guid"] == args["guid"])["position"].update(args["position"])
                 return {"ok": True}
             if action == "spawn_catalog":
                 marker = {
                     "guid": "king01",
                     "name": "Black Checker",
                     "type": "Checker",
-                    "position": dict(args["position"]),
+                    # TTS may create a clone at its transient default
+                    # location instead of the requested clone position.
+                    # Crowning must therefore move and verify the marker.
+                    "position": {"x": 0.0, "y": 4.78, "z": 0.0},
                 }
                 objects.append(marker)
                 return {"action": "spawn_catalog", "object": marker}
@@ -202,6 +262,8 @@ class CheckersInstantMoveTests(unittest.TestCase):
         self.assertEqual(entry["status"], "executed")
         self.assertEqual(entry["crown"]["marker_guid"], "king01")
         self.assertIn(("spawn_catalog", {"guid": "b1ac01", "position": {"x": -2.0, "y": 2.24, "z": -6.0}}), calls)
+        self.assertIn(("move_object", {"guid": "king01", "position": {"x": -2.0, "y": 2.24, "z": -6.0}, "smooth": False, "collide": False, "fast": False}), calls)
+        self.assertTrue(any(item["guid"] == "king-stack" for item in objects))
 
 
 def test_prompt_frames_ai_as_selected_game_opponent() -> None:
