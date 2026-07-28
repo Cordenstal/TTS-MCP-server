@@ -294,6 +294,70 @@ _Avoid_: Silent overwrite, live-scene mutation, arbitrary file write
 The TTS scene currently instantiated from a save through TTS's Save & Load flow; changing a save file on disk does not change the loaded scene until TTS loads it.
 _Avoid_: Edited save file, stale live scene
 
+**Fixture setup profile**:
+A versioned mapping that translates a supported TTS save's native tags and stable anchors into canonical game-setup roles without modifying the save; missing or ambiguous mappings fail closed.
+_Avoid_: Manual retagging, GUID-only game state, setup-time save mutation
+
+**Fixture side binding**:
+The setup profile's explicit association between the AI player color, faction roster, deployment zone, dice pool, counters, and visibility perspective.
+_Avoid_: Position-inferred ownership, Steam-ID inference, implicit player color
+
+**Fixture calibration**:
+The setup profile's declared board plane, height axis, distance scale, and expected combat-zone dimensions, validated against the loaded scene when no physical calibration marker exists.
+_Avoid_: Unvalidated scale assumption, mandatory calibration prop, screenshot-derived measurement
+
+**Deployment subject**:
+The live AI-owned operative selected for placement from its staging area into the AI deployment zone during setup.
+_Avoid_: Ranged target, contained roster model, arbitrary scene object
+
+**Setup placement anchor**:
+A fixture-defined exact point or object-relative relation that resolves to a deterministic legal placement using current bounds, base clearance, and zone boundaries.
+_Avoid_: Tactical destination, deployment-zone center assumption, guessed coordinates
+
+**Tagged setup snap point**:
+The unique global TTS snap point whose fixture-profile tag supplies the authoritative full `x/y/z` position for a deterministic setup placement.
+_Avoid_: Approximate marker, object-local guess, partial horizontal coordinate
+
+**Fixture identity oracle**:
+The test-only expected GUID used to verify that semantic runtime discovery resolved the intended live object; it is not supplied to the AI as its selection.
+_Avoid_: Hard-coded AI choice, mutation input, sentinel GUID
+
+**Fresh fixture run**:
+A live validation run that begins from an explicitly reloaded fixture and leaves all resulting positions, dice, and wounds intact for inspection.
+_Avoid_: Automatic reset, hidden compensation, rerun on mutated state
+
+**Roster fallback**:
+The bounded inspection of the configured AI roster container used only when live AI operatives lack required identity or profile information, or another operative must be selected.
+_Avoid_: Mandatory roster dump, arbitrary container inspection, hidden-state discovery
+
+**Ranged target**:
+The currently visible enemy operative selected as the target of a shooting attack after setup and line-of-sight validation.
+_Avoid_: Deployment subject, mutation target, hidden enemy
+
+**Setup validation shot**:
+The deterministic ranged attack from the placed deployment subject to the fixture's ranged target that proves observation, placement, LOS, dice, and attack execution work together.
+_Avoid_: Tactical attack, optional smoke check, automatic repositioning
+
+**Setup-validation pipeline**:
+The resumable stateful test that follows successful read-only setup through deterministic placement, verification, LOS, attack roll, human defense-roll handoff, resolution, and wound verification.
+_Avoid_: Mutating setup call, monolithic Lua macro, non-resumable smoke test
+
+**Verified wound projection**:
+The semantic application of resolved damage to an operative's real wound state followed by live readback; display-name text alone is not authoritative.
+_Avoid_: Rename-only damage, unverified wound update, manual bookkeeping request
+
+**Human defense-roll handoff**:
+The paused attack state in which the AI has completed its attack roll and waits for the defending player to roll, expose their physical defense dice, and explicitly acknowledge completion before resolution continues.
+_Avoid_: AI-controlled defense roll, inferred result, automatic timeout resolution
+
+**Read-only roll station**:
+A player-owned physical dice area whose settled results the system may observe but whose dice and roller the AI may not manipulate.
+_Avoid_: Shared roller, AI-controlled dice pool, verbal-only result
+
+**Victory-point ledger**:
+The AI's three separately tracked Kill, Tac, and Crit VP categories whose sum is its total victory points.
+_Avoid_: Single generic VP counter, interchangeable score counter, unclassified points
+
 **Save-load handoff**:
 The verified result of editing and backing up a numbered save file, together with the exact path and explicit next step required to load it in TTS.
 _Avoid_: Assumed reload, unverified scene state

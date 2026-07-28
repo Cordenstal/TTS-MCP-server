@@ -125,7 +125,7 @@ button{padding:.55rem .8rem;margin:.5rem .4rem .2rem 0;border:0;border-radius:6p
 <section><h2>Conversation log</h2><button class="secondary" onclick="loadConversations()">Refresh</button><div id="conversations"></div></section>
 <script>
 const $=id=>document.getElementById(id); const adminToken=prompt('TTS admin token (TTS_ADMIN_TOKEN):')||''; const json=async(url,opt={})=>{opt.headers={...(opt.headers||{}),Authorization:'Bearer '+adminToken};let r=await fetch(url,opt);let d=await r.json();if(!r.ok)throw Error(d.error||r.status);return d};
-async function refresh(){let d=await json('/admin/api/status');$('status').textContent=JSON.stringify(d,null,2);let c=d.config;$('kind').value=c.kind||'queue';$('url').value=c.url||'';$('command').value=c.command||'';$('model').value=c.model||'';$('format').value=c.format||'openai';$('timeout').value=c.timeout||60;$('observationCalls').value=c.observation_max_calls||4;$('observationTimeout').value=c.observation_timeout||15;$('keepAlive').value=c.ollama_keep_alive||'30m';$('echo').checked=!!c.echo;$('vision').checked=c.vision!==false;$('prompt').value=c.system_prompt||'';}
+async function refresh(){let d=await json('/admin/api/status');$('status').textContent=JSON.stringify(d,null,2);let c=d.config;$('kind').value=c.kind||'queue';$('url').value=c.url||'';$('command').value=c.command||'';$('model').value=c.model||'';$('format').value=c.format||'openai';$('timeout').value=c.timeout||300;$('observationCalls').value=c.observation_max_calls||4;$('observationTimeout').value=c.observation_timeout||300;$('keepAlive').value=c.ollama_keep_alive||'30m';$('echo').checked=!!c.echo;$('vision').checked=c.vision!==false;$('prompt').value=c.system_prompt||'';}
 async function server(action){try{await json('/admin/api/server/'+action,{method:'POST'});await refresh()}catch(e){alert(e)}}
 async function save(){let b={kind:$('kind').value,url:$('url').value,command:$('command').value,model:$('model').value,format:$('format').value,timeout:Number($('timeout').value),observation_max_calls:Number($('observationCalls').value),observation_timeout:Number($('observationTimeout').value),ollama_keep_alive:$('keepAlive').value,echo:$('echo').checked,vision:$('vision').checked,system_prompt:$('prompt').value};try{await json('/admin/api/config',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});$('saveResult').textContent='Saved and applied';await refresh()}catch(e){$('saveResult').textContent=e}}
 async function models(){try{let d=await json('/admin/api/models');let opts=$('modelOptions');opts.innerHTML='';(d.models||[]).forEach(m=>{let o=document.createElement('option');o.value=m;opts.appendChild(o)});$('models').textContent=(d.models||[]).length+' model(s) found'+(d.source?' from '+d.source:'')}catch(e){$('models').textContent=e}}
@@ -291,6 +291,14 @@ OBSERVATION_TOOL_SPECS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "tts_ping",
+            "description": "Check that the live TTS Global bridge is loaded and return its bridge version.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "tts_get_object",
             "description": "Get one visible TTS object by its exact GUID.",
             "parameters": {"type": "object", "properties": {"guid": {"type": "string"}}, "required": ["guid"]},
@@ -358,6 +366,72 @@ OBSERVATION_TOOL_SPECS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "tts_killteam_setup",
+            "description": "Initialize tagged Kill Team observation state for the loaded table. Call once at game start before tts_killteam_observe.",
+            "parameters": {"type": "object", "properties": {
+                "ai_team": {"type": "string"},
+                "units_per_inch": {"type": "number", "exclusiveMinimum": 0},
+                "ai_dice_count": {"type": "integer", "minimum": 1},
+                "opponent_dice_count": {"type": "integer", "minimum": 1},
+            }},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "tts_killteam_probe_collection",
+            "description": "Diagnose one bounded stage of the Kill Team setup observation collector.",
+            "parameters": {"type": "object", "properties": {
+                "stage": {
+                    "type": "string",
+                    "enum": [
+                        "decode",
+                        "tag_lookup",
+                        "tag_summary",
+                        "required_lookup",
+                        "required_summary",
+                        "snap_lookup",
+                        "snap_summary",
+                    ],
+                },
+                "index": {"type": "integer", "minimum": 1, "maximum": 32},
+                "item_index": {"type": "integer", "minimum": 1, "maximum": 1000},
+            }, "required": ["stage"]},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "tts_killteam_observe",
+            "description": "Return a fresh role-filtered Kill Team observation with visible operatives, terrain, AI dice, counters, and revisions.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "tts_killteam_get_roster",
+            "description": "Inspect the dedicated AI roster container when live operative observations lack the needed profile or model identity.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "tts_killteam_probe_line_of_sight",
+            "description": "Probe visible Kill Team target visibility with nine bounded TTS physics rays; returns blockers, visibility fraction, and collider uncertainty.",
+            "parameters": {"type": "object", "properties": {
+                "attacker_id": {"type": "string"},
+                "target_id": {"type": "string"},
+                "eye_local": {"type": "object", "properties": {
+                    "x": {"type": "number"}, "y": {"type": "number"}, "z": {"type": "number"},
+                }},
+            }, "required": ["attacker_id", "target_id"]},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "tts_get_scene_summary",
             "description": "Return a bounded compact summary of visible top-level scene objects; use only when targeted lookup is insufficient.",
             "parameters": {"type": "object", "properties": {
@@ -393,21 +467,31 @@ OBSERVATION_TOOL_SPECS: list[dict[str, Any]] = [
 OBSERVATION_TOOL_NAMES = {
     item["function"]["name"] for item in OBSERVATION_TOOL_SPECS
 }
+KILLTEAM_OBSERVATION_TOOL_NAMES = {
+    "tts_ping",
+    "tts_killteam_setup",
+    "tts_killteam_probe_collection",
+    "tts_killteam_observe",
+    "tts_killteam_probe_line_of_sight",
+    "tts_killteam_get_roster",
+    "tts_capture_view",
+    "tts_capture_view_info",
+}
 VISUAL_OBSERVATION_TOOL_NAMES = {"tts_capture_view", "tts_capture_view_info"}
 _TOOL_BLOB_KEYS = {"script", "scriptstates", "ui_xml", "raw", "logs"}
 
 
-def _compact_tool_value(value: Any, *, depth: int = 0) -> Any:
+def _compact_tool_value(value: Any, *, depth: int = 0, list_limit: int = 50) -> Any:
     if depth > 5:
         return "[depth limit]"
     if isinstance(value, dict):
         return {
-            str(key): item if str(key) == "image_base64" and isinstance(item, str) else _compact_tool_value(item, depth=depth + 1)
+            str(key): item if str(key) == "image_base64" and isinstance(item, str) else _compact_tool_value(item, depth=depth + 1, list_limit=list_limit)
             for key, item in list(value.items())[:40]
             if str(key).lower() not in _TOOL_BLOB_KEYS
         }
     if isinstance(value, list):
-        return [_compact_tool_value(item, depth=depth + 1) for item in value[:50]]
+        return [_compact_tool_value(item, depth=depth + 1, list_limit=list_limit) for item in value[:list_limit]]
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value if not isinstance(value, str) else value[:2000]
     return str(value)[:500]
@@ -717,6 +801,58 @@ class ChatBackend:
             raise ValueError(f"unknown observation tools: {', '.join(sorted(unknown))}")
         self.observation_tools = dict(tools)
 
+    def handle_killteam_defense_acknowledgment(
+        self,
+        message: str,
+        *,
+        player_identity: str,
+        is_host: bool,
+    ) -> dict[str, Any] | None:
+        """Resolve the Red-defense pause from authenticated player metadata."""
+        controller = self.controller_provider() if self.controller_provider else {}
+        if str(controller.get("active_game", "")).strip().casefold() != "killteam":
+            return None
+        normalized = re.sub(r"[^a-z0-9]+", " ", str(message).casefold()).strip()
+        if normalized not in {
+            "defense roll complete",
+            "red defense roll complete",
+            "defence roll complete",
+            "red defence roll complete",
+        }:
+            return None
+        is_red = str(player_identity).strip().casefold() == "red"
+        if not is_red and not is_host:
+            return {
+                "text": "Only Red or the host can acknowledge Red's defense roll.",
+                "commands": [],
+            }
+        if self.command_execution is None:
+            raise RuntimeError("Kill Team gameplay execution is not configured")
+        acknowledged_by = "Red" if is_red else "host"
+        result = self.command_execution.request(
+            "killteam_complete_setup_validation",
+            {"acknowledged_by": acknowledged_by},
+        )
+        damage = int(result.get("damage", 0))
+        wounds = int(result.get("target_wounds", 0))
+        return {
+            "text": (
+                f"Red's defense roll is resolved: {damage} damage; "
+                f"{wounds} wounds remain."
+            ),
+            "commands": [],
+            "killteam_validation": result,
+        }
+
+    def _observation_tool_specs(self) -> list[dict[str, Any]]:
+        controller = self.controller_provider() if self.controller_provider else {}
+        if str(controller.get("active_game", "")).strip().lower() == "killteam":
+            return [
+                spec for spec in OBSERVATION_TOOL_SPECS
+                if spec["function"]["name"] in KILLTEAM_OBSERVATION_TOOL_NAMES
+            ]
+        return OBSERVATION_TOOL_SPECS
+
     def _gameplay_context(self, payload: dict[str, Any], message: str) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
         intent = classify_intent(message)
         # Ordinary chat starts context-light. Live scene evidence is acquired
@@ -739,6 +875,14 @@ class ChatBackend:
             "position discrepancy greater than 0.5 world units on any axis requires visual review. Never guess a "
             "GUID, coordinate, or visual fact. Screenshots do not prove exact transforms. If any action or "
             "verification fails, stop issuing actions and wait for player instructions. "
+            "For Kill Team, call tts_killteam_setup once at the start of the loaded game, then use "
+            "tts_killteam_observe before activation or attack preparation. Do not call setup again during a live "
+            "activation because it creates a new scene epoch and discards the prior canonical state. "
+            "If a model profile or roster identity is missing, call tts_killteam_get_roster; it reads only the "
+            "dedicated AI roster container. Do not inspect arbitrary containers. "
+            "For Kill Team, use tts_killteam_probe_line_of_sight on a visible target before entering an exposed "
+            "lane or preparing a ranged attack. Treat blocker GUIDs, visibility_fraction, and the collider_warning "
+            "as evidence; do not infer a clear shot from distance alone. "
             "For checkers, tts_list_objects returns checkers.legal_black_moves. Select exactly one listed step "
             "and copy its guid and target x/y/z into MOVE; never invent a different source or destination. "
             "When that list is non-empty, it already resolves occupancy and geometry, so do not request a screenshot "
@@ -768,12 +912,18 @@ class ChatBackend:
             raise ValueError("tool arguments must be an object")
         bounded = dict(arguments)
         allowed_arguments = {
+            "tts_ping": set(),
             "tts_get_object": {"guid"},
             "tts_list_objects": {"name_contains", "tag", "max_results", "compact"},
             "tts_search_scene": {"reference", "max_results"},
             "tts_find_nearest_objects": {"x", "y", "z", "reference_guid", "name_contains", "tag", "max_results"},
             "tts_find_objects_in_region": {"minimum_x", "minimum_y", "minimum_z", "maximum_x", "maximum_y", "maximum_z", "name_contains", "tag", "max_results"},
             "tts_get_zone_objects": {"guid", "ignore_tags"},
+            "tts_killteam_setup": {"ai_team", "units_per_inch", "ai_dice_count", "opponent_dice_count"},
+            "tts_killteam_probe_collection": {"stage", "index", "item_index"},
+            "tts_killteam_observe": set(),
+            "tts_killteam_get_roster": set(),
+            "tts_killteam_probe_line_of_sight": {"attacker_id", "target_id", "eye_local"},
             "tts_get_scene_summary": {"max_results"},
             "tts_capture_view": {"left", "top", "width", "height", "max_width", "jpeg_quality"},
             "tts_capture_view_info": {"left", "top", "width", "height", "max_width"},
@@ -790,6 +940,43 @@ class ChatBackend:
         if name == "tts_list_objects":
             bounded["max_results"] = max(1, min(int(bounded.get("max_results", 200)), 1000))
             bounded["compact"] = bool(bounded.get("compact", True))
+        if name == "tts_killteam_setup":
+            bounded["ai_team"] = str(bounded.get("ai_team", "ai")).strip().lower()
+            if not bounded["ai_team"]:
+                raise ValueError("tts_killteam_setup requires ai_team")
+            bounded["units_per_inch"] = float(bounded.get("units_per_inch", 1.0))
+            if bounded["units_per_inch"] <= 0:
+                raise ValueError("tts_killteam_setup requires positive units_per_inch")
+            bounded["ai_dice_count"] = max(1, int(bounded.get("ai_dice_count", 1)))
+            bounded["opponent_dice_count"] = max(1, int(bounded.get("opponent_dice_count", 1)))
+        if name == "tts_killteam_probe_collection":
+            allowed_stages = {
+                "decode",
+                "tag_lookup",
+                "tag_summary",
+                "required_lookup",
+                "required_summary",
+                "snap_lookup",
+                "snap_summary",
+            }
+            bounded["stage"] = str(bounded.get("stage", "")).strip().lower()
+            if bounded["stage"] not in allowed_stages:
+                raise ValueError("tts_killteam_probe_collection requires a supported stage")
+            bounded["index"] = max(1, min(int(bounded.get("index", 1)), 32))
+            bounded["item_index"] = max(1, min(int(bounded.get("item_index", 1)), 1000))
+        if name == "tts_killteam_probe_line_of_sight":
+            for key in ("attacker_id", "target_id"):
+                bounded[key] = str(bounded.get(key, "")).strip()
+                if not bounded[key]:
+                    raise ValueError(f"tts_killteam_probe_line_of_sight requires {key}")
+            if "eye_local" in bounded:
+                eye_local = bounded["eye_local"]
+                if not isinstance(eye_local, dict):
+                    raise ValueError("eye_local must be an object")
+                try:
+                    bounded["eye_local"] = {axis: float(eye_local[axis]) for axis in ("x", "y", "z")}
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise ValueError("eye_local must contain numeric x, y, and z") from exc
         if name == "tts_get_scene_summary":
             bounded["max_results"] = max(1, min(int(bounded.get("max_results", 50)), 50))
         if name in {"tts_search_scene", "tts_find_nearest_objects", "tts_find_objects_in_region"}:
@@ -808,7 +995,25 @@ class ChatBackend:
         return name, bounded
 
     def _invoke_observation(self, call: dict[str, Any]) -> dict[str, Any]:
-        name, arguments = self._validate_observation_call(call)
+        try:
+            name, arguments = self._validate_observation_call(call)
+        except (KeyError, TypeError, ValueError) as exc:
+            return {"ok": False, "error": f"invalid observation tool call: {str(exc)[:300]}"}
+        available_names = {
+            str(item.get("function", {}).get("name", ""))
+            for item in self._observation_tool_specs()
+            if isinstance(item, dict)
+        }
+        if name not in available_names:
+            controller = self.controller_provider() if self.controller_provider else {}
+            active_game = str(controller.get("active_game", "")).strip().lower()
+            guidance = ""
+            if active_game == "killteam":
+                guidance = " Call tts_killteam_setup, then tts_killteam_observe instead."
+            return {
+                "ok": False,
+                "error": f"{name} is not available for the active game.{guidance}",
+            }
         callback = self.observation_tools.get(name)
         if callback is None:
             return {"ok": False, "error": "observation tools are unavailable this turn"}
@@ -821,7 +1026,8 @@ class ChatBackend:
                 checkers_board = _checkers_board_observation(result)
                 if checkers_board is not None:
                     return checkers_board
-            compact = _compact_tool_value(result)
+            list_limit = 200 if name in {"tts_killteam_setup", "tts_killteam_observe"} else 50
+            compact = _compact_tool_value(result, list_limit=list_limit)
             if not isinstance(compact, dict):
                 compact = {"value": compact}
             compact.setdefault("ok", True)
@@ -1433,7 +1639,7 @@ class ChatBackend:
 
     def _queue_for_external_client(self, payload: dict[str, Any]) -> dict[str, Any]:
         payload = dict(payload)
-        payload["tools"] = OBSERVATION_TOOL_SPECS
+        payload["tools"] = self._observation_tool_specs()
         payload["tool_call_endpoint"] = "/chat/tool"
         payload["tool_budget"] = {
             "max_calls": self.observation_max_calls,
@@ -1469,7 +1675,7 @@ class ChatBackend:
         command_payload = dict(payload)
         command_payload["messages"] = messages
         if include_tools:
-            command_payload["tools"] = OBSERVATION_TOOL_SPECS
+            command_payload["tools"] = self._observation_tool_specs()
         encoded = json.dumps(command_payload, ensure_ascii=False)
         _record_trace(
             "ai_backend_outbound",
@@ -1588,7 +1794,7 @@ class ChatBackend:
             if self.model:
                 request_payload["model"] = self.model
         if include_tools:
-            request_payload["tools"] = OBSERVATION_TOOL_SPECS
+            request_payload["tools"] = self._observation_tool_specs()
 
         encoded = json.dumps(request_payload).encode("utf-8")
         headers = {"Content-Type": "application/json", "Accept": "application/json"}
@@ -1979,6 +2185,11 @@ class GatewayHandler(BaseHTTPRequestHandler):
             player_identity = ""
             if isinstance(player, dict):
                 player_identity = str(player.get("color") or player.get("name") or "").strip()
+            defense_result = self.backend.handle_killteam_defense_acknowledgment(
+                str(payload.get("message", "")),
+                player_identity=player_identity,
+                is_host=is_host,
+            )
             draw_result = self.controller.handle_draw_message(
                 str(payload.get("message", "")),
                 player_identity=player_identity,
@@ -1990,7 +2201,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             payload.setdefault("conversation_id", self.controller.conversation_id())
             if str(payload.get("message", "")).strip().lower() == "!ai start fresh":
                 self.backend.reset(payload["conversation_id"])
-            result = draw_result or command_result or self.backend.complete(payload)
+            result = defense_result or draw_result or command_result or self.backend.complete(payload)
             _record_trace(
                 "ai_message_response",
                 direction="ai_gateway_to_tts",

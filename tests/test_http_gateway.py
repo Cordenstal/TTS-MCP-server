@@ -474,6 +474,167 @@ class PublicAITextTests(unittest.TestCase):
 
         self.assertIn("tts_list_objects", OBSERVATION_TOOL_NAMES)
 
+    def test_observation_registry_exposes_bridge_ping(self) -> None:
+        from http_gateway import OBSERVATION_TOOL_NAMES
+
+        self.assertIn("tts_ping", OBSERVATION_TOOL_NAMES)
+
+    def test_observation_registry_exposes_killteam_setup_and_observe(self) -> None:
+        from http_gateway import OBSERVATION_TOOL_NAMES
+
+        self.assertIn("tts_killteam_setup", OBSERVATION_TOOL_NAMES)
+        self.assertIn("tts_killteam_observe", OBSERVATION_TOOL_NAMES)
+        self.assertIn("tts_killteam_probe_collection", OBSERVATION_TOOL_NAMES)
+        self.assertIn("tts_killteam_probe_line_of_sight", OBSERVATION_TOOL_NAMES)
+        self.assertIn("tts_killteam_get_roster", OBSERVATION_TOOL_NAMES)
+
+    def test_ai_can_dispatch_killteam_line_of_sight_probe(self) -> None:
+        backend = ChatBackend()
+        calls = []
+        backend.configure_observation_tools({
+            "tts_killteam_probe_line_of_sight": lambda args: calls.append(args) or {
+                "visible": False,
+                "visibility_fraction": 0.0,
+                "blocker_guids": ["wall-1"],
+            },
+        })
+
+        result = backend._invoke_observation({
+            "name": "tts_killteam_probe_line_of_sight",
+            "arguments": {
+                "attacker_id": "plague-warrior-01",
+                "target_id": "target-01",
+                "eye_local": {"x": 0, "y": 1.2, "z": 0},
+            },
+        })
+
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["visible"])
+        self.assertEqual(calls, [{
+            "attacker_id": "plague-warrior-01",
+            "target_id": "target-01",
+            "eye_local": {"x": 0.0, "y": 1.2, "z": 0.0},
+        }])
+
+    def test_ai_can_dispatch_dedicated_killteam_roster_observation(self) -> None:
+        backend = ChatBackend()
+        calls = []
+        backend.configure_observation_tools({
+            "tts_killteam_get_roster": lambda args: calls.append(args) or {
+                "container_guid": "e5adb7",
+                "items": [{"name": "Plague Marine Heavy Gunner"}],
+            },
+        })
+
+        result = backend._invoke_observation({
+            "name": "tts_killteam_get_roster",
+            "arguments": {},
+        })
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["container_guid"], "e5adb7")
+        self.assertEqual(calls, [{}])
+
+    def test_killteam_backend_uses_role_filtered_observation_tools(self) -> None:
+        backend = ChatBackend()
+        backend.controller_provider = lambda: {"active_game": "killteam"}
+
+        names = {
+            item["function"]["name"]
+            for item in backend._observation_tool_specs()
+        }
+
+        self.assertIn("tts_killteam_setup", names)
+        self.assertIn("tts_killteam_observe", names)
+        self.assertIn("tts_killteam_probe_line_of_sight", names)
+        self.assertIn("tts_ping", names)
+        self.assertNotIn("tts_list_objects", names)
+        self.assertNotIn("tts_get_object", names)
+
+    def test_ai_can_dispatch_bridge_ping(self) -> None:
+        backend = ChatBackend()
+        calls = []
+        backend.configure_observation_tools({
+            "tts_ping": lambda args: calls.append(args) or {
+                "bridge_version": "2026-07-26-observation-v4",
+                "object_count": 226,
+            },
+        })
+
+        result = backend._invoke_observation({
+            "name": "tts_ping",
+            "arguments": {},
+        })
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["bridge_version"], "2026-07-26-observation-v4")
+        self.assertEqual(calls, [{}])
+
+    def test_killteam_rejects_an_unadvertised_generic_observation_tool(self) -> None:
+        backend = ChatBackend()
+        backend.controller_provider = lambda: {"active_game": "killteam"}
+        calls = []
+        backend.configure_observation_tools({
+            "tts_list_objects": lambda args: calls.append(args) or {"objects": []},
+        })
+
+        result = backend._invoke_observation({
+            "name": "tts_list_objects",
+            "arguments": {"max_results": 200},
+        })
+
+        self.assertFalse(result["ok"])
+        self.assertIn("not available", result["error"])
+        self.assertIn("tts_killteam_setup", result["error"])
+        self.assertEqual(calls, [])
+
+    def test_ai_can_dispatch_killteam_setup_and_observe_tools(self) -> None:
+        backend = ChatBackend()
+        calls = []
+        backend.configure_observation_tools({
+            "tts_killteam_setup": lambda args: calls.append(("setup", args)) or {"status": "ready"},
+            "tts_killteam_observe": lambda args: calls.append(("observe", args)) or {
+                "observation_id": 1,
+                "operatives": {"target-01": {"team": "opponent"}},
+            },
+        })
+
+        setup = backend._invoke_observation({
+            "name": "tts_killteam_setup",
+            "arguments": {"ai_team": "ai"},
+        })
+        observation = backend._invoke_observation({
+            "name": "tts_killteam_observe",
+            "arguments": {},
+        })
+
+        self.assertTrue(setup["ok"])
+        self.assertTrue(observation["ok"])
+        self.assertEqual(calls, [
+            ("setup", {
+                "ai_team": "ai",
+                "units_per_inch": 1.0,
+                "ai_dice_count": 1,
+                "opponent_dice_count": 1,
+            }),
+            ("observe", {}),
+        ])
+
+    def test_killteam_observation_keeps_bounded_terrain_evidence(self) -> None:
+        backend = ChatBackend()
+        terrain = [{"guid": f"terrain-{index}"} for index in range(75)]
+        backend.configure_observation_tools({
+            "tts_killteam_observe": lambda _args: {"terrain": terrain, "truncated": False},
+        })
+
+        result = backend._invoke_observation({
+            "name": "tts_killteam_observe",
+            "arguments": {},
+        })
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(result["terrain"]), 75)
+
     def test_ai_can_dispatch_direct_object_listing_tool(self) -> None:
         backend = ChatBackend()
         backend.reload({
@@ -851,6 +1012,60 @@ class PublicAITextTests(unittest.TestCase):
         backend = ChatBackend()
         backend.reload({"observation_timeout": 999})
         self.assertEqual(backend.observation_timeout, 300.0)
+
+
+class KillTeamDefenseAcknowledgmentTests(unittest.TestCase):
+    def test_red_acknowledgment_completes_pending_validation_without_model_claim(self) -> None:
+        calls = []
+        backend = ChatBackend()
+        backend.configure_gameplay(
+            controller_provider=lambda: {
+                "active_game": "killteam",
+                "state": "running",
+            },
+            request=lambda action, args: calls.append((action, args)) or {
+                "status": "resolved",
+                "damage": 3,
+                "target_wounds": 4,
+            },
+            propose=lambda _proposal: "unused",
+        )
+
+        result = backend.handle_killteam_defense_acknowledgment(
+            "Defense roll complete",
+            player_identity="Red",
+            is_host=False,
+        )
+
+        self.assertEqual(calls, [(
+            "killteam_complete_setup_validation",
+            {"acknowledged_by": "Red"},
+        )])
+        self.assertEqual(
+            result["text"],
+            "Red's defense roll is resolved: 3 damage; 4 wounds remain.",
+        )
+
+    def test_non_red_non_host_cannot_acknowledge_red_defense(self) -> None:
+        calls = []
+        backend = ChatBackend()
+        backend.configure_gameplay(
+            controller_provider=lambda: {
+                "active_game": "killteam",
+                "state": "running",
+            },
+            request=lambda action, args: calls.append((action, args)) or {},
+            propose=lambda _proposal: "unused",
+        )
+
+        result = backend.handle_killteam_defense_acknowledgment(
+            "Defense roll complete",
+            player_identity="Blue",
+            is_host=False,
+        )
+
+        self.assertEqual(calls, [])
+        self.assertIn("Only Red or the host", result["text"])
 
 
 if __name__ == "__main__":

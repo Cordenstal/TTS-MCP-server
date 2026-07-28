@@ -178,29 +178,87 @@ Completion criteria:
 - `[next]` Run an opt-in live Save 128 full-game validation and calibrate search
   depth/time against the local AI backend and TTS physics.
 
-## 11. Kill Team semantic opponent — planned
+## 11. Kill Team semantic opponent — live fixture integration next
 
 The first high-level game adapter targets the `Kill Team 3.0 Quick and Easy`
-variant and the canonical `TS_Save_129.json` fixture. The complete design is
-recorded in [the Kill Team wiki page](killteam.md) and [ADR-0009](../adr/0009-killteam-semantic-opponent.md).
+variant and the canonical `TS_Save_131.json` fixture. The complete design is
+recorded in [the Kill Team wiki page](killteam.md),
+[ADR-0009](../adr/0009-killteam-semantic-opponent.md), and
+[ADR-0010](../adr/0010-native-killteam-fixture-profiles.md).
 
-- `[planned]` Implement the agreed AI-opponent role, hidden-information boundary, and
+- `[done]` Implement the agreed AI-opponent role, hidden-information boundary, and
   host-adjudication policy.
-- `[planned]` Implement tagged setup discovery, AI-side dice/counters, map
+- `[partial]` Implement setup discovery, AI-side dice/counters, map
   calibration, mutable terrain, and player-perspective observation.
-- `[planned]` Define the versioned Kill Team state schema and event types.
-- `[planned]` Build setup ingestion and fail-closed invariant validation.
-- `[planned]` Add role-filtered structured observations and approved camera
-  views for activation/attack preparation.
-- `[planned]` Implement calibrated combat-zone geometry, terrain overrides,
-  LOS/range queries, map revisions, and evidence capture.
-- `[planned]` Implement the typed rules adapter for one ranged activation.
-- `[planned]` Implement semantic movement, shooting, dice rolling, saves,
-  damage, wounds, resources, and scoring projections.
-- `[planned]` Add human-event reconciliation, host rulings, uncertain-commit
-  recovery, and action idempotency.
-- `[planned]` Validate all of the above against a deterministic fake bridge,
-  then run opt-in live-TTS smoke tests with the canonical fixture.
+  Deterministic canonical-tag tests pass; native `TS_Save_131.json` profile
+  normalization remains.
+- `[done]` Define the versioned Kill Team state schema and event types.
+- `[partial]` Build setup ingestion and fail-closed invariant validation.
+  Native tags, exact anchors, and global snap-point uniqueness remain.
+- `[partial]` Add role-filtered structured observations. Approved camera views
+  for activation/attack preparation remain.
+- `[partial]` Implement calibrated combat-zone geometry, terrain overrides,
+  and range queries. On-demand nine-ray physics LOS evidence is implemented;
+  collider calibration, cover policy, and mutable-map evidence reconciliation
+  remain.
+- `[done]` Implement the typed rules adapter for one ranged activation.
+- `[partial]` Implement semantic movement, shooting, dice rolling, saves,
+  damage, and wounds. Resource/scoring projections remain.
+- `[partial]` Add uncertain-commit recovery and action idempotency. Human-event
+  reconciliation and host rulings remain.
+- `[done]` Validate the first slice against a deterministic fake bridge.
+- `[partial]` The native `TS_Save_131.json` fixture profile and opt-in
+  setup-validation pipeline are implemented and covered by deterministic
+  bridge/runtime tests. A fresh-save live TTS run remains.
+
+### Kill Team vertical-slice update plan
+
+This update closes the observation and physical LOS seams so the same deep Kill
+Team module can be used by both an MCP client and the in-game HTTP AI gateway.
+Work remains bounded to setup, observation, and the existing one-operative
+ranged-action slice:
+
+1. `[done]` Define one role-filtered observation contract containing the AI
+   roster, visible enemy operatives, tagged terrain, dice/counter references,
+   map revision, observation ID, and truncation/uncertainty status.
+2. `[done]` Add an explicit gateway setup/observation adapter. Setup must run
+   once per loaded game before the AI can request Kill Team state; repeated
+   setup must replace the prior scene epoch rather than reuse stale state.
+3. `[done]` Expose bounded Kill Team observation tools to the AI backend while
+   keeping arbitrary mutations behind the semantic MCP interface. The gateway
+   may execute only the bounded semantic initial-placement command after a
+   role-filtered observation; it must not expose raw hidden objects or Lua.
+4. `[done]` Make compact object evidence sufficient for inspection by retaining
+   descriptions/profile metadata, exact type, tags, transforms, bounds, and
+   truncation information. Add the bounded fallback roster query for dedicated
+   AI container `e5adb7`; large boards must use an intentional summary rather
+   than silently dropping objects. The dedicated snapshot avoids generic
+   enumeration and now normalizes native fixture tags plus global snap points.
+5. `[partial]` Validate the Python-to-Lua observation request/response path with a
+   fake bridge and Lua source compatibility checks, including empty scenes,
+   large scenes, hidden objects, missing setup, and callback errors. The
+   bounded LOS probe now has fake-bridge/runtime/source coverage; live TTS
+   callback coverage remains.
+6. `[done]` Add an on-demand nine-ray Kill Team LOS probe. It ignores the
+   observer collider, identifies first blockers, returns target visibility
+   fraction and collider uncertainty, and is called by ranged shooting before
+   dice are rolled.
+7. `[done]` Add a versioned Python fixture profile for `TS_Save_131.json`.
+   Normalize its native tags and stable anchors through fixture-agnostic,
+   bounded Lua tag/GUID/snap-point queries. Treat the save and expected GUIDs
+   as test oracles; use only live TTS evidence for actions.
+8. `[done]` Resolve the unique `_start_test_spot`, discover deployment subject
+   `96fe20` and visible ranged target `377732`, place and verify the subject,
+   then require at least one successful target ray from the nine-ray LOS probe.
+9. `[done]` Add the resumable human defense-roll handoff. The AI rolls only its
+   four Boltgun dice through `175503`; Red rolls three defense dice through
+   read-only station `f1adc9` and explicitly acknowledges completion.
+10. `[done]` Add semantic wound projection and readback against the operative's
+    real wound state; rename-only damage is invalid.
+11. `[next]` Run the complete opt-in live sequence from a freshly loaded
+    fixture. Persist detailed audit evidence, leave the resulting scene intact,
+    and stop on uncertain callbacks, collider mismatch, visibility
+    contradiction, or missing human acknowledgment.
 
 ## Later implementation order
 

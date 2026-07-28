@@ -7,6 +7,10 @@
 -- from the mod's existing onExternalMessage function.
 
 local MCP_CHANNEL = "tts-mcp"
+-- Change this whenever the installed Global bridge has a behavior change.
+-- `tts_ping` returns it so a live TTS table can be distinguished from the
+-- source file on disk when the External Editor reports only guid=-1.
+local MCP_BRIDGE_VERSION = "2026-07-28-named-warrior-zone-v16"
 local MCP_HTTP_CHAT_URL = "http://127.0.0.1:8765/chat"
 -- A private callback for bridge results. Unlike print(), this never appears
 -- in the in-game player chat or console feed.
@@ -29,7 +33,7 @@ local function mcp_vector(v)
     if v == nil then
         return nil
     end
-    return {x = v.x, y = v.y, z = v.z}
+    return { x = v.x, y = v.y, z = v.z }
 end
 
 local function mcp_try(fn)
@@ -38,6 +42,21 @@ local function mcp_try(fn)
         return value
     end
     return nil
+end
+
+local function mcp_decode_json_array(value, label)
+    -- Scalar values inside object-form External Editor messages can be
+    -- managed MoonSharp strings. Coerce them before invoking TTS's JSON
+    -- decoder so the decoder receives an ordinary Lua string.
+    local text = mcp_try(function() return tostring(value or "[]") end)
+    if type(text) ~= "string" then
+        error(tostring(label) .. " is not a readable JSON string")
+    end
+    local ok, decoded = pcall(function() return JSON.decode(text) end)
+    if not ok or type(decoded) ~= "table" then
+        error(tostring(label) .. " must decode to an array")
+    end
+    return decoded
 end
 
 local function mcp_bounds(bounds)
@@ -66,8 +85,30 @@ local function mcp_zone_guids(obj)
     return guids
 end
 
+local function mcp_die_value(obj)
+    if obj == nil then
+        return nil
+    end
+    local value = mcp_try(function() return obj.getRotationValue() end)
+    if value == nil then
+        value = mcp_try(function() return obj.getValue() end)
+    end
+    return tonumber(value)
+end
+
+local function mcp_counter_value(obj)
+    if obj == nil then
+        return nil
+    end
+    local counter = mcp_try(function() return obj.Counter end)
+    if counter == nil then
+        return nil
+    end
+    return tonumber(mcp_try(function() return counter.getValue() end))
+end
+
 local function mcp_container_items(obj)
-    local object_type = tostring(obj.type or "")
+    local object_type = tostring(mcp_try(function() return obj.type end) or "")
     if object_type ~= "Bag" and object_type ~= "Deck" and object_type ~= "Chip" then
         return nil
     end
@@ -130,6 +171,8 @@ local function mcp_object_summary(obj)
         transform_right = mcp_vector(mcp_try(function() return obj.getTransformRight() end)),
         transform_up = mcp_vector(mcp_try(function() return obj.getTransformUp() end)),
         zone_guids = mcp_zone_guids(obj),
+        die_value = mcp_die_value(obj),
+        counter_value = mcp_counter_value(obj),
     }
 end
 
@@ -140,7 +183,8 @@ local function mcp_compact_object_summary(obj)
     return {
         guid = mcp_try(function() return obj.getGUID() end),
         name = mcp_try(function() return obj.getName() end),
-        type = mcp_try(function() return obj.tag end),
+        description = mcp_try(function() return obj.getDescription() end),
+        type = mcp_try(function() return obj.type end) or mcp_try(function() return obj.tag end),
         tags = mcp_try(function() return obj.getTags() end) or {},
         position = mcp_vector(mcp_try(function() return obj.getPosition() end)),
         rotation = mcp_vector(mcp_try(function() return obj.getRotation() end)),
@@ -149,6 +193,8 @@ local function mcp_compact_object_summary(obj)
         smooth_moving = mcp_try(function() return obj.isSmoothMoving() end),
         smooth_position = mcp_vector(mcp_try(function() return obj.getPositionSmooth() end)),
         zone_guids = mcp_zone_guids(obj),
+        die_value = mcp_die_value(obj),
+        counter_value = mcp_counter_value(obj),
     }
 end
 
@@ -169,7 +215,7 @@ local function mcp_json_safe(value, depth)
         local y = mcp_try(function() return value.y end)
         local z = mcp_try(function() return value.z end)
         if x ~= nil or y ~= nil or z ~= nil then
-            return {x = tonumber(x) or 0, y = tonumber(y) or 0, z = tonumber(z) or 0}
+            return { x = tonumber(x) or 0, y = tonumber(y) or 0, z = tonumber(z) or 0 }
         end
         return tostring(value)
     end
@@ -206,6 +252,32 @@ local function mcp_post_bridge_response(response)
     )
 end
 
+local function mcp_send_bridge_response(response)
+    -- The optional HTTP fallback must never prevent the native External
+    -- Editor response. In particular, WebRequest.custom can throw before it
+    -- queues a request when TTS rejects a local endpoint or its web subsystem
+    -- is unavailable. Keep each transport isolated so one failed path cannot
+    -- turn a valid command into a Python-side timeout.
+    local posted, post_err = pcall(mcp_post_bridge_response, response)
+    if not posted then
+        mcp_debug("[tts-mcp] HTTP response callback could not start: " .. tostring(post_err))
+    end
+
+    local sent, send_err = pcall(sendExternalMessage, response)
+    if not sent then
+        mcp_debug("[tts-mcp] External Editor response failed: " .. tostring(send_err))
+    end
+
+    -- Retain the next-frame retry for TTS builds that drop an immediate
+    -- External Editor callback, while isolating it from any callback error.
+    Wait.frames(function()
+        local retried, retry_err = pcall(sendExternalMessage, response)
+        if not retried then
+            mcp_debug("[tts-mcp] External Editor retry failed: " .. tostring(retry_err))
+        end
+    end, 1)
+end
+
 local function mcp_send_ok(request_id, result)
     mcp_debug("[tts-mcp] sending success response for " .. tostring(request_id))
     local response = {
@@ -215,15 +287,8 @@ local function mcp_send_ok(request_id, result)
         ok = true,
         result = mcp_json_safe(result),
     }
-    -- Send once immediately and once after the callback returns. Different
-    -- TTS builds have dropped one of these timing modes, while the Python
-    -- request waiter safely ignores a duplicate response.
-    mcp_post_bridge_response(response)
-    sendExternalMessage(response)
-    Wait.frames(function()
-        sendExternalMessage(response)
-        mcp_debug("[tts-mcp] success response sent")
-    end, 1)
+    mcp_send_bridge_response(response)
+    mcp_debug("[tts-mcp] success response queued")
 end
 
 local function mcp_send_error(request_id, err)
@@ -235,12 +300,8 @@ local function mcp_send_error(request_id, err)
         ok = false,
         error = tostring(err),
     }
-    mcp_post_bridge_response(response)
-    sendExternalMessage(response)
-    Wait.frames(function()
-        sendExternalMessage(response)
-        mcp_debug("[tts-mcp] error response sent")
-    end, 1)
+    mcp_send_bridge_response(response)
+    mcp_debug("[tts-mcp] error response queued")
 end
 
 local function mcp_require_object(guid)
@@ -252,7 +313,16 @@ local function mcp_require_object(guid)
     if obj == nil then
         error("No in-scene object exists with GUID " .. guid)
     end
+    local actual_guid = mcp_try(function() return obj.getGUID() end)
+    if actual_guid == nil or tostring(actual_guid) == "" or tostring(actual_guid) == "-1" then
+        error("Object " .. guid .. " is no longer a valid in-scene object")
+    end
     return obj
+end
+
+local function mcp_safe_object_tags(obj)
+    local tags = mcp_try(function() return obj.getTags() end)
+    return type(tags) == "table" and tags or {}
 end
 
 local function mcp_has_tag(obj, requested)
@@ -261,12 +331,24 @@ local function mcp_has_tag(obj, requested)
     end
 
     local wanted = string.lower(tostring(requested))
-    for _, actual in ipairs(obj.getTags()) do
+    local tags = mcp_safe_object_tags(obj)
+    for _, actual in ipairs(tags) do
         if string.lower(tostring(actual)) == wanted then
             return true
         end
     end
     return false
+end
+
+local function mcp_live_object(obj)
+    if obj == nil then
+        return false
+    end
+    local guid = mcp_try(function() return obj.getGUID() end)
+    -- TTS can briefly leave stale object references in getObjects() while a
+    -- model is being destroyed, unloaded, or moved between containers. Those
+    -- references commonly report GUID -1 and must not abort an entire list.
+    return guid ~= nil and tostring(guid) ~= "" and tostring(guid) ~= "-1"
 end
 
 local function mcp_matches_filters(obj, args)
@@ -300,7 +382,7 @@ end
 local function mcp_region_contains_object(obj, minimum, maximum)
     local bounds = mcp_try(function() return obj.getBounds() end)
     local center = mcp_try(function() return obj.getPosition() end)
-    local size = {x = 0, y = 0, z = 0}
+    local size = { x = 0, y = 0, z = 0 }
     if type(bounds) == "table" then
         center = bounds.center or center
         size = bounds.size or size
@@ -322,9 +404,11 @@ end
 local MCP_HANDLERS = {}
 
 MCP_HANDLERS.ping = function(args, request_id)
+    local object_count = mcp_try(function() return #getObjects() end)
     return {
         bridge = MCP_CHANNEL,
-        object_count = #getObjects(),
+        bridge_version = MCP_BRIDGE_VERSION,
+        object_count = tonumber(object_count) or -1,
         message = "Tabletop Simulator MCP bridge is active.",
     }
 end
@@ -338,18 +422,25 @@ MCP_HANDLERS.list_objects = function(args, request_id)
     local total_matching = 0
 
     for _, obj in ipairs(getObjects()) do
-        local object_name = string.lower(tostring(obj.getName() or ""))
-        local name_matches = name_filter == "" or string.find(
-            object_name,
-            name_filter,
-            1,
-            true
-        ) ~= nil
+        if mcp_live_object(obj) then
+            local object_name = string.lower(tostring(mcp_try(function() return obj.getName() end) or ""))
+            local name_matches = name_filter == "" or string.find(
+                object_name,
+                name_filter,
+                1,
+                true
+            ) ~= nil
 
-        if name_matches and mcp_has_tag(obj, tag_filter) then
-            total_matching = total_matching + 1
-            if #results < max_results then
-                table.insert(results, args.compact == true and mcp_compact_object_summary(obj) or mcp_object_summary(obj))
+            if name_matches and mcp_has_tag(obj, tag_filter) then
+                local summary_ok, summary = pcall(function()
+                    return args.compact == true and mcp_compact_object_summary(obj) or mcp_object_summary(obj)
+                end)
+                if summary_ok and type(summary) == "table" and mcp_live_object(obj) and summary.guid ~= nil then
+                    total_matching = total_matching + 1
+                    if #results < max_results then
+                        table.insert(results, summary)
+                    end
+                end
             end
         end
     end
@@ -514,10 +605,29 @@ MCP_HANDLERS.get_snap_points = function(args, request_id)
     if type(points) ~= "table" then
         error("Object " .. args.guid .. " does not expose snap points.")
     end
+    local normalized_points = {}
+    for _, point in ipairs(points) do
+        local normalized = {
+            position = point.position,
+            rotation = point.rotation,
+            tags = point.tags,
+        }
+        local world_position = mcp_try(function()
+            return object.positionToWorld(point.position)
+        end)
+        if type(world_position) == "table" then
+            normalized.world_position = {
+                x = tonumber(world_position.x) or 0,
+                y = tonumber(world_position.y) or 0,
+                z = tonumber(world_position.z) or 0,
+            }
+        end
+        table.insert(normalized_points, normalized)
+    end
     return {
         guid = args.guid,
-        count = #points,
-        snap_points = points,
+        count = #normalized_points,
+        snap_points = normalized_points,
     }
 end
 
@@ -566,10 +676,10 @@ end
 
 local function mcp_catalog_clone(source, args, request_id, parent, cleanup)
     if source == nil or source.isDestroyed() then error("Catalog source container is unavailable") end
-    local position = args.position or {x = 0, y = 2, z = 0}
+    local position = args.position or { x = 0, y = 2, z = 0 }
     local function clone_source(object)
         if object == nil or object.isDestroyed() then error("Catalog object was not taken from its container") end
-        local clone = object.clone({position = position})
+        local clone = object.clone({ position = position })
         if clone == nil then error("Could not clone catalog object " .. tostring(args.guid)) end
         Wait.frames(function()
             if cleanup and parent and not parent.isDestroyed() and not source.isDestroyed() then
@@ -586,7 +696,7 @@ local function mcp_catalog_clone(source, args, request_id, parent, cleanup)
     end
     source.takeObject({
         guid = tostring(args.guid),
-        position = {x = position.x, y = position.y + 3, z = position.z},
+        position = { x = position.x, y = position.y + 3, z = position.z },
         smooth = false,
         callback_function = clone_source,
     })
@@ -597,14 +707,14 @@ MCP_HANDLERS.spawn_catalog = function(args, request_id)
     if not string.match(guid, "^[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]$") then
         error("A valid six-character catalog GUID is required")
     end
-    args.position = args.position or {x = tonumber(args.x) or 0, y = tonumber(args.y) or 2, z = tonumber(args.z) or 0}
+    args.position = args.position or { x = tonumber(args.x) or 0, y = tonumber(args.y) or 2, z = tonumber(args.z) or 0 }
 
     -- Preserve V6 behavior when the source is already on the table: clone it.
     local existing = getObjectFromGUID(guid)
     if existing and existing.type ~= "Bag" and existing.type ~= "Infinite_Bag" then
-        local clone = existing.clone({position = args.position})
+        local clone = existing.clone({ position = args.position })
         if not clone then error("Could not clone catalog object " .. guid) end
-        return {action = "spawn_catalog", guid = guid, object = mcp_object_summary(clone)}
+        return { action = "spawn_catalog", guid = guid, object = mcp_object_summary(clone) }
     end
 
     local path = args.container_path
@@ -629,11 +739,17 @@ MCP_HANDLERS.spawn_catalog = function(args, request_id)
                 end
             end
             if target_guid then
-                container.takeObject({guid = target_guid, position = {x = 0, y = 8, z = 0}, smooth = false,
+                container.takeObject({
+                    guid = target_guid,
+                    position = { x = 0, y = 8, z = 0 },
+                    smooth = false,
                     callback_function = function(category)
                         Wait.frames(function() mcp_catalog_clone(category, args, request_id, container, true) end, 5)
-                        Wait.frames(function() if category and not category.isDestroyed() and container and not container.isDestroyed() then container.putObject(category) end end, 20)
-                    end})
+                        Wait.frames(
+                        function() if category and not category.isDestroyed() and container and not container.isDestroyed() then
+                                container.putObject(category) end end, 20)
+                    end
+                })
                 return nil, true
             end
         end
@@ -649,8 +765,8 @@ MCP_HANDLERS.place_catalog = function(args, request_id)
     local guid = tostring(args.guid or "")
     local object = getObjectFromGUID(guid)
     if object then
-        object.setPositionSmooth(args.position or {x = args.x or 0, y = args.y or 2, z = args.z or 0}, false, true)
-        return {action = "place_catalog", guid = guid, object = mcp_object_summary(object)}
+        object.setPositionSmooth(args.position or { x = args.x or 0, y = args.y or 2, z = args.z or 0 }, false, true)
+        return { action = "place_catalog", guid = guid, object = mcp_object_summary(object) }
     end
     return MCP_HANDLERS.spawn_catalog(args, request_id)
 end
@@ -663,6 +779,740 @@ MCP_HANDLERS.put_object_into_container = function(args, request_id)
         container = mcp_object_summary(result or container),
         object_guid = args.object_guid,
         container_guid = args.container_guid,
+    }
+end
+
+-- Kill Team setup must not enumerate every object in a large mod. Unrelated
+-- scripted objects can be unloading and leave managed references which abort
+-- a generic getObjects() walk. Query only the agreed semantic tags, then add
+-- bounded exact GUIDs required by the current validation goal.
+MCP_HANDLERS.killteam_probe_collection = function(args, request_id)
+    local allowed_stages = {
+        decode = true,
+        tag_lookup = true,
+        tag_summary = true,
+        required_lookup = true,
+        required_summary = true,
+        snap_lookup = true,
+        snap_summary = true,
+    }
+    local stage = tostring(args.probe_stage or "")
+    if allowed_stages[stage] ~= true then
+        error("Kill Team collection probe stage is invalid")
+    end
+    local probe_index = math.max(1, math.min(tonumber(args.probe_index) or 1, 32))
+    local probe_item_index = math.max(1, math.min(tonumber(args.probe_item_index) or 1, 1000))
+    local query_tags = mcp_decode_json_array(args.query_tags_json, "query_tags_json")
+    local required_guids = mcp_decode_json_array(args.required_guids_json, "required_guids_json")
+    local snap_point_tags = mcp_decode_json_array(args.snap_point_tags_json, "snap_point_tags_json")
+
+    if stage == "decode" then
+        return {
+            stage = stage,
+            query_tag_count = #query_tags,
+            required_guid_count = #required_guids,
+            snap_point_tag_count = #snap_point_tags,
+        }
+    end
+
+    if stage == "tag_lookup" or stage == "tag_summary" then
+        local entity_tag = tostring(query_tags[probe_index] or "")
+        if entity_tag == "" or string.len(entity_tag) > 128 then
+            error("Kill Team probe query tag is unavailable or invalid")
+        end
+        local tagged = getObjectsWithTag(entity_tag)
+        if type(tagged) ~= "table" then
+            error("Kill Team tagged lookup did not return an array")
+        end
+        if stage == "tag_lookup" then
+            return {
+                stage = stage,
+                probe_index = probe_index,
+                entity_tag = entity_tag,
+                object_count = #tagged,
+            }
+        end
+        local obj = tagged[probe_item_index]
+        if obj == nil then
+            return {
+                stage = stage,
+                probe_index = probe_index,
+                probe_item_index = probe_item_index,
+                entity_tag = entity_tag,
+                object_count = #tagged,
+                item_available = false,
+            }
+        end
+        return {
+            stage = stage,
+            probe_index = probe_index,
+            probe_item_index = probe_item_index,
+            entity_tag = entity_tag,
+            object_count = #tagged,
+            item_available = true,
+            object = mcp_compact_object_summary(obj),
+        }
+    end
+
+    if stage == "required_lookup" or stage == "required_summary" then
+        local guid = string.lower(tostring(required_guids[probe_index] or ""))
+        if not string.match(guid, "^[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]$") then
+            error("required Kill Team probe GUID is unavailable or invalid")
+        end
+        local obj = getObjectFromGUID(guid)
+        if obj == nil then
+            return {
+                stage = stage,
+                probe_index = probe_index,
+                guid = guid,
+                object_available = false,
+            }
+        end
+        if stage == "required_lookup" then
+            return {
+                stage = stage,
+                probe_index = probe_index,
+                guid = guid,
+                object_available = true,
+            }
+        end
+        return {
+            stage = stage,
+            probe_index = probe_index,
+            guid = guid,
+            object_available = true,
+            object = mcp_compact_object_summary(obj),
+        }
+    end
+
+    local global_snap_points = Global.getSnapPoints()
+    if type(global_snap_points) ~= "table" then
+        error("Global snap points could not be inspected")
+    end
+    if stage == "snap_lookup" then
+        return {
+            stage = stage,
+            snap_point_count = #global_snap_points,
+        }
+    end
+
+    local snap = global_snap_points[probe_item_index]
+    if snap == nil then
+        return {
+            stage = stage,
+            probe_item_index = probe_item_index,
+            snap_point_count = #global_snap_points,
+            item_available = false,
+        }
+    end
+    return {
+        stage = stage,
+        probe_item_index = probe_item_index,
+        snap_point_count = #global_snap_points,
+        requested_tags = snap_point_tags,
+        item_available = true,
+        snap_point = {
+            position = mcp_vector(snap.position),
+            rotation = mcp_vector(snap.rotation),
+            rotation_snap = snap.rotation_snap,
+            tags = snap.tags or {},
+        },
+    }
+end
+
+local function mcp_deployment_object_summary(obj)
+    return {
+        guid = mcp_try(function() return obj.getGUID() end),
+        name = mcp_try(function() return obj.getName() end),
+        type = mcp_try(function() return obj.type end),
+        tags = mcp_try(function() return obj.getTags() end) or {},
+        position = mcp_vector(mcp_try(function() return obj.getPosition() end)),
+        locked = mcp_try(function() return obj.getLock() end) == true,
+    }
+end
+
+MCP_HANDLERS.killteam_deployment_test_objects = function(args, request_id)
+    local wanted_model_name = "plague marine warrior"
+    local wanted_target_tag = "_deployment_zone_blue"
+
+    local function resolve_unique_name(name)
+        local matches = {}
+        for _, obj in ipairs(getObjects()) do
+            if mcp_live_object(obj) then
+                local object_name = string.lower(tostring(
+                    mcp_try(function() return obj.getName() end) or ""
+                ))
+                if string.find(object_name, name, 1, true) ~= nil then
+                    local ok, summary = pcall(function()
+                        return mcp_deployment_object_summary(obj)
+                    end)
+                    if ok and type(summary) == "table" then
+                        local guid = string.lower(tostring(summary.guid or ""))
+                        if guid ~= "" and guid ~= "-1" then
+                            table.insert(matches, summary)
+                        end
+                    end
+                end
+            end
+        end
+        if #matches ~= 1 then
+            error(
+                "test deployment name " .. name
+                .. " must resolve to exactly one object; found "
+                .. tostring(#matches)
+            )
+        end
+        return matches[1]
+    end
+
+    local function resolve_unique_tag(tag)
+        local tagged = mcp_try(function() return getObjectsWithTag(tag) end)
+        if type(tagged) ~= "table" then
+            error("test deployment tag lookup failed: " .. tag)
+        end
+        local matches = {}
+        for _, obj in ipairs(tagged) do
+            if mcp_live_object(obj) then
+                local ok, summary = pcall(function()
+                    return mcp_deployment_object_summary(obj)
+                end)
+                if ok and type(summary) == "table" then
+                    local guid = string.lower(tostring(summary.guid or ""))
+                    if guid ~= "" and guid ~= "-1" then
+                        table.insert(matches, summary)
+                    end
+                end
+            end
+        end
+        if #matches ~= 1 then
+            error(
+                "test deployment tag " .. tag
+                .. " must resolve to exactly one object; found "
+                .. tostring(#matches)
+            )
+        end
+        return matches[1]
+    end
+
+    local model = resolve_unique_name(wanted_model_name)
+    local target = resolve_unique_tag(wanted_target_tag)
+    return {
+        count = 2,
+        total_matching = 2,
+        truncated = false,
+        observation_scope = "killteam_deployment_test",
+        objects = {
+            model,
+            target,
+        },
+    }
+end
+
+MCP_HANDLERS.killteam_deployment_name_search = function(args, request_id)
+    local name_needles = {
+        "plague marine",
+        "novitiate dialogus",
+        "novitiate hospitaller",
+        "blue die",
+        "blue kustom 40k dice roller",
+        "deployment",
+    }
+    local matches = {}
+    local total_matching = 0
+    for _, obj in ipairs(getObjects()) do
+        if mcp_live_object(obj) then
+            local ok, summary = pcall(function()
+                return mcp_deployment_object_summary(obj)
+            end)
+            if ok and type(summary) == "table" then
+                local object_name = string.lower(tostring(summary.name or ""))
+                for _, needle in ipairs(name_needles) do
+                    if string.find(object_name, needle, 1, true) ~= nil then
+                        total_matching = total_matching + 1
+                        if #matches < 20 then
+                            table.insert(matches, summary)
+                        end
+                        break
+                    end
+                end
+            end
+        end
+    end
+    return {
+        count = #matches,
+        total_matching = total_matching,
+        truncated = total_matching > #matches,
+        observation_scope = "killteam_deployment_name_search",
+        objects = matches,
+    }
+end
+
+MCP_HANDLERS.killteam_list_objects = function(args, request_id)
+    local max_results = math.max(1, math.min(tonumber(args.max_results) or 200, 1000))
+    local query_tags = mcp_decode_json_array(args.query_tags_json, "query_tags_json")
+    local required_guids = mcp_decode_json_array(args.required_guids_json, "required_guids_json")
+    local snap_point_tags = mcp_decode_json_array(args.snap_point_tags_json, "snap_point_tags_json")
+    if type(query_tags) ~= "table" or type(required_guids) ~= "table"
+        or type(snap_point_tags) ~= "table" then
+        error("Kill Team snapshot collection arguments must decode to arrays")
+    end
+    if #query_tags == 0 then
+        query_tags = {
+            "tts_mcp:entity=operative",
+            "tts_mcp:entity=die",
+            "tts_mcp:entity=dice_roller",
+            "tts_mcp:entity=counter",
+            "tts_mcp:entity=calibration",
+            "tts_mcp:entity=terrain",
+            "tts_mcp:entity=deployment",
+            "tts_mcp:entity=objective",
+        }
+    end
+    local results = {}
+    local seen = {}
+    local total_matching = 0
+
+    local function add_object(obj)
+        if not mcp_live_object(obj) then
+            return false
+        end
+        local summary_ok, summary = pcall(function()
+            return mcp_compact_object_summary(obj)
+        end)
+        if not summary_ok or type(summary) ~= "table" then
+            return false
+        end
+        local guid = tostring(summary.guid or "")
+        if guid == "" or guid == "-1" then
+            return false
+        end
+        local key = string.lower(guid)
+        if seen[key] then
+            return true
+        end
+        seen[key] = true
+        total_matching = total_matching + 1
+        if #results < max_results then
+            table.insert(results, summary)
+        end
+        return true
+    end
+
+    for index, entity_tag in ipairs(query_tags) do
+        if index > 32 then
+            break
+        end
+        entity_tag = tostring(entity_tag or "")
+        if entity_tag == "" or string.len(entity_tag) > 128 then
+            error("Kill Team query tag is invalid")
+        end
+        local tagged = mcp_try(function() return getObjectsWithTag(entity_tag) end)
+        if type(tagged) == "table" then
+            for _, obj in ipairs(tagged) do
+                add_object(obj)
+            end
+        end
+    end
+
+    for index, raw_guid in ipairs(required_guids) do
+        if index > 32 then
+            break
+        end
+        local guid = string.lower(tostring(raw_guid or ""))
+        if not string.match(guid, "^[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]$") then
+            error("required Kill Team GUID is invalid: " .. guid)
+        end
+        local obj = getObjectFromGUID(guid)
+        if obj == nil then
+            error("required Kill Team object is not in the scene: " .. guid)
+        end
+        if not add_object(obj) then
+            error("required Kill Team object could not be inspected: " .. guid)
+        end
+    end
+
+    local requested_snap_tags = {}
+    for index, raw_tag in ipairs(snap_point_tags) do
+        if index > 16 then
+            break
+        end
+        local tag = tostring(raw_tag or "")
+        if tag == "" or string.len(tag) > 128 then
+            error("Kill Team snap point tag is invalid")
+        end
+        requested_snap_tags[string.lower(tag)] = true
+    end
+    local snap_points = {}
+    if next(requested_snap_tags) ~= nil then
+        local global_snap_points = mcp_try(function() return Global.getSnapPoints() end)
+        if type(global_snap_points) ~= "table" then
+            error("Global snap points could not be inspected")
+        end
+        for _, snap in ipairs(global_snap_points) do
+            local matched = false
+            for _, raw_tag in ipairs(snap.tags or {}) do
+                if requested_snap_tags[string.lower(tostring(raw_tag))] then
+                    matched = true
+                    break
+                end
+            end
+            if matched then
+                table.insert(snap_points, {
+                    position = mcp_vector(snap.position),
+                    rotation = mcp_vector(snap.rotation),
+                    rotation_snap = snap.rotation_snap,
+                    tags = snap.tags or {},
+                })
+            end
+        end
+    end
+
+    return {
+        count = #results,
+        total_matching = total_matching,
+        truncated = total_matching > #results,
+        objects = results,
+        snap_points = snap_points,
+        observation_scope = "killteam_tagged",
+    }
+end
+
+MCP_HANDLERS.killteam_get_roster = function(args, request_id)
+    local container = mcp_require_object(args.guid)
+    local items = mcp_container_items(container)
+    if items == nil then
+        error("Object " .. tostring(args.guid) .. " is not a supported roster container")
+    end
+    return {
+        container_guid = tostring(container.getGUID()),
+        container = mcp_compact_object_summary(container),
+        count = items.count,
+        total = items.total,
+        truncated = items.truncated,
+        items = items.items,
+    }
+end
+
+MCP_HANDLERS.killteam_probe_los = function(args, request_id)
+    local observer = mcp_require_object(args.observer_guid)
+    local target = mcp_require_object(args.target_guid)
+    local observer_guid = tostring(observer.getGUID())
+    local target_guid = tostring(target.getGUID())
+    if observer_guid == target_guid then
+        error("observer and target must be different objects")
+    end
+
+    local eye_local = {
+        x = tonumber(args.eye_x) or 0,
+        y = tonumber(args.eye_y) or 1,
+        z = tonumber(args.eye_z) or 0,
+    }
+    local eye_world = observer.positionToWorld(eye_local)
+
+    local bounds = mcp_try(function() return target.getBounds() end)
+    if type(bounds) ~= "table" or bounds.center == nil or bounds.size == nil then
+        error("target bounds are unavailable for line of sight sampling")
+    end
+    local center = mcp_vector(bounds.center)
+    local size = mcp_vector(bounds.size)
+    if center == nil or size == nil then
+        error("target bounds are invalid for line of sight sampling")
+    end
+
+    local function normalize(value, fallback)
+        local length = math.sqrt((value.x or 0) ^ 2 + (value.y or 0) ^ 2 + (value.z or 0) ^ 2)
+        if length <= 0 then
+            return fallback
+        end
+        return { x = value.x / length, y = value.y / length, z = value.z / length }
+    end
+    local function add_scaled(first, second, amount)
+        return {
+            x = first.x + second.x * amount,
+            y = first.y + second.y * amount,
+            z = first.z + second.z * amount,
+        }
+    end
+    local function subtract(first, second)
+        return {
+            x = first.x - second.x,
+            y = first.y - second.y,
+            z = first.z - second.z,
+        }
+    end
+
+    local right = normalize(
+        mcp_vector(mcp_try(function() return target.getTransformRight() end)) or { x = 1, y = 0, z = 0 },
+        { x = 1, y = 0, z = 0 }
+    )
+    local up = normalize(
+        mcp_vector(mcp_try(function() return target.getTransformUp() end)) or { x = 0, y = 1, z = 0 },
+        { x = 0, y = 1, z = 0 }
+    )
+    local half_width = math.abs(tonumber(size.x) or 0) / 2
+    local half_height = math.abs(tonumber(size.y) or 0) / 2
+    local sample_pattern = {
+        { -1, -1 }, { 0, -1 }, { 1, -1 },
+        { -1, 0 }, { 0, 0 }, { 1, 0 },
+        { -1, 1 }, { 0, 1 }, { 1, 1 },
+    }
+    local ignored = { [observer_guid] = true }
+    if type(args.ignore_guids) == "table" then
+        for index, guid in ipairs(args.ignore_guids) do
+            if index > 16 then
+                break
+            end
+            ignored[tostring(guid)] = true
+        end
+    end
+
+    local samples = {}
+    local blocker_guids = {}
+    local blocker_seen = {}
+    local visible_rays = 0
+    for index, offsets in ipairs(sample_pattern) do
+        local target_point = add_scaled(
+            add_scaled(center, right, offsets[1] * half_width),
+            up,
+            offsets[2] * half_height
+        )
+        local delta = subtract(target_point, eye_world)
+        local distance = math.sqrt(delta.x * delta.x + delta.y * delta.y + delta.z * delta.z)
+        if distance <= 0.0001 then
+            error("observer and target sample point are coincident")
+        end
+        local direction = {
+            x = delta.x / distance,
+            y = delta.y / distance,
+            z = delta.z / distance,
+        }
+        local cast_ok, hits = pcall(function()
+            return Physics.cast({
+                origin = eye_world,
+                direction = direction,
+                type = 1,
+                max_distance = distance,
+                debug = args.debug == true,
+            })
+        end)
+        if not cast_ok then
+            error("Physics.cast failed: " .. tostring(hits))
+        end
+
+        local first_hit = nil
+        for _, hit in ipairs(hits or {}) do
+            local hit_object = hit and hit.hit_object or nil
+            local hit_guid = hit_object and mcp_try(function() return hit_object.getGUID() end) or nil
+            if hit_guid ~= nil and not ignored[tostring(hit_guid)] then
+                first_hit = {
+                    guid = tostring(hit_guid),
+                    name = hit_object and mcp_try(function() return hit_object.getName() end) or nil,
+                    point = mcp_vector(hit.point),
+                    distance = tonumber(hit.distance),
+                }
+                break
+            end
+        end
+        local hits_target = first_hit ~= nil and first_hit.guid == target_guid
+        if hits_target then
+            visible_rays = visible_rays + 1
+        elseif first_hit ~= nil and not blocker_seen[first_hit.guid] then
+            blocker_seen[first_hit.guid] = true
+            table.insert(blocker_guids, first_hit.guid)
+        end
+        table.insert(samples, {
+            index = index,
+            target_point = target_point,
+            hit_guid = first_hit and first_hit.guid or nil,
+            hit_name = first_hit and first_hit.name or nil,
+            hit_point = first_hit and first_hit.point or nil,
+            hit_distance = first_hit and first_hit.distance or nil,
+            hits_target = hits_target,
+        })
+    end
+
+    return {
+        observer_guid = observer_guid,
+        target_guid = target_guid,
+        eye_local = eye_local,
+        eye_world = mcp_vector(eye_world),
+        target_bounds = mcp_bounds(bounds),
+        visible = visible_rays > 0,
+        visible_rays = visible_rays,
+        total_rays = #sample_pattern,
+        visibility_fraction = visible_rays / #sample_pattern,
+        blocker_guids = blocker_guids,
+        samples = samples,
+        collider_warning = "physics_colliders_only",
+        debug = args.debug == true,
+    }
+end
+
+MCP_HANDLERS.killteam_roll_dice = function(args, request_id)
+    local roller = mcp_require_object(args.roller_guid)
+    local dice_guids = mcp_decode_json_array(args.dice_guids_json, "dice_guids_json")
+    if type(dice_guids) ~= "table" or #dice_guids == 0 or #dice_guids > 12 then
+        error("dice_guids must contain at least one die GUID")
+    end
+    local team = tostring(args.team or "")
+    local requested = {}
+    for _, guid in ipairs(dice_guids) do
+        guid = string.lower(tostring(guid or ""))
+        if not string.match(guid, "^[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]$") then
+            error("Kill Team die GUID is invalid: " .. guid)
+        end
+        local die = mcp_require_object(tostring(guid))
+        local has_canonical_tag = mcp_has_tag(die, "tts_mcp:entity=die")
+        local has_native_tag = args.die_tag ~= nil
+            and args.die_tag ~= ""
+            and mcp_has_tag(die, args.die_tag)
+        if not has_canonical_tag and not has_native_tag then
+            error("Object " .. tostring(guid) .. " is not tagged as a Kill Team die")
+        end
+        if team ~= "" and not has_native_tag and not mcp_has_tag(die, "tts_mcp:team=" .. team) then
+            error("Die " .. tostring(guid) .. " is not assigned to team " .. team)
+        end
+        requested[guid] = true
+        roller.putObject(die)
+    end
+
+    Wait.frames(function()
+        local rolled_values = mcp_try(function() return roller.getTable("diceGuids") end) or {}
+        local faces = {}
+        local items = {}
+        for _, raw_guid in ipairs(dice_guids) do
+            local guid = string.lower(tostring(raw_guid))
+            local face = tonumber(rolled_values[guid])
+            if face == nil then
+                local die = mcp_try(function() return getObjectFromGUID(guid) end)
+                face = mcp_die_value(die)
+            end
+            table.insert(faces, face)
+            table.insert(items, {
+                guid = guid,
+                die_value = face,
+            })
+        end
+        mcp_send_ok(request_id, {
+            team = team,
+            purpose = tostring(args.purpose or ""),
+            roller_guid = args.roller_guid,
+            faces = faces,
+            items = items,
+        })
+    end, 30)
+    return nil, true
+end
+
+MCP_HANDLERS.killteam_observe_defense_roll = function(args, request_id)
+    local station = mcp_require_object(args.station_guid)
+    local expected_count = tonumber(args.expected_count)
+    if expected_count == nil or expected_count < 1 or expected_count > 6
+        or expected_count ~= math.floor(expected_count) then
+        error("expected_count must be an integer from 1 through 6")
+    end
+    local rolled_values = mcp_try(function() return station.getTable("diceGuids") end)
+    if type(rolled_values) ~= "table" then
+        error("the defense station has no readable completed roll")
+    end
+    local items = {}
+    for raw_guid, raw_face in pairs(rolled_values) do
+        local guid = string.lower(tostring(raw_guid or ""))
+        local face = tonumber(raw_face)
+        if string.match(guid, "^[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]$")
+            and face ~= nil and face >= 1 and face <= 6 then
+            table.insert(items, { guid = guid, die_value = face })
+        end
+    end
+    table.sort(items, function(first, second) return first.guid < second.guid end)
+    if #items ~= expected_count then
+        error(
+            "the defense station must contain exactly "
+            .. tostring(expected_count)
+            .. " completed die results"
+        )
+    end
+    local faces = {}
+    for _, item in ipairs(items) do
+        table.insert(faces, item.die_value)
+    end
+    return {
+        station_guid = tostring(station.getGUID()),
+        expected_count = expected_count,
+        faces = faces,
+        items = items,
+    }
+end
+
+local function mcp_operative_wounds(operative)
+    local state = mcp_try(function() return operative.getTable("state") end)
+    if type(state) ~= "table" then
+        state = mcp_try(function() return operative.getVar("state") end)
+    end
+    if type(state) ~= "table" then
+        return nil
+    end
+    return tonumber(state.wounds)
+end
+
+MCP_HANDLERS.killteam_apply_damage = function(args, request_id)
+    local operative = mcp_require_object(args.guid)
+    local damage = tonumber(args.damage)
+    local expected_wounds = tonumber(args.expected_wounds)
+    if damage == nil or damage < 0 or damage > 100 or damage ~= math.floor(damage) then
+        error("damage must be an integer from 0 through 100")
+    end
+    if expected_wounds == nil or expected_wounds < 0
+        or expected_wounds ~= math.floor(expected_wounds) then
+        error("expected_wounds must be a non-negative integer")
+    end
+    local before_wounds = mcp_operative_wounds(operative)
+    if before_wounds == nil then
+        error("operative wound state is not readable")
+    end
+    if before_wounds ~= expected_wounds then
+        error(
+            "operative wound precondition failed: expected "
+            .. tostring(expected_wounds)
+            .. ", observed "
+            .. tostring(before_wounds)
+        )
+    end
+    for _ = 1, math.min(damage, before_wounds) do
+        operative.call("damage", "Blue")
+    end
+    local after_wounds = mcp_operative_wounds(operative)
+    local expected_after = math.max(0, before_wounds - damage)
+    if after_wounds ~= expected_after then
+        error(
+            "operative wound readback failed: expected "
+            .. tostring(expected_after)
+            .. ", observed "
+            .. tostring(after_wounds)
+        )
+    end
+    return {
+        guid = tostring(operative.getGUID()),
+        damage = damage,
+        before_wounds = before_wounds,
+        after_wounds = after_wounds,
+    }
+end
+
+MCP_HANDLERS.set_counter_value = function(args, request_id)
+    local counter = mcp_require_object(args.guid)
+    if counter.Counter == nil or counter.Counter.setValue == nil then
+        error("Object " .. tostring(args.guid) .. " is not a TTS counter")
+    end
+    local value = tonumber(args.value)
+    if value == nil then
+        error("counter value must be numeric")
+    end
+    counter.Counter.setValue(value)
+    return {
+        guid = args.guid,
+        value = mcp_counter_value(counter),
+        object = mcp_object_summary(counter),
     }
 end
 
@@ -723,7 +1573,7 @@ MCP_HANDLERS.move_object = function(args, request_id)
     if x == nil or y == nil or z == nil then
         error("position must contain numeric x, y, and z values.")
     end
-    local position = {x = x, y = y, z = z}
+    local position = { x = x, y = y, z = z }
 
     -- Resolve the in-scene GUID first, then pass a native Lua position table
     -- to TTS. Do not pass any External Editor-provided vector/table to the
@@ -795,9 +1645,9 @@ MCP_HANDLERS.spawn_builtin = function(args, request_id)
 
     local params = {
         type = object_type,
-        position = args.position or {x = 0, y = 3, z = 0},
-        rotation = args.rotation or {x = 0, y = 0, z = 0},
-        scale = args.scale or {x = 1, y = 1, z = 1},
+        position = args.position or { x = 0, y = 3, z = 0 },
+        rotation = args.rotation or { x = 0, y = 0, z = 0 },
+        scale = args.scale or { x = 1, y = 1, z = 1 },
         sound = false,
         snap_to_grid = false,
         callback_function = function(spawned)
@@ -830,8 +1680,8 @@ end
 
 MCP_HANDLERS.broadcast = function(args, request_id)
     local message = tostring(args.message or "")
-    broadcastToAll(message, {r = 1, g = 1, b = 1})
-    return {broadcast = true, message = message}
+    broadcastToAll(message, { r = 1, g = 1, b = 1 })
+    return { broadcast = true, message = message }
 end
 
 local function mcp_forward_chat(message, sender)
@@ -975,6 +1825,25 @@ local function mcp_unwrap_external_message(data)
     return data
 end
 
+local function mcp_external_scalar_array(data, count_field, item_prefix, max_items)
+    local raw_count = mcp_try(function() return data[count_field] end)
+    local count = math.max(
+        0,
+        math.min(tonumber(tostring(raw_count or "0")) or 0, max_items)
+    )
+    local values = {}
+    for index = 1, count do
+        local field = item_prefix .. tostring(index)
+        local raw_value = mcp_try(function() return data[field] end)
+        local value = tostring(raw_value or "")
+        if value == "" then
+            error(field .. " is missing")
+        end
+        table.insert(values, value)
+    end
+    return values
+end
+
 function mcp_handleExternalMessage(data)
     data = mcp_unwrap_external_message(data)
 
@@ -1015,14 +1884,155 @@ function mcp_handleExternalMessage(data)
         return true
     end
 
-    local args = data.args or {}
-    -- Object-form External Editor messages can lose values nested under args.
-    -- Python mirrors these action fields at the message root for this narrow
-    -- compatibility fallback.
-    if args.guid == nil and data.guid ~= nil then args.guid = data.guid end
-    if args.position == nil and data.position ~= nil then args.position = data.position end
-    if args.rotation == nil and data.rotation ~= nil then args.rotation = data.rotation end
-    if args.locked == nil and data.locked ~= nil then args.locked = data.locked end
+    if action == "killteam_deployment_test_objects"
+        or action == "killteam_deployment_name_search" then
+        local handler = MCP_HANDLERS[action]
+        mcp_debug("[tts-mcp] received action: " .. action)
+        local ok, result, deferred = pcall(handler, {}, request_id)
+        if not ok then
+            mcp_send_error(request_id, result)
+        elseif deferred ~= true then
+            mcp_send_ok(request_id, result)
+        end
+        return true
+    end
+
+    if action == "get_object" or action == "get_snap_points" then
+        local scalar_args = {
+            guid = tostring(data.guid or ""),
+        }
+        local handler = MCP_HANDLERS[action]
+        mcp_debug("[tts-mcp] received action: " .. action)
+        if handler == nil then
+            mcp_send_error(request_id, "Unknown MCP action: " .. action)
+            return true
+        end
+        local ok, result, deferred = pcall(handler, scalar_args, request_id)
+        if not ok then
+            mcp_send_error(request_id, result)
+        elseif deferred ~= true then
+            mcp_send_ok(request_id, result)
+        end
+        return true
+    end
+
+    -- Reconstruct Kill Team collection arrays from bounded root scalar slots.
+    -- TTS exposes JSON strings inside object-form External Editor messages as
+    -- managed values which can throw before JSON.decode or Lua pcall runs.
+    if action == "killteam_list_objects" then
+        local raw_max_results = mcp_try(function() return data.max_results end)
+        local query_tags = mcp_external_scalar_array(
+            data, "query_tag_count", "query_tag_", 32
+        )
+        local required_guids = mcp_external_scalar_array(
+            data, "required_guid_count", "required_guid_", 32
+        )
+        local snap_point_tags = mcp_external_scalar_array(
+            data, "snap_point_tag_count", "snap_point_tag_", 16
+        )
+        local list_args = {
+            max_results = tonumber(tostring(raw_max_results or "200")) or 200,
+            query_tags_json = JSON.encode(query_tags),
+            required_guids_json = JSON.encode(required_guids),
+            snap_point_tags_json = JSON.encode(snap_point_tags),
+        }
+        local handler = MCP_HANDLERS[action]
+        mcp_debug("[tts-mcp] received action: " .. action)
+        if handler == nil then
+            mcp_send_error(request_id, "Unknown MCP action: " .. action)
+            return true
+        end
+        local ok, result, deferred = pcall(handler, list_args, request_id)
+        if not ok then
+            mcp_send_error(request_id, result)
+        elseif deferred ~= true then
+            mcp_send_ok(request_id, result)
+        end
+        return true
+    end
+
+    local nested_args = mcp_try(function() return data.args end)
+    local args = {}
+    -- Object-form External Editor messages can expose nested scalar values as
+    -- managed MoonSharp wrappers. Python mirrors the scalar fields at the
+    -- message root, so prefer those plain values even when the nested field
+    -- appears present. This is especially important for the Kill Team JSON
+    -- filter arguments: passing a managed wrapper to JSON.decode causes TTS
+    -- to raise "Object reference not set to an instance of an object" with
+    -- guid=-1 before the handler can return a correlated MCP error.
+    local scalar_fallback_fields = {
+        "max_results",
+        "query_tags_json",
+        "required_guids_json",
+        "snap_point_tags_json",
+        "probe_stage",
+        "probe_index",
+        "probe_item_index",
+        "observer_guid",
+        "target_guid",
+        "eye_x",
+        "eye_y",
+        "eye_z",
+        "debug",
+        "team",
+        "dice_guids_json",
+        "roller_guid",
+        "purpose",
+        "die_tag",
+        "station_guid",
+        "expected_count",
+        "damage",
+        "expected_wounds",
+    }
+    local external_fields = {
+        "guid",
+        "name_contains",
+        "tag",
+        "compact",
+        "position",
+        "rotation",
+        "locked",
+        "include_self",
+        "minimum",
+        "maximum",
+        "from_guid",
+        "to_guid",
+        "ignore_tags",
+        "container_guid",
+        "flip",
+        "smooth",
+        "index",
+        "item_guid",
+        "container_path",
+        "master_bag_guid",
+        "container_name",
+        "object_guid",
+        "ignore_guids",
+        "value",
+        "player_color",
+        "mode",
+        "pitch",
+        "yaw",
+        "distance",
+        "collide",
+        "fast",
+        "name",
+        "object_type",
+        "scale",
+        "message",
+    }
+    for _, field in ipairs(scalar_fallback_fields) do
+        table.insert(external_fields, field)
+    end
+    for _, field in ipairs(external_fields) do
+        local value = mcp_try(function() return data[field] end)
+        if value == nil and nested_args ~= nil then
+            value = mcp_try(function() return nested_args[field] end)
+        end
+        if value ~= nil then
+            args[field] = value
+        end
+    end
     local handler = MCP_HANDLERS[action]
 
     mcp_debug("[tts-mcp] received action: " .. action)
@@ -1044,7 +2054,28 @@ end
 -- Remove this wrapper if the mod already has onExternalMessage(data). In that
 -- case, call mcp_handleExternalMessage(data) from the existing handler.
 function onExternalMessage(data)
-    mcp_handleExternalMessage(data)
+    -- Managed object-reference failures can occur outside a handler's local
+    -- pcall while TTS is unloading an object. Keep the External Editor
+    -- request correlated so Python receives an error response instead of
+    -- waiting for its timeout.
+    local ok, err = pcall(mcp_handleExternalMessage, data)
+    if ok then
+        return
+    end
+
+    local request_id = ""
+    local decoded_ok, decoded = pcall(mcp_unwrap_external_message, data)
+    if decoded_ok and type(decoded) == "table" then
+        request_id = tostring(decoded.requestId or "")
+    end
+    local sent, send_err = pcall(
+        mcp_send_error,
+        request_id,
+        "Unhandled MCP bridge dispatch error: " .. tostring(err)
+    )
+    if not sent then
+        print("[tts-mcp] failed to return dispatch error: " .. tostring(send_err))
+    end
 end
 
 -- Forward player chat to MCP as an unsolicited custom event.
@@ -1097,7 +2128,7 @@ function onChat(message, sender)
             local text = mcp_public_chat_text(response.text or "")
             if text ~= "" then
                 -- Explicit alpha avoids TTS's translucent default text.
-                printToAll(text, {r = 1, g = 1, b = 1, a = 1})
+                printToAll(text, { r = 1, g = 1, b = 1, a = 1 })
             end
         end
     )

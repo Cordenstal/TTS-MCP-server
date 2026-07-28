@@ -10,7 +10,7 @@ The project needs to play Kill Team rather than only manipulate arbitrary TTS
 objects. Kill Team combines tactical planning, hidden deployment, physical
 terrain, line of sight, dice, counters, mutable status, and human actions.
 The AI will play one side as an opponent. The first target is the `Kill Team
-3.0 Quick and Easy` variant represented by the `TS_Save_129.json` fixture.
+3.0 Quick and Easy` variant represented by the `TS_Save_131.json` fixture.
 
 Raw TTS mutations and screenshots cannot establish game legality. A raw object
 list can also expose concealed opponent state unless it is filtered by the
@@ -24,12 +24,13 @@ Build Kill Team as a role-specific adapter over the generic TTS control plane.
   log. TTS is the physical projection and observation source.
 - The AI receives only its own private state, public combat-zone state, and
   currently observable enemy state. Hidden enemy state is never exposed.
-- Game startup is an explicit, fail-closed setup phase driven by versioned
-  `tts_mcp:` metadata. It discovers the roster, tagged dice, roller, counters,
-  terrain, deployment areas, objectives, ownership, and board calibration.
-- The save is parsed once as setup/fixture input. Live structured queries,
-  approved camera views, Lua deltas, and periodic snapshots provide runtime
-  state and reconciliation.
+- Game startup is an explicit, fail-closed setup phase driven by a versioned
+  fixture setup profile. The profile normalizes native save tags and stable
+  anchors into roster, dice, roller, counter, terrain, deployment, objective,
+  ownership, and calibration roles without modifying the save. See ADR-0010.
+- The save may be inspected offline to select and validate its fixture profile,
+  but actionable setup and runtime state comes from live structured queries,
+  approved camera views, Lua deltas, and periodic snapshots.
 - The rules engine owns legality, phases, activations, movement, LOS, dice
   resolution, damage, statuses, resources, and scoring. Markdown rules are
   context only. Missing rules and geometry/evidence conflicts pause for a
@@ -44,10 +45,12 @@ Build Kill Team as a role-specific adapter over the generic TTS control plane.
   records origin, orientation, ground height, and world-units-per-inch scale.
   Terrain uses bounds by default with explicit metadata overrides. Map changes
   create revisions and invalidate affected LOS results.
-- Physical dice are authoritative in live play. The tagged AI dice are moved
-  into roller `175503`, sorted, read, and recorded as a roll event. Runtime
-  resources and statuses are authoritative; TTS counters and markers mirror
-  them.
+- Physical dice are authoritative in live play. The AI may move only its Blue
+  dice into roller `175503`. A defending Red player rolls their own dice
+  through read-only roll station `f1adc9`; resolution pauses until an explicit
+  Red/host completion acknowledgment, then reads the settled physical results.
+  Runtime resources and statuses are authoritative; TTS counters and markers
+  mirror them.
 - Human TTS changes are reconciled as external events. Host adjudications are
   explicit, logged, and scoped to the current state.
 
@@ -67,7 +70,8 @@ map revisions, and audit evidence.
 The adapter requires a typed state schema, visibility projection, semantic
 action API, map/LOS model, event reconciliation, and deterministic fake bridge
 before live play can be considered reliable. TTS GUIDs remain implementation
-details discovered through tags and validated at setup.
+details discovered through profile-mapped tags or exact anchors and validated
+against the live scene at setup.
 
 ## Alternatives rejected
 

@@ -314,6 +314,44 @@ def test_parser_only_accepts_allowlisted_commands_and_guid_shape() -> None:
     ]
 
 
+def test_parser_supports_semantic_killteam_placement() -> None:
+    commands = parse_ai_commands("KILLTEAM_PLACE[plague-warrior-01, 1.5, 1.0, -3.25]")
+
+    assert len(commands) == 1
+    assert commands[0].action == "killteam_place_operative"
+    assert commands[0].args == {
+        "operative_id": "plague-warrior-01",
+        "x": 1.5,
+        "y": 1.0,
+        "z": -3.25,
+    }
+
+
+def test_command_execution_dispatches_semantic_killteam_placement() -> None:
+    calls = []
+
+    def request(action, args):
+        calls.append((action, args))
+        return {"status": "verified", "operative_id": args["operative_id"]}
+
+    executor = CommandExecution(request, lambda _: "unused")
+    result = executor.execute(
+        parse_ai_commands("KILLTEAM_PLACE[plague-warrior-01, 1.5, 1.0, -3.25]"),
+        running=True,
+        active_game="killteam",
+    )
+
+    assert result["executed"][0]["status"] == "executed"
+    assert calls == [
+        ("killteam_place_operative", {
+            "operative_id": "plague-warrior-01",
+            "x": 1.5,
+            "y": 1.0,
+            "z": -3.25,
+        }),
+    ]
+
+
 def test_parser_supports_v6_catalog_spawn_and_place() -> None:
     commands = parse_ai_commands("SPAWN[abcdef, -5, 2] PLACE[123456, 4, 8]")
     assert commands[0].action == "spawn_catalog"
@@ -522,3 +560,83 @@ def test_location_context_returns_exact_live_position() -> None:
     }, "Where is the red pawn?", Intent.QUERY)
     assert '"x":4.0' in context["text"]
     assert '"z":-7.0' in context["text"]
+
+
+class KillTeamCommandProtocolTests(unittest.TestCase):
+    def test_parser_supports_semantic_placement(self) -> None:
+        commands = parse_ai_commands("KILLTEAM_PLACE[plague-warrior-01, 1.5, 1.0, -3.25]")
+        self.assertEqual(commands[0].action, "killteam_place_operative")
+        self.assertEqual(commands[0].args["operative_id"], "plague-warrior-01")
+
+    def test_command_execution_dispatches_semantic_placement(self) -> None:
+        calls: list[tuple[str, dict]] = []
+
+        def request(action: str, args: dict) -> dict:
+            calls.append((action, args))
+            return {"status": "verified"}
+
+        result = CommandExecution(request, lambda _: "unused").execute(
+            parse_ai_commands("KILLTEAM_PLACE[plague-warrior-01, 1.5, 1.0, -3.25]"),
+            running=True,
+            active_game="killteam",
+        )
+        self.assertEqual(result["executed"][0]["status"], "executed")
+        self.assertEqual(calls[0][0], "killteam_place_operative")
+
+    def test_parser_and_execution_support_resumable_setup_validation_start(self) -> None:
+        calls: list[tuple[str, dict]] = []
+
+        def request(action: str, args: dict) -> dict:
+            calls.append((action, args))
+            return {"status": "awaiting_red_defense_roll"}
+
+        commands = parse_ai_commands(
+            "KILLTEAM_VALIDATE_SETUP[setup-shot-001]"
+        )
+        result = CommandExecution(request, lambda _: "unused").execute(
+            commands,
+            running=True,
+            active_game="killteam",
+        )
+
+        self.assertEqual(commands[0].action, "killteam_begin_setup_validation")
+        self.assertEqual(commands[0].args, {"action_id": "setup-shot-001"})
+        self.assertEqual(result["executed"][0]["status"], "executed")
+        self.assertEqual(calls, [(
+            "killteam_begin_setup_validation",
+            {"action_id": "setup-shot-001"},
+        )])
+
+    def test_parser_and_execution_support_tagged_deployment_smoke_test(self) -> None:
+        calls: list[tuple[str, dict]] = []
+
+        def request(action: str, args: dict) -> dict:
+            calls.append((action, args))
+            return {"status": "verified", "guid": "aa11bb"}
+
+        commands = parse_ai_commands("KILLTEAM_DEPLOY_TEST")
+        result = CommandExecution(request, lambda _: "unused").execute(
+            commands,
+            running=True,
+            active_game="killteam",
+        )
+
+        self.assertEqual(commands[0].action, "killteam_deploy_test_model")
+        self.assertEqual(commands[0].args, {})
+        self.assertEqual(result["executed"][0]["status"], "executed")
+        self.assertEqual(calls, [(
+            "killteam_deploy_test_model",
+            {},
+        )])
+
+    def test_prompt_requires_role_filtered_killteam_placement(self) -> None:
+        prompt = GamePromptBuilder(Path("game_rules")).build(
+            game="killteam",
+            intent=Intent.SCENE_SETUP,
+            context={},
+        )
+        self.assertIn("tts_killteam_observe", prompt)
+        self.assertIn("KILLTEAM_PLACE[operative_id,target_x,target_y,target_z]", prompt)
+        self.assertIn("\nKILLTEAM_DEPLOY_TEST\n", prompt)
+        self.assertIn("KILLTEAM_VALIDATE_SETUP[action_id]", prompt)
+        self.assertIn("Do not emit generic MOVE", prompt)

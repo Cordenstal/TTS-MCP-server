@@ -1,15 +1,74 @@
 from __future__ import annotations
 
 import json
+import os
 import queue
 import unittest
+from unittest.mock import patch
 from urllib.request import Request, urlopen
 
 from http_gateway import HttpGateway
-from server import TTSBridge
+from server import TTSBridge, _ai_observation_bridge_timeout
 
 
 class BridgeResponseTransportTests(unittest.TestCase):
+    def test_ai_facing_bridge_deadlines_default_to_300_seconds(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(TTSBridge().timeout, 300.0)
+            self.assertEqual(_ai_observation_bridge_timeout(), 300.0)
+
+    def test_request_keeps_external_editor_custom_message_object_form(self) -> None:
+        bridge = TTSBridge()
+        sent: dict[str, object] = {}
+        bridge.ensure_listener = lambda: None  # type: ignore[method-assign]
+
+        def fake_send(message: dict[str, object]) -> None:
+            sent.update(message)
+            raw = message["customMessage"]
+            envelope = json.loads(raw) if isinstance(raw, str) else raw
+            assert isinstance(envelope, dict)
+            bridge.deliver_response({
+                "channel": "tts-mcp",
+                "event": "mcp_response",
+                "requestId": envelope["requestId"],
+                "ok": True,
+                "result": {"decoded": True},
+            }, transport="test")
+
+        bridge._send = fake_send  # type: ignore[method-assign]
+
+        result = bridge.request(
+            "killteam_list_objects",
+            {
+                "query_tags_json": "[\"Operative\"]",
+                "required_guids_json": "[]",
+                "snap_point_tags_json": "[]",
+            },
+        )
+
+        self.assertEqual(result, {"decoded": True})
+        self.assertIsInstance(sent["customMessage"], dict)
+        self.assertEqual(
+            sent["customMessage"]["query_tags_json"],  # type: ignore[index]
+            "[\"Operative\"]",
+        )
+        self.assertEqual(
+            sent["customMessage"]["query_tag_count"],  # type: ignore[index]
+            1,
+        )
+        self.assertEqual(
+            sent["customMessage"]["query_tag_1"],  # type: ignore[index]
+            "Operative",
+        )
+        self.assertEqual(
+            sent["customMessage"]["required_guid_count"],  # type: ignore[index]
+            0,
+        )
+        self.assertEqual(
+            sent["customMessage"]["snap_point_tag_count"],  # type: ignore[index]
+            0,
+        )
+
     def test_loopback_bridge_response_releases_the_matching_waiter(self) -> None:
         bridge = TTSBridge()
         request_id = "response-transport-test"
@@ -44,4 +103,3 @@ class BridgeResponseTransportTests(unittest.TestCase):
             gateway.close()
             with bridge._pending_guard:
                 bridge._pending.pop(request_id, None)
-

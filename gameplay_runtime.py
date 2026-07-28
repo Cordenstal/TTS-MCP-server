@@ -141,6 +141,21 @@ def parse_ai_commands(text: str, *, max_commands: int = 50) -> list[ParsedComman
 
     for m in re.finditer(rf"MOVE\[({_GUID}),\s*({_NUMBER}),\s*({_NUMBER}),\s*({_NUMBER})\]", text, re.I):
         add("move_object", {"guid": m.group(1), "x": float(m.group(2)), "y": float(m.group(3)), "z": float(m.group(4))})
+    for m in re.finditer(r"KILLTEAM_PLACE\[([^,\]]+),\s*(" + _NUMBER + r"),\s*(" + _NUMBER + r"),\s*(" + _NUMBER + r")\]", text, re.I):
+        add("killteam_place_operative", {
+            "operative_id": m.group(1).strip(),
+            "x": float(m.group(2)),
+            "y": float(m.group(3)),
+            "z": float(m.group(4)),
+        })
+    for m in re.finditer(
+        r"KILLTEAM_VALIDATE_SETUP\[([A-Za-z0-9_-]{1,64})\]",
+        text,
+        re.I,
+    ):
+        add("killteam_begin_setup_validation", {"action_id": m.group(1)})
+    for _ in re.finditer(r"^\s*KILLTEAM_DEPLOY_TEST\s*$", text, re.I | re.M):
+        add("killteam_deploy_test_model", {})
     for m in re.finditer(rf"ROTATE\[({_GUID}),\s*({_NUMBER}),\s*({_NUMBER}),\s*({_NUMBER})\]", text, re.I):
         add("rotate_object", {"guid": m.group(1), "x": float(m.group(2)), "y": float(m.group(3)), "z": float(m.group(4))})
     for m in re.finditer(rf"(LOCK|UNLOCK)\[({_GUID})\]", text, re.I):
@@ -163,7 +178,7 @@ def parse_ai_commands(text: str, *, max_commands: int = 50) -> list[ParsedComman
         for item in entries:
             if not isinstance(item, dict) or not isinstance(item.get("action"), str) or not isinstance(item.get("args", {}), dict):
                 continue
-            if item["action"] in {"move_object", "rotate_object", "set_object_lock", "spawn_builtin", "spawn_catalog", "place_catalog", "broadcast", "destroy_object"}:
+            if item["action"] in {"move_object", "killteam_place_operative", "killteam_deploy_test_model", "killteam_begin_setup_validation", "rotate_object", "set_object_lock", "spawn_builtin", "spawn_catalog", "place_catalog", "broadcast", "destroy_object"}:
                 add(item["action"], dict(item.get("args", {})), item["action"] == "destroy_object")
     return commands
 
@@ -280,6 +295,34 @@ class GamePromptBuilder:
                 "The server converts this command into the validated checkers movement path, which rejects occupied, non-diagonal, backward, and illegal capture moves. "
                 "Before emitting it, check every black piece for a mandatory capture; if any capture exists, emit only a legal capture. "
                 "If no legal move can be proven, emit no MOVE command and state the missing evidence."
+            )
+        if selected_game.lower() == "killteam":
+            sections.append(
+                "KILL TEAM OBSERVATION AND PLACEMENT PROTOCOL (mandatory):\n"
+                "Call tts_killteam_setup once when the loaded table or roster changes, then call "
+                "tts_killteam_observe before choosing a model or position. The returned AI operatives contain "
+                "operative_id, exact TTS guid, name, description, profile, bounds, and x/y/z position. Use those "
+                "records to identify the AI's models; never infer a GUID from a screenshot or invent one.\n"
+                "If the live observation does not contain the model or profile needed for the requested action, call "
+                "tts_killteam_get_roster. It reads only the dedicated AI roster container and returns bounded item "
+                "names, descriptions, tags, and contained GUID metadata. Do not inspect arbitrary containers.\n"
+                "To place one of the AI's own models, emit exactly one standalone line in this form:\n"
+                "KILLTEAM_PLACE[operative_id,target_x,target_y,target_z]\n"
+                "Use the operative_id from the role-filtered Kill Team observation. This semantic command resolves "
+                "the model GUID server-side and validates the placement path. Do not emit generic MOVE for an AI "
+                "operative. Before placing a model near an enemy, inspect the current board and use the visible "
+                "model positions, terrain bounds, and line-of-sight probe; stop if any identity or position is unclear."
+                "\nFor the deployment smoke test, emit exactly one standalone line:\n"
+                "KILLTEAM_DEPLOY_TEST\n"
+                "This zero-argument command resolves exactly one model whose name contains Plague Marine Warrior "
+                "and exactly one destination tagged _deployment_zone_blue. It copies the zone's x/z coordinates, preserves the "
+                "model's y coordinate, moves the model, and verifies its final x/z position within 0.25 units. "
+                "It does not require Kill Team setup."
+                "\nFor the agreed Save 131 vertical-slice test, emit exactly one standalone line:\n"
+                "KILLTEAM_VALIDATE_SETUP[action_id]\n"
+                "Use a new stable action_id such as setup-shot-001. The server places the discovered staged "
+                "operative at _start_test_spot, verifies nine-ray LOS to the discovered visible enemy, rolls only "
+                "Blue's Boltgun dice, and pauses. Never claim Red rolled or acknowledge Red's roll yourself."
             )
         return "\n\n".join(sections)
 

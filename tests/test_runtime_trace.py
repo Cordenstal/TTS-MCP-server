@@ -149,6 +149,28 @@ class RuntimeTraceTests(unittest.TestCase):
                 release_logger.set()
                 worker.join(timeout=1)
 
+    def test_closed_console_stream_does_not_prevent_later_file_handlers(self):
+        class ClosedStream:
+            def write(self, _value: str) -> None:
+                raise OSError("console stream is closed")
+
+            def flush(self) -> None:
+                raise OSError("console stream is closed")
+
+        captured: list[str] = []
+
+        class CaptureHandler(runtime_trace.logging.Handler):
+            def emit(self, log_record):
+                captured.append(str(log_record.msg))
+
+        logger = runtime_trace.logging.Logger("trace-closed-console-test")
+        logger.addHandler(runtime_trace._NonBlockingConsoleHandler(ClosedStream()))
+        logger.addHandler(CaptureHandler())
+
+        logger.info("must reach file handler")
+
+        self.assertEqual(captured, ["must reach file handler"])
+
 
 if __name__ == "__main__":
     unittest.main()

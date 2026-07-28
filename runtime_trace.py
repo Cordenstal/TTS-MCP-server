@@ -291,6 +291,17 @@ class _ConsoleFormatter(logging.Formatter):
             return str(log_record.msg)
         return console_event(event)
 
+
+class _NonBlockingConsoleHandler(logging.StreamHandler):
+    """Drop console sink errors without aborting later trace handlers."""
+
+    def handleError(self, record: logging.LogRecord) -> None:
+        # A gateway launched from a temporary shell can outlive stderr. The
+        # standard handler may write its own diagnostic to that same closed
+        # stream, raising again before file handlers receive the record.
+        return
+
+
 if TRACE_ENABLED and not TRACE_LOG.handlers:
     class _PrettyFormatter(logging.Formatter):
         """Render one structured event as a compact, human-readable block."""
@@ -329,7 +340,7 @@ if TRACE_ENABLED and not TRACE_LOG.handlers:
                 lines.append(f"  {key}: {rendered.replace(chr(10), chr(10) + '  ')}")
             return "\n".join(lines)
 
-    pretty_handler = logging.StreamHandler()
+    pretty_handler = _NonBlockingConsoleHandler()
     pretty_handler.setFormatter(_ConsoleFormatter())
     TRACE_LOG.addHandler(pretty_handler)
     try:

@@ -48,7 +48,7 @@ if not exist "%~dp0tts_mcp_backend.json" (
     set "AI_BACKEND_URL=http://127.0.0.1:11434/api/chat"
     set "AI_BACKEND_MODEL=gemma4:12b"
     set "AI_BACKEND_FORMAT=ollama"
-    set "AI_BACKEND_TIMEOUT=120"
+    set "AI_BACKEND_TIMEOUT=300"
 )
 echo Open the AI control panel at http://127.0.0.1:8765/admin
 echo Runtime traces are written under .tmp\.

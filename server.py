@@ -40,6 +40,13 @@ from runtime_trace import (
 from save_file import apply_operations, inspect_save, resolve_save_path
 from windows_gui import load_save_via_gui
 from gameplay_runtime import checkers_capture_holding_position, should_capture_game_vision
+from killteam_runtime import (
+    KillTeamConfig,
+    KillTeamError,
+    KillTeamRuntime,
+    SAVE_131_FIXTURE_PROFILE,
+    TTSKillTeamBridge,
+)
 
 
 class TTSBridgeError(RuntimeError):
@@ -72,7 +79,7 @@ class TTSBridge:
         host: str = "127.0.0.1",
         send_port: int = 39999,
         receive_port: int = 39998,
-        timeout: float = 10.0,
+        timeout: float = 300.0,
     ) -> None:
         self.host = host
         self.send_port = send_port
@@ -420,6 +427,26 @@ class TTSBridge:
             for key, value in request_args.items():
                 if key not in {"channel", "requestId", "action", "args"}:
                     custom_message[key] = value
+            if action == "killteam_list_objects":
+                scalar_collections = (
+                    ("query_tags_json", "query_tag", 32),
+                    ("required_guids_json", "required_guid", 32),
+                    ("snap_point_tags_json", "snap_point_tag", 16),
+                )
+                for json_field, scalar_prefix, limit in scalar_collections:
+                    try:
+                        values = json.loads(str(request_args.get(json_field, "[]")))
+                    except json.JSONDecodeError as exc:
+                        raise ValueError(
+                            f"{json_field} must be a JSON array"
+                        ) from exc
+                    if not isinstance(values, list) or len(values) > limit:
+                        raise ValueError(
+                            f"{json_field} must contain at most {limit} values"
+                        )
+                    custom_message[f"{scalar_prefix}_count"] = len(values)
+                    for index, value in enumerate(values, start=1):
+                        custom_message[f"{scalar_prefix}_{index}"] = str(value)
             # Tabletop Simulator's External Editor can expose nested objects
             # in customMessage as managed MoonSharp wrappers.  Its Lua object
             # APIs reject those wrappers as vectors ("Specified cast is not
@@ -434,9 +461,9 @@ class TTSBridge:
             self._send(
                 {
                     "messageID": 2,
-                    # This TTS build accepts object-form custom messages. The
-                    # Lua bridge uses mirrored root fields as a fallback when
-                    # it drops values nested under args.
+                    # TTS invokes onExternalMessage only for object-form custom
+                    # messages. The Lua boundary normalizes managed scalar
+                    # values before JSON decoding or object API calls.
                     "customMessage": custom_message,
                 }
             )
@@ -521,6 +548,8 @@ class TTSBridge:
 
 
 bridge = TTSBridge()
+_killteam_lock = threading.RLock()
+_killteam_runtime = KillTeamRuntime(TTSKillTeamBridge(bridge.request))
 
 mcp = FastMCP(
     "tabletop-simulator",
@@ -774,6 +803,83 @@ CAPABILITY_MANIFEST: list[dict[str, Any]] = [
         "mutates": True,
         "confirmation": "normal intent; validate live checkers move",
         "verification": "validated diagonal, final coordinate, and settled state",
+    },
+    {
+        "name": "tts_killteam_setup",
+        "category": "game-domain",
+        "mutates": False,
+        "confirmation": "explicit setup boundary; fails closed on ambiguity",
+        "verification": "tagged roster, dice, roller, counters, terrain, and visibility are validated",
+    },
+    {
+        "name": "tts_killteam_observe",
+        "category": "game-domain",
+        "mutates": False,
+        "confirmation": "none",
+        "verification": "fresh role-filtered state with observation and map revisions",
+    },
+    {
+        "name": "tts_killteam_get_roster",
+        "category": "game-domain",
+        "mutates": False,
+        "confirmation": "none",
+        "verification": "bounded contents of the configured dedicated AI roster container",
+    },
+    {
+        "name": "tts_killteam_probe_line_of_sight",
+        "category": "game-domain",
+        "mutates": False,
+        "confirmation": "none",
+        "verification": "bounded nine-ray evidence with first blockers, visibility fraction, and collider uncertainty",
+    },
+    {
+        "name": "tts_killteam_place_operative",
+        "category": "game-domain",
+        "mutates": True,
+        "confirmation": "semantic placement; exact GUID remains adapter-internal",
+        "verification": "validated path and exact post-position",
+    },
+    {
+        "name": "tts_killteam_deploy_test_model",
+        "category": "game-domain",
+        "mutates": True,
+        "confirmation": "explicit zero-argument tagged movement smoke test",
+        "verification": "tag-resolved model and marker with x/z readback within 0.25 units",
+    },
+    {
+        "name": "tts_killteam_search_deployment_names",
+        "category": "observation",
+        "mutates": False,
+        "confirmation": "none",
+        "verification": "zero-argument in-TTS name filter returns at most 20 compact matches",
+    },
+    {
+        "name": "tts_killteam_activate_operative",
+        "category": "game-domain",
+        "mutates": True,
+        "confirmation": "legal activation transition",
+        "verification": "active operative and AP returned",
+    },
+    {
+        "name": "tts_killteam_shoot",
+        "category": "game-domain",
+        "mutates": True,
+        "confirmation": "legal ranged action; physical dice are authoritative",
+        "verification": "LOS/range, attack and defense dice, damage, wounds, and state revision",
+    },
+    {
+        "name": "tts_killteam_begin_setup_validation",
+        "category": "game-domain",
+        "mutates": True,
+        "confirmation": "explicit Save 131 validation start",
+        "verification": "exact snap placement, nine-ray LOS, and Blue attack roll before pausing for Red",
+    },
+    {
+        "name": "tts_killteam_complete_setup_validation",
+        "category": "game-domain",
+        "mutates": True,
+        "confirmation": "explicit Red or host defense-roll acknowledgment",
+        "verification": "settled Red dice and operative-script wound readback",
     },
     {
         "name": "tts_rotate_object",
@@ -1095,6 +1201,204 @@ async def tts_ping() -> dict[str, Any]:
     """Check that Tabletop Simulator and the installed Global Lua bridge respond."""
     result = await call_tts("ping")
     return {"connected": True, "result": result}
+
+
+def _killteam_call(method: str, *args: Any, **kwargs: Any) -> dict[str, Any]:
+    """Serialize Kill Team mutations and preserve the game-rule seam."""
+    with _killteam_lock:
+        try:
+            return getattr(_killteam_runtime, method)(*args, **kwargs)
+        except KillTeamError as exc:
+            session_store.record_event(
+                "killteam_action_error",
+                {"method": method, "error_type": type(exc).__name__, "error": str(exc)},
+            )
+            raise
+
+
+def _killteam_setup_sync(
+    *,
+    ai_team: str = "ai",
+    units_per_inch: float = 1.0,
+    ai_dice_count: int = 1,
+    opponent_dice_count: int = 1,
+    roster_container_guid: str = "e5adb7",
+    fixture_profile: str = SAVE_131_FIXTURE_PROFILE.name,
+) -> dict[str, Any]:
+    """Start a fresh Kill Team scene epoch and validate it through TTS."""
+    global _killteam_runtime
+    if not ai_team.strip():
+        raise ValueError("ai_team must not be empty")
+    if units_per_inch <= 0:
+        raise ValueError("units_per_inch must be positive")
+    if ai_dice_count <= 0 or opponent_dice_count <= 0:
+        raise ValueError("dice counts must be positive")
+    if not roster_container_guid.strip():
+        raise ValueError("roster_container_guid must not be empty")
+    with _killteam_lock:
+        _killteam_runtime = KillTeamRuntime(
+            TTSKillTeamBridge(bridge.request),
+            KillTeamConfig(
+                ai_team=ai_team.strip().lower(),
+                units_per_inch=float(units_per_inch),
+                ai_dice_count=int(ai_dice_count),
+                opponent_dice_count=int(opponent_dice_count),
+                roster_container_guid=roster_container_guid.strip().lower(),
+                fixture_profile=fixture_profile.strip(),
+            ),
+        )
+    return _killteam_call("setup")
+
+
+@mcp.tool()
+async def tts_killteam_setup(
+    ai_team: str = "ai",
+    units_per_inch: float = 1.0,
+    ai_dice_count: int = 1,
+    opponent_dice_count: int = 1,
+    roster_container_guid: str = "e5adb7",
+    fixture_profile: str = SAVE_131_FIXTURE_PROFILE.name,
+) -> dict[str, Any]:
+    """Validate Save 131's native Kill Team setup and build role-filtered state."""
+    return await asyncio.to_thread(
+        _killteam_setup_sync,
+        ai_team=ai_team,
+        units_per_inch=units_per_inch,
+        ai_dice_count=ai_dice_count,
+        opponent_dice_count=opponent_dice_count,
+        roster_container_guid=roster_container_guid,
+        fixture_profile=fixture_profile,
+    )
+
+
+@mcp.tool()
+async def tts_killteam_observe() -> dict[str, Any]:
+    """Return the current role-filtered Kill Team observation."""
+    return await asyncio.to_thread(_killteam_call, "observe")
+
+
+@mcp.tool()
+async def tts_killteam_get_roster() -> dict[str, Any]:
+    """Inspect the bounded dedicated AI roster container."""
+    return await asyncio.to_thread(_killteam_call, "get_roster")
+
+
+@mcp.tool()
+async def tts_killteam_probe_line_of_sight(
+    attacker_id: str,
+    target_id: str,
+    eye_local: dict[str, float] | None = None,
+    debug: bool = False,
+) -> dict[str, Any]:
+    """Return sampled physical LOS evidence for an AI operative and visible target."""
+    if not attacker_id.strip() or not target_id.strip():
+        raise ValueError("attacker_id and target_id are required")
+    normalized_eye = None
+    if eye_local is not None:
+        if not isinstance(eye_local, dict):
+            raise ValueError("eye_local must contain x, y, and z")
+        try:
+            normalized_eye = {axis: float(eye_local[axis]) for axis in ("x", "y", "z")}
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("eye_local must contain numeric x, y, and z") from exc
+    return await asyncio.to_thread(
+        _killteam_call,
+        "probe_line_of_sight",
+        attacker_id.strip(),
+        target_id.strip(),
+        eye_local=normalized_eye,
+        debug=bool(debug),
+    )
+
+
+@mcp.tool()
+async def tts_killteam_place_operative(
+    operative_id: str,
+    path: list[dict[str, float]],
+    action_id: str = "",
+) -> dict[str, Any]:
+    """Place or move an AI operative along a validated horizontal path."""
+    if not operative_id.strip() or not path:
+        raise ValueError("operative_id and a non-empty path are required")
+    return await asyncio.to_thread(
+        _killteam_call,
+        "place_operative",
+        operative_id.strip(),
+        path,
+        action_id=action_id.strip() or None,
+    )
+
+
+@mcp.tool()
+async def tts_killteam_deploy_test_model() -> dict[str, Any]:
+    """Move the tagged Plague Marine to the tagged blue test marker and verify it."""
+    return await asyncio.to_thread(_killteam_call, "deploy_test_model")
+
+
+@mcp.tool()
+async def tts_killteam_search_deployment_names() -> dict[str, Any]:
+    """Find live named Kill Team models, dice, and roller objects without a scene dump."""
+    return await asyncio.to_thread(
+        bridge.request,
+        "killteam_deployment_name_search",
+        {},
+    )
+
+
+@mcp.tool()
+async def tts_killteam_activate_operative(operative_id: str) -> dict[str, Any]:
+    """Start the AI activation for one tagged operative."""
+    if not operative_id.strip():
+        raise ValueError("operative_id must not be empty")
+    return await asyncio.to_thread(_killteam_call, "activate_operative", operative_id.strip())
+
+
+@mcp.tool()
+async def tts_killteam_shoot(
+    attacker_id: str,
+    target_id: str,
+    weapon_id: str,
+    action_id: str = "",
+) -> dict[str, Any]:
+    """Resolve one visible ranged attack through the tagged physical dice."""
+    if not attacker_id.strip() or not target_id.strip() or not weapon_id.strip():
+        raise ValueError("attacker_id, target_id, and weapon_id are required")
+    return await asyncio.to_thread(
+        _killteam_call,
+        "shoot",
+        attacker_id.strip(),
+        target_id.strip(),
+        weapon_id.strip(),
+        action_id=action_id.strip() or None,
+    )
+
+
+@mcp.tool()
+async def tts_killteam_begin_setup_validation(
+    action_id: str = "",
+) -> dict[str, Any]:
+    """Place the Save 131 test model, prove LOS, roll Blue, and pause for Red."""
+    return await asyncio.to_thread(
+        _killteam_call,
+        "begin_setup_validation",
+        action_id=action_id.strip() or None,
+    )
+
+
+@mcp.tool()
+async def tts_killteam_complete_setup_validation(
+    acknowledged_by: str,
+    action_id: str = "",
+) -> dict[str, Any]:
+    """After Red/host acknowledgment, read Red's roll and verify real wounds."""
+    if not acknowledged_by.strip():
+        raise ValueError("acknowledged_by is required")
+    return await asyncio.to_thread(
+        _killteam_call,
+        "complete_setup_validation",
+        acknowledged_by=acknowledged_by.strip(),
+        action_id=action_id.strip() or None,
+    )
 
 
 @mcp.tool()
@@ -2576,15 +2880,98 @@ def _ai_game_context() -> dict[str, Any]:
 
 
 def _ai_observation_bridge_timeout() -> float:
-    """Fail a dead TTS observation quickly enough for player feedback."""
+    """Allow long-running TTS observations while keeping a bounded deadline."""
     try:
-        return max(1.0, min(float(os.getenv("AI_OBSERVATION_TTS_TIMEOUT", "15")), 60.0))
+        return max(
+            1.0,
+            min(float(os.getenv("AI_OBSERVATION_TTS_TIMEOUT", "300")), 300.0),
+        )
     except (TypeError, ValueError):
-        return 15.0
+        return 300.0
+
+
+def _ai_gameplay_request(action: str, args: dict[str, Any]) -> dict[str, Any]:
+    """Route Kill Team chat placement through the semantic runtime."""
+    if action == "killteam_place_operative":
+        operative_id = str(args.get("operative_id", "")).strip()
+        if not operative_id:
+            raise ValueError("killteam placement requires operative_id")
+        try:
+            position = {axis: float(args[axis]) for axis in ("x", "y", "z")}
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("killteam placement requires numeric x, y, and z") from exc
+        return _killteam_call("place_operative", operative_id, [position])
+    if action == "killteam_deploy_test_model":
+        return _killteam_call("deploy_test_model")
+    if action == "killteam_begin_setup_validation":
+        action_id = str(args.get("action_id", "")).strip()
+        if not action_id:
+            raise ValueError("Kill Team setup validation requires action_id")
+        return _killteam_call(
+            "begin_setup_validation",
+            action_id=action_id,
+        )
+    if action == "killteam_complete_setup_validation":
+        acknowledged_by = str(args.get("acknowledged_by", "")).strip()
+        if acknowledged_by.casefold() not in {"red", "host"}:
+            raise ValueError("Red or host acknowledgment is required")
+        return _killteam_call(
+            "complete_setup_validation",
+            acknowledged_by=acknowledged_by,
+        )
+    return bridge.request(action, args)
 
 
 def _ai_observation_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
     """Run one gateway-approved read-only observation and compact its result."""
+    if name == "tts_ping":
+        return bridge.request(
+            "ping",
+            {},
+            timeout=_ai_observation_bridge_timeout(),
+        )
+    if name == "tts_killteam_setup":
+        return _killteam_setup_sync(
+            ai_team=str(args.get("ai_team", "ai")),
+            units_per_inch=float(args.get("units_per_inch", 1.0)),
+            ai_dice_count=int(args.get("ai_dice_count", 1)),
+            opponent_dice_count=int(args.get("opponent_dice_count", 1)),
+        )
+    if name == "tts_killteam_probe_collection":
+        return bridge.request(
+            "killteam_probe_collection",
+            {
+                "query_tags_json": json.dumps(
+                    list(SAVE_131_FIXTURE_PROFILE.query_tags),
+                    separators=(",", ":"),
+                ),
+                "required_guids_json": json.dumps(
+                    list(SAVE_131_FIXTURE_PROFILE.required_guids),
+                    separators=(",", ":"),
+                ),
+                "snap_point_tags_json": json.dumps(
+                    [SAVE_131_FIXTURE_PROFILE.start_snap_tag],
+                    separators=(",", ":"),
+                ),
+                "probe_stage": str(args.get("stage", "")),
+                "probe_index": int(args.get("index", 1)),
+                "probe_item_index": int(args.get("item_index", 1)),
+            },
+            timeout=_ai_observation_bridge_timeout(),
+        )
+    if name == "tts_killteam_observe":
+        return _killteam_call("observe")
+    if name == "tts_killteam_get_roster":
+        return _killteam_call("get_roster")
+    if name == "tts_killteam_probe_line_of_sight":
+        eye_local = args.get("eye_local")
+        return _killteam_call(
+            "probe_line_of_sight",
+            str(args["attacker_id"]).strip(),
+            str(args["target_id"]).strip(),
+            eye_local=eye_local,
+            debug=False,
+        )
     if name == "tts_get_object":
         return bridge.request(
             "get_object",
@@ -3012,7 +3399,7 @@ if __name__ == "__main__":
         http_gateway = HttpGateway(context_provider=_ai_game_context)
         # The gateway remains import-cycle free, while command execution still
         # goes through the same allowlisted External Editor bridge as MCP.
-        http_gateway.configure_gameplay(bridge.request)
+        http_gateway.configure_gameplay(_ai_gameplay_request)
         http_gateway.configure_observation_tools(_ai_observation_tool)
         http_gateway.configure_bridge_response(
             lambda response: bridge.deliver_response(response, transport="http")

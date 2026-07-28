@@ -172,13 +172,68 @@ read-only, host-managed access.
 
 ### Kill Team opponent
 
-The first planned high-level game adapter targets the `Kill Team 3.0 Quick and
-Easy` variant represented by the canonical `TS_Save_129.json` fixture. The AI
+The first high-level game adapter targets the `Kill Team 3.0 Quick and
+Easy` variant represented by the canonical `TS_Save_131.json` fixture. The AI
 plays one side as an opponent using role-filtered observations, a versioned
-canonical state, executable rules, semantic actions, tagged dice/counters,
-and map/line-of-sight validation. It may inspect the table like a player, but
-hidden opponent state is never exposed. See the [Kill Team design](docs/wiki/killteam.md)
-and [ADR-0009](docs/adr/0009-killteam-semantic-opponent.md).
+canonical state, executable rules, semantic actions, physical dice/counters,
+and map/line-of-sight validation. A versioned fixture setup profile maps the
+save's native tags into canonical roles without modifying the save. It may
+inspect the table like a player, but hidden opponent state is never exposed.
+See the [Kill Team design](docs/wiki/killteam.md),
+[ADR-0009](docs/adr/0009-killteam-semantic-opponent.md), and
+[ADR-0010](docs/adr/0010-native-killteam-fixture-profiles.md).
+
+The first implementation slice is now available through these semantic MCP
+tools: `tts_killteam_setup`, `tts_killteam_observe`,
+`tts_killteam_probe_line_of_sight`, `tts_killteam_place_operative`,
+`tts_killteam_deploy_test_model`,
+`tts_killteam_search_deployment_names`,
+`tts_killteam_activate_operative`, `tts_killteam_shoot`,
+`tts_killteam_begin_setup_validation`, and
+`tts_killteam_complete_setup_validation`. The dedicated snapshot uses bounded
+native tag/GUID queries and scalar-safe JSON collection arguments instead of
+generic whole-mod enumeration. The Save 131 profile resolves its global snap
+point, staged Plague Marine, visible target, dice stations, roster, and
+separate counters without modifying the save. The resumable validation action
+places and verifies the operative, probes nine physical LOS rays, rolls only
+Blue's four dice through the object tagged `_blue_dice_roller` (resolving its
+current GUID only at the bridge boundary), then pauses. Red rolls through station
+`f1adc9`; only authenticated Red/host chat acknowledgment resumes resolution.
+Damage is projected through the target model's own `damage` function and its
+real `state.wounds` value is read back. If collider evidence, a physical
+commit, or readback is ambiguous, the action stops without an automatic retry.
+The deterministic placement smoke test is exposed separately as
+`tts_killteam_deploy_test_model`: it resolves the unique model whose name
+contains `Plague Marine Warrior` and the unique destination tagged
+`_deployment_zone_blue`. It derives both current GUIDs internally, copies the
+zone's x/z coordinates while preserving the model's y coordinate, and
+verifies the model's final x/z position within `0.25` TTS world units. This
+zero-argument smoke test does not inspect setup, rosters, snap points, dice, or
+game rules.
+
+The bounded `tts_killteam_search_deployment_names` observation searches the
+known Plague Marine, Novitiate Dialogus, and deployment names without a full
+scene dump. It returns compact live summaries with GUIDs, names, tags, types,
+lock state, and positions. Verify a candidate is a unique `Figurine` with the
+expected `Operative` and faction tags before using its GUID for movement or
+LOS.
+
+The in-game AI gateway can also call the bounded `tts_killteam_setup`,
+`tts_killteam_observe`, `tts_killteam_get_roster`, and
+`tts_killteam_probe_line_of_sight` tools. The roster query reads the dedicated
+AI container, currently `e5adb7`, only when the live observation lacks a
+needed profile or model identity. Setup is intended once per loaded game;
+subsequent turns should use fresh observation and on-demand LOS probes. For
+the initial placement test, the gateway accepts
+the semantic `KILLTEAM_PLACE[operative_id,x,y,z]` command after observing the
+AI roster; the runtime resolves the operative ID to its live GUID and verifies
+the placement. The isolated deployment smoke test uses
+the standalone zero-argument command `KILLTEAM_DEPLOY_TEST`; it bypasses setup
+and moves only the uniquely named test model to the uniquely tagged zone.
+The agreed vertical-slice run uses
+`KILLTEAM_VALIDATE_SETUP[action_id]`; the gateway consumes the command and
+stops at the Red-defense handoff. Red or the host resumes it by saying
+`Defense roll complete`.
 
 ## 1. Install the Python environment
 
@@ -295,7 +350,7 @@ $env:AI_BACKEND_KIND = "http"
 $env:AI_BACKEND_URL = "http://127.0.0.1:11434/api/chat"
 $env:AI_BACKEND_MODEL = "gemma4:12b"
 $env:AI_BACKEND_FORMAT = "ollama"
-$env:AI_BACKEND_TIMEOUT = "120"
+$env:AI_BACKEND_TIMEOUT = "300"
 ```
 
 The selected model must already be available in Ollama. The gateway also
@@ -485,8 +540,8 @@ Or edit `%USERPROFILE%\.codex\config.toml`:
 [mcp_servers.tabletop_simulator]
 command = "C:\\path\\to\\tabletop-simulator-mcp\\.venv\\Scripts\\python.exe"
 args = ["C:\\path\\to\\tabletop-simulator-mcp\\server.py"]
-startup_timeout_sec = 20
-tool_timeout_sec = 30
+startup_timeout_sec = 300
+tool_timeout_sec = 300
 default_tools_approval_mode = "writes"
 enabled = true
 ```
