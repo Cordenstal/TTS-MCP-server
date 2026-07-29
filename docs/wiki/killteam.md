@@ -65,6 +65,8 @@ generic semantic pregame-setup mode. In that mode it discovers side-tagged
 faction-deck containers, roster model containers, `Roster List <side>` zones,
 `Deployed Zone <side>` zones, and deployment zones, then tracks initiative,
 roster locking, and deployment cadence in the typed state machine.
+The generic object scan first tries the canonical `tts_mcp:` setup tags, then
+falls back to the native blue/red scene tags when that canonical scan is empty.
 
 ## Observation and map model
 

@@ -642,6 +642,70 @@ def save_131_native_objects():
     ]
 
 
+def native_generic_setup_objects():
+    return [
+        {
+            "guid": "die-blue",
+            "name": "Blue D6",
+            "type": "Die",
+            "tags": ["_dice_blue", "Blue"],
+            "position": {"x": -30.0, "y": 1.0, "z": 0.0},
+        },
+        {
+            "guid": "die-red",
+            "name": "Red D6",
+            "type": "Die",
+            "tags": ["_dice_red", "Red"],
+            "position": {"x": 30.0, "y": 1.0, "z": 0.0},
+        },
+        {
+            "guid": "roller-blue",
+            "name": "Blue Dice Roller",
+            "type": "DiceRoller",
+            "tags": ["_blue_dice_roller", "Blue"],
+            "position": {"x": 0.0, "y": 1.0, "z": 0.0},
+        },
+        {
+            "guid": "cp",
+            "name": "CP",
+            "tags": ["counter", "Blue"],
+            "counter_value": 2,
+        },
+        {
+            "guid": "vp",
+            "name": "VP",
+            "tags": ["counter", "Blue"],
+            "counter_value": 0,
+        },
+        {
+            "guid": "calibration",
+            "name": "Calibration",
+            "tags": ["calibration"],
+            "position": {"x": 0.0, "y": 1.0, "z": 0.0},
+        },
+        setup_container("deck-ai", name="Faction Decks Blue", entity="faction_decks", side_id="blue")
+        | {"tags": ["_faction_decks", "Blue"]},
+        setup_container("deck-op", name="Faction Decks Red", entity="faction_decks", side_id="red")
+        | {"tags": ["_faction_decks", "Red"]},
+        setup_container("roster-ai", name="Roster Blue", entity="roster", side_id="blue")
+        | {"tags": ["_roster", "Blue"]},
+        setup_container("roster-op", name="Roster Red", entity="roster", side_id="red")
+        | {"tags": ["_roster", "Red"]},
+        setup_zone("roster-list-ai", name="Roster List Blue", entity="roster_list_zone", side_id="blue", x=-18, z=-12)
+        | {"tags": ["Roster List", "Blue"]},
+        setup_zone("roster-list-op", name="Roster List Red", entity="roster_list_zone", side_id="red", x=18, z=-12)
+        | {"tags": ["Roster List", "Red"]},
+        setup_zone("deployed-ai", name="Deployed Zone Blue", entity="deployed_zone", side_id="blue", x=-18, z=-4)
+        | {"tags": ["Deployed Zone", "Blue"]},
+        setup_zone("deployed-op", name="Deployed Zone Red", entity="deployed_zone", side_id="red", x=18, z=-4)
+        | {"tags": ["Deployed Zone", "Red"]},
+        setup_zone("deploy-ai", name="Blue Deployment", entity="deployment", side_id="blue", x=-18, z=6, size_x=10, size_z=8)
+        | {"tags": ["_deployment_zone_blue", "Blue"]},
+        setup_zone("deploy-op", name="Red Deployment", entity="deployment", side_id="red", x=18, z=6, size_x=10, size_z=8)
+        | {"tags": ["_deployment_zone_red", "Red"]},
+    ]
+
+
 def save_131_roster_card(guid, name, index=1):
     return {
         "guid": guid,
@@ -1354,6 +1418,34 @@ class KillTeamRuntimeTests(unittest.TestCase):
             "required_guids": [],
             "query_tags": list(_GENERIC_SETUP_QUERY_TAGS),
         }])
+
+    def test_setup_retries_with_native_tags_when_the_canonical_generic_scan_is_empty(self):
+        from killteam_runtime import _GENERIC_NATIVE_SETUP_QUERY_TAGS, _GENERIC_SETUP_QUERY_TAGS
+
+        class NativeFallbackBridge(FakeKillTeamBridge):
+            def list_objects(self, **kwargs):
+                self.list_calls.append(dict(kwargs))
+                if kwargs.get("query_tags") == list(_GENERIC_SETUP_QUERY_TAGS):
+                    return {"objects": [], "snap_points": []}
+                return {
+                    "objects": [copy.deepcopy(item) for item in self.objects.values()],
+                    "snap_points": copy.deepcopy(self.snap_points),
+                }
+
+        bridge = NativeFallbackBridge(native_generic_setup_objects())
+        runtime = KillTeamRuntime(bridge)
+
+        result = runtime.setup()
+        observation = runtime.observe()
+
+        self.assertEqual(result["status"], "ready")
+        self.assertGreaterEqual(len(bridge.list_calls), 2)
+        self.assertEqual(bridge.list_calls[0]["query_tags"], list(_GENERIC_SETUP_QUERY_TAGS))
+        self.assertEqual(bridge.list_calls[1]["query_tags"], list(_GENERIC_NATIVE_SETUP_QUERY_TAGS))
+        self.assertEqual(sorted(result["setup"]["sides"].keys()), ["ai", "opponent"])
+        self.assertEqual(result["roller_guid"], "roller-blue")
+        self.assertEqual(observation["counters"]["cp"]["guid"], "cp")
+        self.assertEqual(observation["counters"]["vp"]["guid"], "vp")
 
     def test_setup_discovers_ai_state_and_filters_hidden_opponents(self):
         runtime = KillTeamRuntime(FakeKillTeamBridge(fixture_objects()))

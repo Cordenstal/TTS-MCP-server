@@ -384,6 +384,29 @@ _GENERIC_SETUP_QUERY_TAGS = (
     "tts_mcp:entity=roster_card",
 )
 
+_GENERIC_NATIVE_SETUP_QUERY_TAGS = (
+    "Blue",
+    "Red",
+    "Operative",
+    "_dice_blue",
+    "_dice_red",
+    "_blue_dice_roller",
+    "_red_dice_roller",
+    "dice_roller",
+    "combat_zone",
+    "_deployment_zone_blue",
+    "_deployment_zone_red",
+    "KT_MISSION_TERRAIN",
+    "KT_MISSION_OBJECTIVE",
+    "_faction_decks",
+    "_roster",
+    "_roster_card",
+    "Roster List",
+    "Deployed Zone",
+    "counter",
+    "calibration",
+)
+
 _SETUP_FACTION_PROFILES = {
     "legionary": KillTeamSetupFactionProfile(
         faction_id="legionary",
@@ -755,6 +778,17 @@ class KillTeamRuntime:
         self._listing_truncated = bool(result.get("truncated")) if isinstance(result, dict) else True
         objects = result.get("objects", []) if isinstance(result, dict) else []
         snap_points = result.get("snap_points", []) if isinstance(result, dict) else []
+        if (
+            self._fixture_profile is None
+            and not objects
+            and query_tags == list(_GENERIC_SETUP_QUERY_TAGS)
+        ):
+            fallback_kwargs = dict(list_kwargs)
+            fallback_kwargs["query_tags"] = list(_GENERIC_NATIVE_SETUP_QUERY_TAGS)
+            result = self.bridge.list_objects(**fallback_kwargs)
+            self._listing_truncated = bool(result.get("truncated")) if isinstance(result, dict) else True
+            objects = result.get("objects", []) if isinstance(result, dict) else []
+            snap_points = result.get("snap_points", []) if isinstance(result, dict) else []
         if not isinstance(objects, list):
             raise KillTeamSetupError("TTS object listing was not a list")
         if not isinstance(snap_points, list):
@@ -773,6 +807,23 @@ class KillTeamRuntime:
         expected = tag.casefold()
         return any(str(value).strip().casefold() == expected for value in obj.get("tags", []))
 
+    @staticmethod
+    def _setup_generic_text(obj: dict[str, Any]) -> str:
+        parts = [
+            str(obj.get("name") or ""),
+            str(obj.get("description") or ""),
+            " ".join(str(tag) for tag in obj.get("tags", [])),
+        ]
+        return " ".join(part for part in parts if part).casefold()
+
+    def _setup_generic_side_id(self, obj: dict[str, Any]) -> str:
+        words = set(re.findall(r"[a-z0-9]+", self._setup_generic_text(obj)))
+        if words & {"blue", "ai"}:
+            return self.config.ai_team
+        if words & {"red", "opponent"}:
+            return "opponent"
+        return ""
+
     def _normalize_fixture_objects(
         self,
         objects: list[dict[str, Any]],
@@ -785,16 +836,49 @@ class KillTeamRuntime:
                 tags = {str(tag).strip().casefold() for tag in obj.get("tags", [])}
                 name = str(obj.get("name") or "").casefold()
                 meta = dict(obj.get("meta") or {})
+                side_id = self._setup_generic_side_id(obj)
+                if side_id:
+                    meta.setdefault("side_id", side_id)
+                    meta.setdefault("team", side_id)
                 if "_faction_decks" in tags:
                     meta.setdefault("entity", "faction_decks")
                 if "_roster" in tags:
                     meta.setdefault("entity", "roster")
                 if "_roster_card" in tags:
                     meta.setdefault("entity", "roster_card")
+                if "_dice_blue" in tags or "_dice_red" in tags:
+                    meta.setdefault("entity", "die")
+                    if side_id:
+                        meta.setdefault("team", side_id)
+                if "_blue_dice_roller" in tags or "_red_dice_roller" in tags or "dice roller" in name:
+                    meta.setdefault("entity", "dice_roller")
+                    if side_id:
+                        meta.setdefault("team", side_id)
                 if "roster list" in name or "roster cards" in name:
                     meta.setdefault("entity", "roster_list_zone")
                 if "deployed zone" in name:
                     meta.setdefault("entity", "deployed_zone")
+                if "_deployment_zone_blue" in tags or "_deployment_zone_red" in tags:
+                    meta.setdefault("entity", "deployment")
+                if "operative" in tags or "operative" in name:
+                    meta.setdefault("entity", "operative")
+                    if side_id:
+                        meta.setdefault("team", side_id)
+                if "combat_zone" in tags:
+                    meta.setdefault("entity", "combat_zone")
+                if "kt_mission_terrain" in tags:
+                    meta.setdefault("entity", "terrain")
+                    meta.setdefault("blocks_los", "true")
+                if "kt_mission_objective" in tags:
+                    meta.setdefault("entity", "objective")
+                if "counter" in tags:
+                    meta.setdefault("entity", "counter")
+                    if "cp" in name:
+                        meta.setdefault("counter", "cp")
+                    elif "vp" in name:
+                        meta.setdefault("counter", "vp")
+                if "calibration" in tags:
+                    meta.setdefault("entity", "calibration")
                 obj["meta"] = meta
             return normalized
 
