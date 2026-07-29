@@ -46,58 +46,32 @@ Tabletop Simulator
 tts_mcp_global.lua
 ```
 
-`killteam_runtime.py` owns the typed Kill Team state and rules seam. It talks
-to TTS only through the small `TTSKillTeamBridge` adapter, so deterministic
-fake-bridge tests can validate legality and visibility without a live table.
-The generic bridge remains the only Lua execution boundary; Kill Team exposes
-allowlisted semantic actions rather than arbitrary scene mutations. Its LOS
-adapter is an on-demand nine-ray physics query that returns first-hit evidence
-and collider uncertainty; Python owns visibility policy and consumes that
-evidence before shooting. Kill Team setup uses the dedicated
-`killteam_list_objects` action with scalar-safe JSON tag/GUID/snap filters,
-rather than the generic whole-scene listing action. A versioned Save 131
-profile normalizes native fixture tags and stable support anchors without
-modifying the save. The HTTP AI gateway may request only the bounded Kill Team
-setup, observation, roster, and LOS-probe tools. The roster tool is fixed to
-the configured dedicated AI roster container. The gateway may execute
-semantic placement and the resumable Save 131 validation start; only
-authenticated Red/host acknowledgment resumes the defense-roll handoff.
-Activation, shooting, and other mutations remain on the semantic MCP
-interface.
+`killteam_runtime.py` owns the typed Kill Team state and rules seam. Detailed
+behavioral guidance for movement, model identification, LOS, setup, attack
+dice, and semantic Kill Team actions is documented in the ADR/wiki set rather
+than duplicated here. Start with:
 
-Screenshots are captured by Python using `mss` and returned as MCP image
-content. They are on-demand snapshots, not a continuous video stream.
+- `docs/adr/0001-ai-participant-boundary.md`
+- `docs/adr/0002-generic-game-support.md`
+- `docs/adr/0004-host-approval-for-destructive-actions.md`
+- `docs/adr/0005-no-hidden-information-cheating.md`
+- `docs/adr/0008-hybrid-game-state-and-autonomous-checkers.md`
+- `docs/adr/0009-killteam-semantic-opponent.md`
+- `docs/wiki/api-reference.md`
+- `docs/wiki/api-and-rules.md`
+- `docs/wiki/killteam.md`
+- `docs/wiki/observation-and-visuals.md`
+- `docs/wiki/roadmap.md`
 
-The Python process also exposes a localhost HTTP AI gateway on port 8765.
-TTS can send chat messages to `/chat`, and the gateway can forward them to an
-OpenAI-compatible, Hermes, Ollama, or generic HTTP backend.
-
-Persistent AI session/controller state and audit records are stored in a local
-SQLite database. The gateway interprets host-only `!ai` lifecycle and approval
-commands, while ordinary chat is forwarded to the configured AI backend for
-proactive participation.
-
-Ordinary chat starts without automatic screenshots or object lists. The
-gateway exposes only bounded, read-only observation tools to the AI backend;
-the backend may request targeted scene data or the current view when needed.
-Tool results are compact and ephemeral, and player-facing chat must contain
-only the final natural-language response.
+Use those documents as the source of truth for gameplay semantics, movement
+contracts, bridge boundaries, and AI behavior. Keep this file focused on
+handoff-critical repo notes, not rule duplication.
 
 ## Development guidance
 
 - Keep the Python and Lua bridge action names synchronized.
 - Prefer read/inspect tools before mutating tools.
 - Identify objects by GUID rather than display name alone.
-- For Kill Team model identification, use the bounded
-  `tts_killteam_search_deployment_names` route before movement or LOS. Normalize
-  TTS display-name markup for comparison, then require a unique live `Figurine`
-  whose name matches the intended operative, includes the `Operative` tag, and
-  has consistent faction tags. Similar-named bags, layouts, and containers are
-  not models. Use the returned live GUID as authoritative; for the current
-  pairing, the Plague Marine Warrior should also carry Chaos/LEGIONARY tags
-  and the Novitiate Dialogus should carry NOVITIATE/Imperium tags.
-- For the bundled checkers save, use the game-specific validated movement
-  tool for black pieces; keep `tts_move_object` as an unrestricted primitive.
 - Preserve the existing External Editor callback protocol and request IDs.
 - Do not add arbitrary Lua execution without explicit safeguards and approval.
 - Treat object destruction and broad scene changes as irreversible operations.
@@ -108,6 +82,9 @@ only the final natural-language response.
   and whitespace-only responses to the TTS chat.
 - Keep screenshot capture configurable by screen rectangle; do not assume TTS
   is always on the primary monitor in new code.
+- Update the relevant ADR and wiki documentation whenever code is written or
+  edited if the change affects behavior, architecture, safety, or user-facing
+  workflows.
 - Update this file and `README.md` when adding major tools or changing the
   bridge architecture.
 - Keep `docs/wiki/roadmap.md` current when roadmap priorities, implementation

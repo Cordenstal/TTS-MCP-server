@@ -11,6 +11,7 @@ import copy
 import json
 import math
 import re
+import uuid
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -38,7 +39,30 @@ class KillTeamBridge(Protocol):
 
     def get_snap_points(self, guid: str) -> dict[str, Any]: ...
 
+    def inspect_container(self, guid: str) -> dict[str, Any]: ...
+
+    def get_zone_objects(self, guid: str) -> dict[str, Any]: ...
+
     def move_object(self, guid: str, position: dict[str, float]) -> dict[str, Any]: ...
+
+    def take_from_container(
+        self,
+        container_guid: str,
+        *,
+        item_guid: str | None = None,
+        index: int | None = None,
+        position: dict[str, float] | None = None,
+        flip: bool = False,
+        smooth: bool = False,
+    ) -> dict[str, Any]: ...
+
+    def put_object_into_container(
+        self,
+        container_guid: str,
+        object_guid: str,
+        *,
+        index: int | None = None,
+    ) -> dict[str, Any]: ...
 
     def roll_dice(
         self,
@@ -61,7 +85,11 @@ class KillTeamBridge(Protocol):
 
     def get_roster(self, container_guid: str) -> dict[str, Any]: ...
 
+    def get_setup_roster_cards(self, zone_guid: str) -> dict[str, Any]: ...
+
     def set_object_name(self, guid: str, name: str) -> dict[str, Any]: ...
+
+    def set_object_lock(self, guid: str, locked: bool) -> dict[str, Any]: ...
 
     def observe_defense_roll(
         self,
@@ -97,6 +125,16 @@ class TTSKillTeamBridge:
             and not snap_point_tags
         ):
             return self._request("killteam_deployment_test_objects", {})
+        if (
+            query_tags == list(SAVE_131_FIXTURE_PROFILE.query_tags)
+            and required_guids == list(SAVE_131_FIXTURE_PROFILE.required_guids)
+            and snap_point_tags == [SAVE_131_FIXTURE_PROFILE.start_snap_tag]
+        ):
+            # TTS can reject a multi-field External Editor message before Lua
+            # receives it. Keep the fixed fixture collection entirely inside
+            # the zero-argument Lua action, the same reliable boundary used
+            # for deployment name discovery.
+            return self._request("killteam_save_131_setup_objects", {})
         return self._request(
             "killteam_list_objects",
             {
@@ -113,11 +151,62 @@ class TTSKillTeamBridge:
     def get_snap_points(self, guid: str) -> dict[str, Any]:
         return self._request("get_snap_points", {"guid": guid})
 
+    def inspect_container(self, guid: str) -> dict[str, Any]:
+        return self._request("inspect_container", {"guid": guid})
+
+    def get_zone_objects(self, guid: str) -> dict[str, Any]:
+        return self._request("get_zone_objects", {"guid": guid, "ignore_tags": False})
+
+    def get_setup_roster_cards(self, zone_guid: str) -> dict[str, Any]:
+        if zone_guid.strip().lower() == SAVE_131_FIXTURE_PROFILE.setup_roster_zone_guid:
+            return self._request("killteam_setup_roster_cards", {})
+        return self._request("get_zone_objects", {"guid": zone_guid, "ignore_tags": False})
+
     def move_object(self, guid: str, position: dict[str, float]) -> dict[str, Any]:
         return self._request(
             "move_object",
             {"guid": guid, "position": position, "smooth": False, "collide": False, "fast": True},
         )
+
+    def take_from_container(
+        self,
+        container_guid: str,
+        *,
+        item_guid: str | None = None,
+        index: int | None = None,
+        position: dict[str, float] | None = None,
+        flip: bool = False,
+        smooth: bool = False,
+    ) -> dict[str, Any]:
+        args: dict[str, Any] = {
+            "container_guid": container_guid,
+            "flip": bool(flip),
+            "smooth": bool(smooth),
+        }
+        if item_guid:
+            args["item_guid"] = item_guid
+        elif index is not None:
+            args["index"] = int(index)
+        else:
+            raise ValueError("item_guid or index is required")
+        if position is not None:
+            args["position"] = copy.deepcopy(position)
+        return self._request("take_from_container", args)
+
+    def put_object_into_container(
+        self,
+        container_guid: str,
+        object_guid: str,
+        *,
+        index: int | None = None,
+    ) -> dict[str, Any]:
+        args: dict[str, Any] = {
+            "container_guid": container_guid,
+            "object_guid": object_guid,
+        }
+        if index is not None:
+            args["index"] = int(index)
+        return self._request("put_object_into_container", args)
 
     def roll_dice(
         self,
@@ -169,6 +258,9 @@ class TTSKillTeamBridge:
     def set_object_name(self, guid: str, name: str) -> dict[str, Any]:
         return self._request("set_object_name", {"guid": guid, "name": name})
 
+    def set_object_lock(self, guid: str, locked: bool) -> dict[str, Any]:
+        return self._request("set_object_lock", {"guid": guid, "locked": bool(locked)})
+
     def observe_defense_roll(
         self,
         *,
@@ -213,6 +305,7 @@ class KillTeamFixtureProfile:
     ai_roller_tag: str
     defense_station_guid: str
     roster_container_guid: str
+    setup_roster_zone_guid: str
     counter_guids: tuple[tuple[str, str], ...]
 
 
@@ -242,6 +335,7 @@ SAVE_131_FIXTURE_PROFILE = KillTeamFixtureProfile(
     ai_roller_tag="_blue_dice_roller",
     defense_station_guid="f1adc9",
     roster_container_guid="e5adb7",
+    setup_roster_zone_guid="aefe3b",
     counter_guids=(
         ("cp", "2cc38b"),
         ("kill_vp", "d9b193"),
@@ -262,6 +356,62 @@ class KillTeamConfig:
     roster_container_guid: str = "e5adb7"
     target_guid: str = "96fe20"
     fixture_profile: str = ""
+    initiative_side: str = ""
+
+
+@dataclass(frozen=True)
+class KillTeamSetupFactionProfile:
+    faction_id: str
+    exact_team_size: int
+    leader_type_ids: frozenset[str]
+    unlimited_type_ids: frozenset[str] = frozenset()
+    per_type_limits: dict[str, int] | None = None
+    default_limit: int = 1
+
+
+_GENERIC_SETUP_QUERY_TAGS = (
+    "tts_mcp:entity=operative",
+    "tts_mcp:entity=die",
+    "tts_mcp:entity=dice_roller",
+    "tts_mcp:entity=counter",
+    "tts_mcp:entity=calibration",
+    "tts_mcp:entity=terrain",
+    "tts_mcp:entity=deployment",
+    "tts_mcp:entity=faction_decks",
+    "tts_mcp:entity=roster",
+    "tts_mcp:entity=roster_list_zone",
+    "tts_mcp:entity=deployed_zone",
+    "tts_mcp:entity=roster_card",
+)
+
+_SETUP_FACTION_PROFILES = {
+    "legionary": KillTeamSetupFactionProfile(
+        faction_id="legionary",
+        exact_team_size=6,
+        leader_type_ids=frozenset({"chosen", "aspiring_champion"}),
+        unlimited_type_ids=frozenset({"warrior"}),
+    ),
+    "legionaries": KillTeamSetupFactionProfile(
+        faction_id="legionary",
+        exact_team_size=6,
+        leader_type_ids=frozenset({"chosen", "aspiring_champion"}),
+        unlimited_type_ids=frozenset({"warrior"}),
+    ),
+    "novitiate": KillTeamSetupFactionProfile(
+        faction_id="novitiate",
+        exact_team_size=10,
+        leader_type_ids=frozenset({"superior"}),
+        unlimited_type_ids=frozenset({"militant"}),
+        per_type_limits={"purgatus": 2},
+    ),
+    "novitiates": KillTeamSetupFactionProfile(
+        faction_id="novitiate",
+        exact_team_size=10,
+        leader_type_ids=frozenset({"superior"}),
+        unlimited_type_ids=frozenset({"militant"}),
+        per_type_limits={"purgatus": 2},
+    ),
+}
 
 
 def _live_object_guid(value: Any) -> str | None:
@@ -270,6 +420,10 @@ def _live_object_guid(value: Any) -> str | None:
     if not guid or guid == "-1":
         return None
     return guid
+
+
+def _norm(value: Any) -> str:
+    return str(value or "").strip().lower()
 
 
 def _tag_metadata(tags: Any) -> dict[str, str]:
@@ -301,6 +455,13 @@ def _bool(value: Any, default: bool = False) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _whole_number(value: Any, field: str) -> int:
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError) as exc:
+        raise KillTeamSetupError(f"{field} must be an integer") from exc
+
+
 def _number(value: Any, field: str) -> float:
     try:
         return float(value)
@@ -311,6 +472,37 @@ def _number(value: Any, field: str) -> float:
 def _position(obj: dict[str, Any]) -> dict[str, float]:
     raw = obj.get("position") or {}
     return {axis: _number(raw.get(axis, 0), f"position.{axis}") for axis in ("x", "y", "z")}
+
+
+def _clean_setup_name(value: Any) -> str:
+    text = str(value or "")
+    text = re.sub(r"\[[0-9A-Fa-f]{6}\]", "", text)
+    text = text.replace("[-]", "")
+    text = re.sub(r"\{\s*\d+\s*/\s*\d+\s*\}", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _setup_base_name(value: Any) -> str:
+    text = _clean_setup_name(value)
+    text = re.sub(r"\broster\s+card\b", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s+#?\d+\s*$", "", text).strip()
+    return re.sub(r"\s+", " ", text)
+
+
+def _setup_numbered_name(base: str, index: int) -> str:
+    return f"{base} {index}"
+
+
+def _inflated_rect(
+    rect: tuple[float, float, float, float],
+    padding: float,
+) -> tuple[float, float, float, float]:
+    return rect[0] - padding, rect[1] + padding, rect[2] - padding, rect[3] + padding
+
+
+def _rect_dict(rect: tuple[float, float, float, float]) -> dict[str, float]:
+    return {"min_x": rect[0], "max_x": rect[1], "min_z": rect[2], "max_z": rect[3]}
 
 
 def parse_profile_description(description: str) -> dict[str, Any]:
@@ -409,6 +601,34 @@ def _bounds(obj: dict[str, Any]) -> tuple[float, float, float, float] | None:
     return cx - sx / 2, cx + sx / 2, cz - sz / 2, cz + sz / 2
 
 
+def _rect_contains_rect(
+    outer: tuple[float, float, float, float],
+    inner: tuple[float, float, float, float],
+    *,
+    tolerance: float = 1e-6,
+) -> bool:
+    return (
+        inner[0] >= outer[0] - tolerance
+        and inner[1] <= outer[1] + tolerance
+        and inner[2] >= outer[2] - tolerance
+        and inner[3] <= outer[3] + tolerance
+    )
+
+
+def _rects_overlap(
+    first: tuple[float, float, float, float],
+    second: tuple[float, float, float, float],
+    *,
+    tolerance: float = 1e-6,
+) -> bool:
+    return not (
+        first[1] <= second[0] + tolerance
+        or second[1] <= first[0] + tolerance
+        or first[3] <= second[2] + tolerance
+        or second[3] <= first[2] + tolerance
+    )
+
+
 def _segment_intersects_rect(
     start: dict[str, float],
     end: dict[str, float],
@@ -434,6 +654,13 @@ def _segment_intersects_rect(
                 return False
             t1 = min(t1, ratio)
     return t0 <= t1
+
+
+def _rect_center(rect: tuple[float, float, float, float]) -> dict[str, float]:
+    return {
+        "x": (rect[0] + rect[1]) / 2,
+        "z": (rect[2] + rect[3]) / 2,
+    }
 
 
 def _resolve_ranged_successes(
@@ -497,6 +724,7 @@ class KillTeamRuntime:
         self._action_results: dict[str, dict[str, Any]] = {}
         self._uncertain_action_ids: set[str] = set()
         self._listing_truncated = False
+        self._setup_board_plans: dict[str, dict[str, Any]] = {}
 
     def _list_objects(self) -> list[dict[str, Any]]:
         # Kill Team needs identity, tags, transforms, bounds, counters, and
@@ -511,9 +739,7 @@ class KillTeamRuntime:
             query_tags.extend(self._fixture_profile.query_tags)
             snap_point_tags.append(self._fixture_profile.start_snap_tag)
         else:
-            target_guid = _live_object_guid(self.config.target_guid)
-            if target_guid is not None:
-                required_guids.append(target_guid)
+            query_tags.extend(_GENERIC_SETUP_QUERY_TAGS)
         list_kwargs: dict[str, Any] = {
             "max_results": 1000,
             "compact": True,
@@ -554,7 +780,23 @@ class KillTeamRuntime:
         """Project Save 131's native tags and stable anchors into canonical roles."""
         profile = self._fixture_profile
         if profile is None:
-            return objects
+            normalized = copy.deepcopy(objects)
+            for obj in normalized:
+                tags = {str(tag).strip().casefold() for tag in obj.get("tags", [])}
+                name = str(obj.get("name") or "").casefold()
+                meta = dict(obj.get("meta") or {})
+                if "_faction_decks" in tags:
+                    meta.setdefault("entity", "faction_decks")
+                if "_roster" in tags:
+                    meta.setdefault("entity", "roster")
+                if "_roster_card" in tags:
+                    meta.setdefault("entity", "roster_card")
+                if "roster list" in name or "roster cards" in name:
+                    meta.setdefault("entity", "roster_list_zone")
+                if "deployed zone" in name:
+                    meta.setdefault("entity", "deployed_zone")
+                obj["meta"] = meta
+            return normalized
 
         normalized = copy.deepcopy(objects)
         by_guid = {str(obj.get("guid", "")).lower(): obj for obj in normalized}
@@ -639,6 +881,510 @@ class KillTeamRuntime:
                     if field in obj:
                         record[field] = copy.deepcopy(obj[field])
 
+    def _setup_board_snapshot(self, roster_zone_guid: str) -> dict[str, Any]:
+        profile = self._fixture_profile
+        if profile is None or profile.name != SAVE_131_FIXTURE_PROFILE.name:
+            raise KillTeamSetupError("setup board planning requires the Save 131 fixture profile")
+        roster_zone_guid = roster_zone_guid.strip().lower() or profile.setup_roster_zone_guid
+        if roster_zone_guid != profile.setup_roster_zone_guid:
+            raise KillTeamSetupError("Save 131 setup board planning uses fixed roster zone aefe3b")
+
+        objects = self._normalize_fixture_objects(self._list_objects())
+        self._objects = {str(obj["guid"]): obj for obj in objects}
+        try:
+            raw_cards = self.bridge.get_setup_roster_cards(roster_zone_guid)
+        except Exception as exc:
+            raise KillTeamSetupError("Deployed Zone roster cards could not be inspected") from exc
+        card_objects = raw_cards.get("objects", []) if isinstance(raw_cards, dict) else []
+        if not isinstance(card_objects, list):
+            raise KillTeamSetupError("Deployed Zone roster card response was invalid")
+        cards: list[dict[str, Any]] = []
+        for index, obj in enumerate(card_objects, start=1):
+            if not isinstance(obj, dict):
+                continue
+            object_type = str(obj.get("type") or "")
+            if "card" not in object_type.casefold():
+                raise KillTeamSetupError(
+                    f"Deployed Zone item {obj.get('guid', '<unknown>')} is not a roster card"
+                )
+            base_name = _setup_base_name(obj.get("name"))
+            if not base_name:
+                raise KillTeamSetupError(f"Deployed Zone card {obj.get('guid', '<unknown>')} has no mappable name")
+            cards.append({
+                "guid": str(obj.get("guid") or ""),
+                "name": _clean_setup_name(obj.get("name")),
+                "base_name": base_name,
+                "layout_index": int(obj.get("layout_index", index) or index),
+                "tags": copy.deepcopy(obj.get("tags", [])),
+            })
+        if not cards:
+            raise KillTeamSetupError("Deployed Zone aefe3b contains no roster cards")
+
+        deployments = [
+            obj for obj in objects
+            if _norm(_metadata(obj).get("entity")) == "deployment"
+            and _norm(_metadata(obj).get("team")) == self.config.ai_team
+        ]
+        if len(deployments) != 1:
+            raise KillTeamSetupError(f"expected one Blue deployment zone; found {len(deployments)}")
+        deployment = deployments[0]
+        deployment_bounds = _bounds(deployment)
+        if deployment_bounds is None:
+            raise KillTeamSetupError("Blue deployment zone is missing bounds")
+        combat_zones = [
+            obj for obj in objects
+            if _norm(_metadata(obj).get("entity")) == "combat_zone"
+        ]
+        combat_center = None
+        if combat_zones:
+            combat_center = _position(combat_zones[0])
+
+        models: list[dict[str, Any]] = []
+        ai_tags = {tag.casefold() for tag in profile.ai_faction_tags}
+        for obj in objects:
+            metadata = _metadata(obj)
+            if metadata.get("entity") != "operative" or _norm(metadata.get("team")) != self.config.ai_team:
+                continue
+            tags = {str(tag).strip().casefold() for tag in obj.get("tags", [])}
+            object_type = str(obj.get("type") or "").casefold()
+            if object_type and object_type != "figurine":
+                continue
+            if "operative" not in tags or not ai_tags.issubset(tags):
+                continue
+            bounds = _bounds(obj)
+            if bounds is None:
+                raise KillTeamSetupError(f"model {obj.get('guid', '<unknown>')} is missing bounds")
+            models.append(obj)
+        if not models:
+            raise KillTeamSetupError("no live AI operative models were found")
+
+        blockers: list[dict[str, Any]] = []
+        for obj in objects:
+            entity = _norm(_metadata(obj).get("entity"))
+            if entity not in {"terrain", "objective", "operative"}:
+                continue
+            bounds = _bounds(obj)
+            if bounds is None:
+                continue
+            blockers.append({
+                "guid": str(obj.get("guid") or ""),
+                "name": str(obj.get("name") or ""),
+                "entity": entity,
+                "bounds": bounds,
+            })
+        return {
+            "objects": objects,
+            "cards": cards,
+            "models": models,
+            "deployment": deployment,
+            "deployment_bounds": deployment_bounds,
+            "combat_center": combat_center,
+            "blockers": blockers,
+            "roster_order_source": str(raw_cards.get("order_source", "layout_zone.getObjects")) if isinstance(raw_cards, dict) else "layout_zone.getObjects",
+        }
+
+    def _setup_board_targets(self, snapshot: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        cards = list(snapshot["cards"])
+        models = list(snapshot["models"])
+        models_by_base: dict[str, list[dict[str, Any]]] = {}
+        for model in models:
+            models_by_base.setdefault(_setup_base_name(model.get("name")), []).append(model)
+        card_counts: dict[str, int] = {}
+        for card in cards:
+            card_counts[card["base_name"]] = card_counts.get(card["base_name"], 0) + 1
+
+        targets: list[dict[str, Any]] = []
+        renames: list[dict[str, Any]] = []
+        used_guids: set[str] = set()
+        for base_name, count in card_counts.items():
+            candidates = models_by_base.get(base_name, [])
+            if len(candidates) != count:
+                raise KillTeamSetupError(
+                    f"roster card base {base_name!r} maps to {len(candidates)} live models, expected {count}"
+                )
+            candidates.sort(key=lambda obj: (_position(obj)["z"], _position(obj)["x"]))
+            for index, model in enumerate(candidates, start=1):
+                guid = str(model["guid"])
+                used_guids.add(guid)
+                final_name = _setup_numbered_name(base_name, index) if count > 1 else _clean_setup_name(model.get("name"))
+                if _clean_setup_name(model.get("name")) != final_name:
+                    renames.append({
+                        "guid": guid,
+                        "from": _clean_setup_name(model.get("name")),
+                        "to": final_name,
+                        "base_name": base_name,
+                        "index": index,
+                    })
+        occurrence: dict[str, int] = {}
+        by_base_sorted: dict[str, list[dict[str, Any]]] = {}
+        for base_name, candidates in models_by_base.items():
+            candidates = [obj for obj in candidates if str(obj.get("guid")) in used_guids]
+            candidates.sort(key=lambda obj: (_position(obj)["z"], _position(obj)["x"]))
+            by_base_sorted[base_name] = candidates
+        for card in cards:
+            base_name = card["base_name"]
+            occurrence[base_name] = occurrence.get(base_name, 0) + 1
+            model = by_base_sorted[base_name][occurrence[base_name] - 1]
+            model_count = card_counts[base_name]
+            final_name = (
+                _setup_numbered_name(base_name, occurrence[base_name])
+                if model_count > 1 else _clean_setup_name(model.get("name"))
+            )
+            targets.append({
+                "card": copy.deepcopy(card),
+                "model": model,
+                "model_name": final_name,
+                "base_name": base_name,
+                "duplicate_index": occurrence[base_name],
+                "duplicate_count": model_count,
+            })
+        return targets, renames
+
+    def _setup_board_projected_rect(
+        self,
+        model: dict[str, Any],
+        position: dict[str, float],
+    ) -> tuple[float, float, float, float]:
+        raw = model.get("bounds") or {}
+        size = raw.get("size") or {}
+        try:
+            sx, sz = abs(float(size.get("x", 0))), abs(float(size.get("z", 0)))
+        except (TypeError, ValueError) as exc:
+            raise KillTeamSetupError("model bounds size is invalid") from exc
+        if sx <= 0 or sz <= 0:
+            bounds = _bounds(model)
+            if bounds is None:
+                raise KillTeamSetupError("model is missing usable bounds")
+            sx, sz = bounds[1] - bounds[0], bounds[3] - bounds[2]
+        return (
+            float(position["x"]) - sx / 2,
+            float(position["x"]) + sx / 2,
+            float(position["z"]) - sz / 2,
+            float(position["z"]) + sz / 2,
+        )
+
+    def _setup_board_slot_blockers(
+        self,
+        snapshot: dict[str, Any],
+        *,
+        target_guids: set[str],
+        placed_guids: set[str],
+        current_guid: str | None = None,
+    ) -> list[dict[str, Any]]:
+        blockers = []
+        for blocker in snapshot["blockers"]:
+            guid = blocker["guid"]
+            if guid == current_guid:
+                continue
+            if guid in target_guids and guid not in placed_guids:
+                continue
+            blockers.append(blocker)
+        return blockers
+
+    def _setup_board_rect_legality(
+        self,
+        rect: tuple[float, float, float, float],
+        *,
+        deployment_bounds: tuple[float, float, float, float],
+        clearance: float,
+        blockers: list[dict[str, Any]],
+    ) -> tuple[bool, list[dict[str, Any]]]:
+        inflated = _inflated_rect(rect, clearance)
+        hits = []
+        if not _rect_contains_rect(deployment_bounds, inflated):
+            hits.append({"kind": "deployment_bounds", "bounds": _rect_dict(deployment_bounds)})
+        for blocker in blockers:
+            blocker_bounds = blocker["bounds"]
+            if _rects_overlap(inflated, blocker_bounds):
+                hits.append({
+                    "kind": "blocker",
+                    "guid": blocker["guid"],
+                    "name": blocker["name"],
+                    "entity": blocker["entity"],
+                    "bounds": _rect_dict(blocker_bounds),
+                })
+        return not hits, hits
+
+    def _setup_board_generate_slots(
+        self,
+        snapshot: dict[str, Any],
+        targets: list[dict[str, Any]],
+        *,
+        clearance: float,
+    ) -> list[dict[str, Any]]:
+        deployment_bounds = snapshot["deployment_bounds"]
+        target_guids = {str(item["model"]["guid"]) for item in targets}
+        assigned_rects: list[dict[str, Any]] = []
+        placements: list[dict[str, Any]] = []
+        tested: list[dict[str, Any]] = []
+        for target in targets:
+            model = target["model"]
+            current = _position(model)
+            raw_size = ((model.get("bounds") or {}).get("size") or {})
+            size_x = abs(float(raw_size.get("x", 1) or 1))
+            size_z = abs(float(raw_size.get("z", 1) or 1))
+            x = deployment_bounds[0] + size_x / 2 + clearance
+            z = deployment_bounds[2] + size_z / 2 + clearance
+            step_x = max(0.1, size_x + 2 * clearance)
+            step_z = max(0.1, size_z + 2 * clearance)
+            found: dict[str, float] | None = None
+            while z <= deployment_bounds[3] - size_z / 2 - clearance + 1e-6 and found is None:
+                x = deployment_bounds[0] + size_x / 2 + clearance
+                while x <= deployment_bounds[1] - size_x / 2 - clearance + 1e-6:
+                    position = {"x": round(x, 6), "y": current["y"], "z": round(z, 6)}
+                    rect = self._setup_board_projected_rect(model, position)
+                    assigned_blockers = [
+                        {
+                            "guid": item["guid"],
+                            "name": item["name"],
+                            "entity": "planned_model",
+                            "bounds": item["rect"],
+                        }
+                        for item in assigned_rects
+                    ]
+                    blockers = self._setup_board_slot_blockers(
+                        snapshot,
+                        target_guids=target_guids,
+                        placed_guids=set(),
+                        current_guid=str(model["guid"]),
+                    ) + assigned_blockers
+                    ok, evidence = self._setup_board_rect_legality(
+                        rect,
+                        deployment_bounds=deployment_bounds,
+                        clearance=clearance,
+                        blockers=blockers,
+                    )
+                    tested.append({
+                        "guid": str(model["guid"]),
+                        "position": copy.deepcopy(position),
+                        "ok": ok,
+                        "blockers": evidence[:5],
+                    })
+                    if ok:
+                        found = position
+                        assigned_rects.append({
+                            "guid": str(model["guid"]),
+                            "name": target["model_name"],
+                            "rect": _inflated_rect(rect, clearance),
+                        })
+                        break
+                    x += step_x
+                z += step_z
+            if found is None:
+                raise KillTeamSetupError(
+                    "no legal setup slot for "
+                    f"{target['model_name']}; tested={tested[-20:]}; "
+                    f"zone_bounds={_rect_dict(deployment_bounds)}; "
+                    f"footprint={{'x': {size_x}, 'z': {size_z}, 'clearance': {clearance}}}; "
+                    f"assigned={assigned_rects}"
+                )
+            placements.append({
+                "card_guid": target["card"]["guid"],
+                "card_name": target["card"]["name"],
+                "card_layout_index": target["card"]["layout_index"],
+                "model_guid": str(model["guid"]),
+                "model_name": target["model_name"],
+                "base_name": target["base_name"],
+                "duplicate_index": target["duplicate_index"],
+                "duplicate_count": target["duplicate_count"],
+                "original_name": _clean_setup_name(model.get("name")),
+                "original_locked": bool(model.get("locked", False)),
+                "original_position": _position(model),
+                "target_position": found,
+                "target_rect": _rect_dict(self._setup_board_projected_rect(model, found)),
+            })
+        return placements
+
+    def _validate_setup_board_plan_current(self, plan: dict[str, Any]) -> dict[str, Any]:
+        snapshot = self._setup_board_snapshot(str(plan["roster_zone_guid"]))
+        cards = snapshot["cards"]
+        expected_cards = plan["cards"]
+        if [
+            (card["guid"], card["name"], card["base_name"])
+            for card in cards
+        ] != [
+            (card["guid"], card["name"], card["base_name"])
+            for card in expected_cards
+        ]:
+            raise KillTeamRuleError("setup board plan is stale: roster card order changed")
+        by_guid = {str(obj["guid"]): obj for obj in snapshot["models"]}
+        for placement in plan["placements"]:
+            live = by_guid.get(str(placement["model_guid"]))
+            if live is None:
+                raise KillTeamRuleError(f"setup board plan is stale: model {placement['model_guid']} is missing")
+            if _clean_setup_name(live.get("name")) != placement["original_name"]:
+                raise KillTeamRuleError(f"setup board plan is stale: model {placement['model_guid']} name changed")
+            if bool(live.get("locked", False)) != bool(placement["original_locked"]):
+                raise KillTeamRuleError(f"setup board plan is stale: model {placement['model_guid']} lock state changed")
+            live_position = _position(live)
+            original_position = placement["original_position"]
+            if any(abs(live_position[axis] - float(original_position[axis])) > 0.01 for axis in ("x", "y", "z")):
+                raise KillTeamRuleError(f"setup board plan is stale: model {placement['model_guid']} moved")
+        if _rect_dict(snapshot["deployment_bounds"]) != plan["deployment_zone"]["bounds"]:
+            raise KillTeamRuleError("setup board plan is stale: deployment zone bounds changed")
+        return snapshot
+
+    def plan_setup_board(
+        self,
+        *,
+        roster_zone_guid: str = "",
+        clearance: float = 0.25,
+    ) -> dict[str, Any]:
+        clearance = float(clearance)
+        if clearance < 0:
+            raise KillTeamSetupError("setup board clearance must be non-negative")
+        profile = self._fixture_profile
+        if profile is None:
+            raise KillTeamSetupError("setup board planning requires the Save 131 fixture profile")
+        roster_zone_guid = roster_zone_guid.strip().lower() or profile.setup_roster_zone_guid
+        snapshot = self._setup_board_snapshot(roster_zone_guid)
+        targets, renames = self._setup_board_targets(snapshot)
+        placements = self._setup_board_generate_slots(snapshot, targets, clearance=clearance)
+        plan_id = uuid.uuid4().hex[:12]
+        plan = {
+            "status": "planned",
+            "schema_version": 1,
+            "plan_id": plan_id,
+            "fixture_profile": profile.name,
+            "roster_zone_guid": roster_zone_guid,
+            "roster_order_source": snapshot["roster_order_source"],
+            "clearance": clearance,
+            "revision": len(self._setup_board_plans) + 1,
+            "cards": copy.deepcopy(snapshot["cards"]),
+            "deployment_zone": {
+                "guid": str(snapshot["deployment"].get("guid")),
+                "name": str(snapshot["deployment"].get("name") or ""),
+                "bounds": _rect_dict(snapshot["deployment_bounds"]),
+                "position": _position(snapshot["deployment"]),
+            },
+            "combat_center": copy.deepcopy(snapshot["combat_center"]),
+            "renames": renames,
+            "models_to_unlock": [
+                {
+                    "guid": item["model_guid"],
+                    "name": item["original_name"],
+                }
+                for item in placements if item["original_locked"]
+            ],
+            "placements": placements,
+            "blockers": [
+                {
+                    "guid": item["guid"],
+                    "name": item["name"],
+                    "entity": item["entity"],
+                    "bounds": _rect_dict(item["bounds"]),
+                }
+                for item in snapshot["blockers"]
+                if item["entity"] in {"terrain", "objective"}
+            ],
+            "executed": False,
+        }
+        self._setup_board_plans[plan_id] = copy.deepcopy(plan)
+        return copy.deepcopy(plan)
+
+    def execute_setup_board(self, plan_id: str) -> dict[str, Any]:
+        plan_id = str(plan_id or "").strip()
+        if not plan_id:
+            raise KillTeamRuleError("setup board plan_id is required")
+        plan = self._setup_board_plans.get(plan_id)
+        if plan is None:
+            raise KillTeamRuleError(f"unknown or expired setup board plan {plan_id}")
+        if plan.get("executed"):
+            raise KillTeamRuleError(f"setup board plan {plan_id} has already executed")
+        completed: list[dict[str, Any]] = []
+
+        def fail(phase: str, placement: dict[str, Any] | None, exc: Exception) -> dict[str, Any]:
+            return {
+                "status": "failed",
+                "plan_id": plan_id,
+                "failed_phase": phase,
+                "failed_model": copy.deepcopy(placement) if placement else None,
+                "error": str(exc),
+                "completed": completed,
+                "stopped": True,
+            }
+
+        try:
+            snapshot = self._validate_setup_board_plan_current(plan)
+        except Exception as exc:
+            return fail("preflight", None, exc)
+
+        target_guids = {str(item["model_guid"]) for item in plan["placements"]}
+        try:
+            for unlock in plan["models_to_unlock"]:
+                guid = str(unlock["guid"])
+                projected = self.bridge.set_object_lock(guid, False)
+                if bool(projected.get("locked", False)):
+                    raise KillTeamRuleError(f"model {guid} did not unlock")
+            for rename in plan["renames"]:
+                projected = self.bridge.set_object_name(str(rename["guid"]), str(rename["to"]))
+                if _clean_setup_name(projected.get("name")) != str(rename["to"]):
+                    raise KillTeamRuleError(f"model {rename['guid']} rename did not verify")
+            snapshot = self._setup_board_snapshot(str(plan["roster_zone_guid"]))
+            live_by_guid = {str(obj["guid"]): obj for obj in snapshot["models"]}
+            for placement in plan["placements"]:
+                live = live_by_guid.get(str(placement["model_guid"]))
+                if live is None:
+                    raise KillTeamRuleError(f"model {placement['model_guid']} is missing after rename")
+                if _clean_setup_name(live.get("name")) != placement["model_name"]:
+                    raise KillTeamRuleError(f"model {placement['model_guid']} identity did not verify after rename")
+        except Exception as exc:
+            return fail("prepare", None, exc)
+
+        placed_guids: set[str] = set()
+        for placement in plan["placements"]:
+            try:
+                live = next(
+                    obj for obj in snapshot["models"]
+                    if str(obj["guid"]) == str(placement["model_guid"])
+                )
+                rect = self._setup_board_projected_rect(live, placement["target_position"])
+                blockers = self._setup_board_slot_blockers(
+                    snapshot,
+                    target_guids=target_guids,
+                    placed_guids=placed_guids,
+                    current_guid=str(placement["model_guid"]),
+                )
+                ok, evidence = self._setup_board_rect_legality(
+                    rect,
+                    deployment_bounds=(
+                        plan["deployment_zone"]["bounds"]["min_x"],
+                        plan["deployment_zone"]["bounds"]["max_x"],
+                        plan["deployment_zone"]["bounds"]["min_z"],
+                        plan["deployment_zone"]["bounds"]["max_z"],
+                    ),
+                    clearance=float(plan["clearance"]),
+                    blockers=blockers,
+                )
+                if not ok:
+                    raise KillTeamRuleError(f"frozen setup coordinate is blocked: {evidence[:5]}")
+                projected = self.bridge.move_object(
+                    str(placement["model_guid"]),
+                    copy.deepcopy(placement["target_position"]),
+                )
+                actual = _position(projected if isinstance(projected, dict) else self.bridge.get_object(str(placement["model_guid"])))
+                if any(abs(actual[axis] - float(placement["target_position"][axis])) > 0.05 for axis in ("x", "y", "z")):
+                    raise KillTeamUncertainCommit("setup model move did not verify")
+                completed.append({
+                    "model_guid": placement["model_guid"],
+                    "model_name": placement["model_name"],
+                    "position": actual,
+                })
+                placed_guids.add(str(placement["model_guid"]))
+                snapshot = self._setup_board_snapshot(str(plan["roster_zone_guid"]))
+            except Exception as exc:
+                return fail("move", placement, exc)
+        plan["executed"] = True
+        self._setup_board_plans[plan_id] = plan
+        return {
+            "status": "executed",
+            "plan_id": plan_id,
+            "completed": completed,
+            "renames": copy.deepcopy(plan["renames"]),
+            "unlocked": copy.deepcopy(plan["models_to_unlock"]),
+            "stopped": False,
+        }
+
     def _require_state(self) -> dict[str, Any]:
         if self._state is None:
             raise KillTeamSetupError("Kill Team setup has not completed")
@@ -653,10 +1399,574 @@ class KillTeamRuntime:
                 visible[operative_id] = copy.deepcopy(record)
         return visible
 
-    def setup(self) -> dict[str, Any]:
+    def _setup_profile_for_faction(self, faction_id: str) -> KillTeamSetupFactionProfile:
+        profile = _SETUP_FACTION_PROFILES.get(_norm(faction_id))
+        if profile is None:
+            raise KillTeamSetupError(f"unsupported setup faction {faction_id}")
+        return profile
+
+    def _setup_side_id(self, metadata: dict[str, str]) -> str:
+        side_id = _norm(metadata.get("side_id") or metadata.get("team"))
+        if not side_id:
+            raise KillTeamSetupError("setup object is missing side_id metadata")
+        return side_id
+
+    def _setup_identity(self, metadata: dict[str, str], *, entity_label: str) -> dict[str, str]:
+        operative_type_id = _norm(metadata.get("operative_type_id"))
+        instance_id = str(metadata.get("instance_id") or "").strip()
+        faction_id = _norm(metadata.get("faction_id"))
+        operative_id = str(metadata.get("operative_id") or "").strip()
+        if not operative_type_id or not instance_id or not faction_id:
+            raise KillTeamSetupError(
+                f"{entity_label} requires operative_type_id, instance_id, and faction_id metadata"
+            )
+        if not operative_id:
+            operative_id = f"{operative_type_id}#{instance_id}"
+        return {
+            "operative_id": operative_id,
+            "operative_type_id": operative_type_id,
+            "instance_id": instance_id,
+            "faction_id": faction_id,
+            "role": _norm(metadata.get("role")),
+        }
+
+    def _setup_card_from_object(self, obj: dict[str, Any]) -> dict[str, Any]:
+        metadata = _metadata(obj)
+        if _norm(metadata.get("entity")) != "roster_card":
+            raise KillTeamSetupError("setup card object is missing roster_card metadata")
+        identity = self._setup_identity(metadata, entity_label="roster card")
+        identity.update({
+            "guid": str(obj.get("guid") or ""),
+            "side_id": self._setup_side_id(metadata),
+            "name": str(obj.get("name") or identity["operative_id"]),
+            "tags": copy.deepcopy(obj.get("tags", [])),
+        })
+        return identity
+
+    def _setup_card_from_container_item(self, item: dict[str, Any]) -> dict[str, Any]:
+        metadata = _tag_metadata(item.get("tags"))
+        if _norm(metadata.get("entity")) != "roster_card":
+            raise KillTeamSetupError("contained setup card is missing roster_card metadata")
+        identity = self._setup_identity(metadata, entity_label="contained roster card")
+        identity.update({
+            "guid": str(item.get("guid") or ""),
+            "side_id": self._setup_side_id(metadata),
+            "name": str(item.get("name") or identity["operative_id"]),
+            "tags": copy.deepcopy(item.get("tags", [])),
+        })
+        return identity
+
+    def _setup_model_from_container_item(self, item: dict[str, Any]) -> dict[str, Any]:
+        metadata = _tag_metadata(item.get("tags"))
+        if _norm(metadata.get("entity")) != "operative":
+            raise KillTeamSetupError("contained setup model is missing operative metadata")
+        identity = self._setup_identity(metadata, entity_label="contained operative")
+        identity.update({
+            "guid": str(item.get("guid") or ""),
+            "side_id": self._setup_side_id(metadata),
+            "name": str(item.get("name") or identity["operative_id"]),
+            "tags": copy.deepcopy(item.get("tags", [])),
+        })
+        return identity
+
+    def _setup_selected_cards(self, zone_guid: str) -> list[dict[str, Any]]:
+        try:
+            zone = self.bridge.get_zone_objects(zone_guid)
+        except Exception as exc:
+            raise KillTeamSetupError(f"setup zone {zone_guid} could not be inspected") from exc
+        objects = zone.get("objects", []) if isinstance(zone, dict) else []
+        if not isinstance(objects, list):
+            raise KillTeamSetupError(f"setup zone {zone_guid} returned invalid contents")
+        cards = []
+        for obj in objects:
+            if not isinstance(obj, dict):
+                continue
+            metadata = _metadata(obj)
+            if _norm(metadata.get("entity")) != "roster_card":
+                continue
+            cards.append(self._setup_card_from_object(obj))
+        return cards
+
+    def _setup_container_items(self, container_guid: str) -> list[dict[str, Any]]:
+        try:
+            container = self.bridge.inspect_container(container_guid)
+        except Exception as exc:
+            raise KillTeamSetupError(f"setup container {container_guid} could not be inspected") from exc
+        items = container.get("items", []) if isinstance(container, dict) else []
+        if not isinstance(items, list):
+            raise KillTeamSetupError(f"setup container {container_guid} returned invalid contents")
+        return [copy.deepcopy(item) for item in items if isinstance(item, dict)]
+
+    def _setup_zone_bounds(self, zone_guid: str) -> tuple[float, float, float, float]:
+        zone = self._objects.get(zone_guid)
+        bounds = _bounds(zone or {})
+        if zone is None or bounds is None:
+            raise KillTeamSetupError(f"setup zone {zone_guid} is missing bounds")
+        return bounds
+
+    def _setup_zone_center(self, zone_guid: str) -> dict[str, float]:
+        zone = self._objects.get(zone_guid) or {}
+        center = (zone.get("bounds") or {}).get("center") or zone.get("position") or {}
+        return {axis: _number(center.get(axis, 0), f"{zone_guid}.{axis}") for axis in ("x", "y", "z")}
+
+    def _validate_partial_setup_cards(
+        self,
+        cards: list[dict[str, Any]],
+    ) -> tuple[KillTeamSetupFactionProfile, str]:
+        if not cards:
+            raise KillTeamSetupError("at least one roster card is required")
+        faction_ids = {_norm(card["faction_id"]) for card in cards}
+        if len(faction_ids) != 1:
+            raise KillTeamRuleError("selected roster cards must share one faction")
+        faction_id = next(iter(faction_ids))
+        profile = self._setup_profile_for_faction(faction_id)
+        if len(cards) > profile.exact_team_size:
+            raise KillTeamRuleError("selected roster card count exceeds the faction team size")
+        counts: dict[str, int] = {}
+        leader_count = 0
+        seen_operatives: set[str] = set()
+        for card in cards:
+            operative_id = card["operative_id"]
+            if operative_id in seen_operatives:
+                raise KillTeamRuleError(f"duplicate selected operative {operative_id}")
+            seen_operatives.add(operative_id)
+            type_id = _norm(card["operative_type_id"])
+            counts[type_id] = counts.get(type_id, 0) + 1
+            if type_id in profile.leader_type_ids:
+                leader_count += 1
+            limit = None
+            if type_id in profile.unlimited_type_ids:
+                limit = profile.exact_team_size
+            elif profile.per_type_limits and type_id in profile.per_type_limits:
+                limit = int(profile.per_type_limits[type_id])
+            else:
+                limit = int(profile.default_limit)
+            if counts[type_id] > limit:
+                raise KillTeamRuleError(
+                    f"duplicate limit exceeded for {type_id}"
+                )
+        if leader_count > 1:
+            raise KillTeamRuleError("selected roster cards exceed the faction leader limit")
+        return profile, faction_id
+
+    def _validate_locked_setup_cards(
+        self,
+        cards: list[dict[str, Any]],
+    ) -> tuple[KillTeamSetupFactionProfile, str]:
+        profile, faction_id = self._validate_partial_setup_cards(cards)
+        if len(cards) != profile.exact_team_size:
+            raise KillTeamRuleError(
+                f"roster list requires exactly {profile.exact_team_size} operatives"
+            )
+        leader_count = sum(
+            1 for card in cards if _norm(card["operative_type_id"]) in profile.leader_type_ids
+        )
+        if leader_count != 1:
+            raise KillTeamRuleError("roster list requires exactly one leader")
+        return profile, faction_id
+
+    def _setup_side_objects(self) -> dict[str, dict[str, str]]:
+        sides: dict[str, dict[str, str]] = {}
+        required_entities = {
+            "faction_decks",
+            "roster",
+            "roster_list_zone",
+            "deployed_zone",
+            "deployment",
+        }
+        for guid, obj in self._objects.items():
+            metadata = _metadata(obj)
+            entity = _norm(metadata.get("entity"))
+            if entity not in required_entities:
+                continue
+            side_id = self._setup_side_id(metadata)
+            sides.setdefault(side_id, {})
+            if entity in sides[side_id]:
+                raise KillTeamSetupError(f"setup side {side_id} has duplicate {entity} objects")
+            sides[side_id][entity] = guid
+        if not sides:
+            return {}
+        for side_id, mapping in sides.items():
+            missing = sorted(required_entities - mapping.keys())
+            if missing:
+                raise KillTeamSetupError(
+                    f"setup side {side_id} is missing {', '.join(missing)}"
+                )
+        if self.config.ai_team.lower() not in sides:
+            raise KillTeamSetupError("the AI setup side is missing required tagged objects")
+        if len(sides) < 2:
+            raise KillTeamSetupError("Kill Team setup requires two tagged sides")
+        return sides
+
+    def _setup_mode_enabled(self, side_objects: dict[str, dict[str, str]]) -> bool:
+        return bool(side_objects)
+
+    def _setup_clean_start(self, side_objects: dict[str, dict[str, str]]) -> None:
+        for side_id, mapping in side_objects.items():
+            roster_cards = self._setup_selected_cards(mapping["roster_list_zone"])
+            deployed_cards = self._setup_selected_cards(mapping["deployed_zone"])
+            if roster_cards:
+                raise KillTeamSetupError(f"Roster List for {side_id} must start empty")
+            if deployed_cards:
+                raise KillTeamSetupError(f"Deployed Zone for {side_id} must start empty")
+        live_setup_operatives = [
+            guid
+            for guid, obj in self._objects.items()
+            if _norm(_metadata(obj).get("entity")) == "operative"
+            and _norm(_metadata(obj).get("side_id") or _metadata(obj).get("team")) in side_objects
+        ]
+        if live_setup_operatives:
+            raise KillTeamSetupError("setup requires all selected operatives to remain in roster containers")
+
+    def _setup_start_from_roster_models(self, setup_state: dict[str, Any]) -> None:
+        """Start deployment directly from the tagged model containers."""
+        for side_id, side in setup_state["sides"].items():
+            models = [
+                self._setup_model_from_container_item(item)
+                for item in self._setup_container_items(side["roster_container_guid"])
+            ]
+            models = [model for model in models if _norm(model["side_id"]) == side_id]
+            if not models:
+                raise KillTeamSetupError(f"roster container for {side_id} contains no operative models")
+            if side_id == self.config.ai_team:
+                models.sort(key=self._setup_ai_order_key)
+            profile = self._setup_profile_for_faction(models[0]["faction_id"])
+            if len(models) < profile.exact_team_size:
+                raise KillTeamSetupError(
+                    f"roster container for {side_id} has {len(models)} models; "
+                    f"{profile.exact_team_size} are required"
+                )
+            selected_models = models[:profile.exact_team_size]
+            self._validate_locked_setup_cards(selected_models)
+            side["locked"] = True
+            side["faction_id"] = profile.faction_id
+            side["selected_operatives"] = {
+                model["operative_id"]: copy.deepcopy(model)
+                for model in selected_models
+            }
+            side["deployed_operatives"] = {}
+            side["batch_size"] = max(1, len(selected_models) // 3)
+        setup_state["mode"] = "model_deployment"
+        setup_state["stage"] = "deployment"
+        setup_state["current_side"] = setup_state["initiative_side"]
+        first_side = setup_state["sides"][setup_state["current_side"]]
+        setup_state["current_batch_target"] = min(
+            int(first_side["batch_size"]),
+            len(first_side["selected_operatives"]),
+        )
+        setup_state["current_batch_progress"] = 0
+
+    def _setup_snapshot(self, state: dict[str, Any]) -> dict[str, Any] | None:
+        setup_state = state.get("setup")
+        if not isinstance(setup_state, dict):
+            return None
+        result = {
+            "mode": setup_state["mode"],
+            "stage": setup_state["stage"],
+            "initiative_side": setup_state["initiative_side"],
+            "current_side": setup_state.get("current_side"),
+            "current_batch_target": setup_state.get("current_batch_target", 0),
+            "current_batch_progress": setup_state.get("current_batch_progress", 0),
+            "pending_side": setup_state.get("pending_side"),
+            "pending_operative_id": setup_state.get("pending_operative_id"),
+            "pending_model_guid": setup_state.get("pending_model_guid"),
+            "sides": {},
+        }
+        for side_id, side in setup_state["sides"].items():
+            selected = side.get("selected_operatives", {})
+            deployed = side.get("deployed_operatives", {})
+            result["sides"][side_id] = {
+                "faction_decks_guid": side["faction_decks_guid"],
+                "roster_container_guid": side["roster_container_guid"],
+                "roster_list_zone_guid": side["roster_list_zone_guid"],
+                "deployed_zone_guid": side["deployed_zone_guid"],
+                "deployment_zone_guid": side["deployment_zone_guid"],
+                "locked": bool(side.get("locked")),
+                "faction_id": side.get("faction_id", ""),
+                "selected_count": len(selected),
+                "deployed_count": len(deployed),
+                "remaining_count": max(0, len(selected) - len(deployed)),
+                "batch_size": int(side.get("batch_size", 0)),
+            }
+        ai_plan = self._setup_ai_plan(state)
+        if ai_plan is not None:
+            result["ai_plan"] = ai_plan
+            if setup_state["stage"] == "roster_selection" and ai_plan.get("next_selection"):
+                result["next_action"] = {
+                    "type": "select_roster_card",
+                    "side_id": self.config.ai_team,
+                    **copy.deepcopy(ai_plan["next_selection"]),
+                }
+            elif setup_state["stage"] == "deployment":
+                if setup_state.get("current_side") == self.config.ai_team and ai_plan.get("next_deployment"):
+                    result["next_action"] = {
+                        "type": "deploy_ai_operative",
+                        "side_id": self.config.ai_team,
+                        "batch_target": int(setup_state.get("current_batch_target", 0)),
+                        "batch_progress": int(setup_state.get("current_batch_progress", 0)),
+                        **copy.deepcopy(ai_plan["next_deployment"]),
+                    }
+                elif setup_state.get("current_side"):
+                    result["next_action"] = {
+                        "type": "await_human_deployment",
+                        "side_id": setup_state["current_side"],
+                        "batch_target": int(setup_state.get("current_batch_target", 0)),
+                        "batch_progress": int(setup_state.get("current_batch_progress", 0)),
+                    }
+        return result
+
+    @staticmethod
+    def _setup_ai_role(record: dict[str, Any]) -> tuple[int, str]:
+        text = " ".join(
+            str(value).casefold()
+            for value in (
+                record.get("operative_id", ""),
+                record.get("profile_id", ""),
+                record.get("name", ""),
+                record.get("description", ""),
+            )
+            if str(value).strip()
+        )
+        if any(token in text for token in ("leader", "chosen", "champion", "sergeant", "commander")):
+            return 0, "leader"
+        if any(token in text for token in ("balefire", "icon", "gunner", "specialist", "support")):
+            return 1, "specialist"
+        if any(token in text for token in ("butcher", "heavy", "brute", "tank")):
+            return 2, "heavy"
+        return 3, "warrior"
+
+    def _setup_ai_order_key(self, record: dict[str, Any]) -> tuple[int, int, int, int, str]:
+        priority, _label = self._setup_ai_role(record)
+        profile = record.get("profile") if isinstance(record.get("profile"), dict) else {}
+        return (
+            priority,
+            -int(profile.get("apl", 0)),
+            -int(profile.get("move", 0)),
+            -int(profile.get("wounds", 0)),
+            str(record.get("operative_id", "")),
+        )
+
+    def _setup_recommended_position(
+        self,
+        side: dict[str, Any],
+        model_item: dict[str, Any],
+        *,
+        clearance: float = 0.25,
+    ) -> dict[str, float] | None:
+        """Return a conservative legal slot without moving the model."""
+        deployment_bounds = self._setup_zone_bounds(side["deployment_zone_guid"])
+        raw_model = model_item.get("object") if isinstance(model_item.get("object"), dict) else model_item
+        raw_bounds = raw_model.get("bounds") if isinstance(raw_model, dict) else None
+        raw_size = raw_bounds.get("size") if isinstance(raw_bounds, dict) else None
+        try:
+            size_x = abs(float((raw_size or {}).get("x", 1.0))) or 1.0
+            size_z = abs(float((raw_size or {}).get("z", 1.0))) or 1.0
+        except (TypeError, ValueError):
+            size_x, size_z = 1.0, 1.0
+
+        zone = self._objects.get(side["deployment_zone_guid"], {})
+        zone_position = _position(zone)
+        opponent_centers = []
+        for candidate_side_id, candidate_side in self._require_setup_state()["sides"].items():
+            if candidate_side_id == side["side_id"]:
+                continue
+            candidate_zone = self._objects.get(candidate_side["deployment_zone_guid"])
+            if candidate_zone is not None:
+                opponent_centers.append(_position(candidate_zone))
+        opponent_center = opponent_centers[0] if opponent_centers else None
+
+        blockers: list[tuple[float, float, float, float]] = []
+        for guid, obj in self._objects.items():
+            if guid == side["deployment_zone_guid"]:
+                continue
+            metadata = _metadata(obj)
+            entity = _norm(metadata.get("entity"))
+            if entity not in {"terrain", "objective", "operative"}:
+                continue
+            bounds = _bounds(obj)
+            if bounds is not None:
+                blockers.append(bounds)
+
+        assigned: list[tuple[float, float, float, float]] = []
+        for deployed in side.get("deployed_operatives", {}).values():
+            live = self._objects.get(str(deployed.get("guid") or ""))
+            bounds = _bounds(live or {})
+            if bounds is not None:
+                assigned.append(_inflated_rect(bounds, clearance))
+
+        step_x = max(0.25, size_x + 2 * clearance)
+        step_z = max(0.25, size_z + 2 * clearance)
+        candidates: list[tuple[tuple[float, float, float], dict[str, float], tuple[float, float, float, float]]] = []
+        x = deployment_bounds[0] + size_x / 2 + clearance
+        while x <= deployment_bounds[1] - size_x / 2 - clearance + 1e-6:
+            z = deployment_bounds[2] + size_z / 2 + clearance
+            while z <= deployment_bounds[3] - size_z / 2 - clearance + 1e-6:
+                rect = (
+                    x - size_x / 2,
+                    x + size_x / 2,
+                    z - size_z / 2,
+                    z + size_z / 2,
+                )
+                inflated = _inflated_rect(rect, clearance)
+                if _rect_contains_rect(deployment_bounds, inflated) and not any(
+                    _rects_overlap(inflated, blocker) for blocker in [*blockers, *assigned]
+                ):
+                    distance = (
+                        math.hypot(x - opponent_center["x"], z - opponent_center["z"])
+                        if opponent_center is not None
+                        else 0.0
+                    )
+                    # Prefer distance from the opposing deployment zone, then
+                    # use stable coordinates to keep repeated plans identical.
+                    score = (distance, -x, -z)
+                    candidates.append((score, {"x": round(x, 6), "y": zone_position["y"], "z": round(z, 6)}, rect))
+                z += step_z
+            x += step_x
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        return candidates[0][1]
+
+    def _setup_ai_plan(self, state: dict[str, Any]) -> dict[str, Any] | None:
+        setup_state = state.get("setup")
+        if not isinstance(setup_state, dict):
+            return None
+        ai_team = _norm(self.config.ai_team)
+        side = setup_state["sides"].get(ai_team)
+        if not isinstance(side, dict):
+            return None
+
+        try:
+            deck_cards = [
+                self._setup_card_from_container_item(item)
+                for item in self._setup_container_items(side["faction_decks_guid"])
+            ]
+        except KillTeamSetupError:
+            deck_cards = []
+        try:
+            roster_models = [
+                self._setup_model_from_container_item(item)
+                for item in self._setup_container_items(side["roster_container_guid"])
+            ]
+        except KillTeamSetupError:
+            roster_models = []
+
+        deck_by_id = {
+            card["operative_id"]: card
+            for card in deck_cards
+            if _norm(card["side_id"]) == ai_team
+        }
+        models_by_id = {
+            model["operative_id"]: model
+            for model in roster_models
+            if _norm(model["side_id"]) == ai_team
+        }
+        ai_records = {
+            record["operative_id"]: record
+            for record in state["operatives"].values()
+            if _norm(record["team"]) == ai_team
+        }
+        if not ai_records:
+            for card in deck_cards:
+                if _norm(card["side_id"]) == ai_team:
+                    ai_records.setdefault(card["operative_id"], card)
+            for model in roster_models:
+                if _norm(model["side_id"]) == ai_team:
+                    ai_records.setdefault(model["operative_id"], model)
+
+        selected = side.get("selected_operatives", {})
+        deployed = side.get("deployed_operatives", {})
+        selection_candidates = sorted(deck_by_id.values(), key=self._setup_ai_order_key)
+        legal_selection_cards = []
+        for card in selection_candidates:
+            try:
+                self._validate_partial_setup_cards([*legal_selection_cards, card])
+            except (KillTeamRuleError, KillTeamSetupError):
+                continue
+            legal_selection_cards.append(card)
+        if legal_selection_cards:
+            selection_ids = [card["operative_id"] for card in legal_selection_cards]
+        else:
+            selection_ids = [
+                card["operative_id"]
+                for card in sorted(selected.values(), key=self._setup_ai_order_key)
+            ]
+        deployment_candidates = [
+            models_by_id[operative_id]
+            for operative_id in selection_ids
+            if operative_id in models_by_id
+        ]
+        if not deployment_candidates:
+            deployment_candidates = sorted(models_by_id.values(), key=self._setup_ai_order_key)
+        deployment_ids = [record["operative_id"] for record in deployment_candidates]
+        selection_order = []
+        deployment_order = []
+        next_selection = None
+        next_deployment = None
+        for operative_id in selection_ids:
+            card = deck_by_id.get(operative_id)
+            if card is None:
+                continue
+            priority, label = self._setup_ai_role(card)
+            entry = {
+                "operative_id": operative_id,
+                "card_guid": card["guid"],
+                "card_name": card.get("name", ""),
+                "name": card.get("name", ""),
+                "profile_id": card.get("profile_id", ""),
+                "priority": priority,
+                "priority_label": label,
+                "selected": operative_id in selected,
+            }
+            selection_order.append(entry)
+            if next_selection is None and not entry["selected"]:
+                next_selection = copy.deepcopy(entry)
+        for operative_id in deployment_ids:
+            model = models_by_id.get(operative_id)
+            if model is None:
+                continue
+            priority, label = self._setup_ai_role(model)
+            entry = {
+                "operative_id": operative_id,
+                "model_guid": model["guid"],
+                "model_name": model.get("name", ""),
+                "name": model.get("name", ""),
+                "profile_id": model.get("profile_id", ""),
+                "priority": priority,
+                "priority_label": label,
+                "deployed": operative_id in deployed,
+            }
+            try:
+                model_item = self._setup_operative_model_item(side, operative_id)
+                entry["recommended_position"] = self._setup_recommended_position(side, model_item)
+            except (KillTeamSetupError, KillTeamRuleError):
+                entry["recommended_position"] = None
+            deployment_order.append(entry)
+            if next_deployment is None and not entry["deployed"]:
+                next_deployment = copy.deepcopy(entry)
+
+        return {
+            "policy": (
+                "Use the listed AI selection order for roster cards and the listed AI deployment order for models. "
+                "Take the first outstanding entry in each list for the active stage."
+            ),
+            "selection_order": selection_order,
+            "deployment_order": deployment_order,
+            "next_selection": next_selection,
+            "next_deployment": next_deployment,
+        }
+
+    def setup(self, *, auto_start: bool = False) -> dict[str, Any]:
         objects = self._normalize_fixture_objects(self._list_objects())
         self._objects = {str(obj["guid"]): obj for obj in objects}
         metadata = {guid: _metadata(obj) for guid, obj in self._objects.items()}
+        side_objects = self._setup_side_objects() if self._fixture_profile is None else {}
+        setup_mode_enabled = self._setup_mode_enabled(side_objects)
+        if setup_mode_enabled:
+            initiative_side = _norm(self.config.initiative_side)
+            if initiative_side and initiative_side not in side_objects:
+                raise KillTeamSetupError("initiative_side does not match a tagged setup side")
+            self._setup_clean_start(side_objects)
 
         rollers = [guid for guid, meta in metadata.items() if meta.get("entity") == "dice_roller"]
         if len(rollers) != 1:
@@ -706,10 +2016,11 @@ class KillTeamRuntime:
                 "defense_dice": int(profile.get("defense_dice", 3)),
                 "profile": profile,
                 "statuses": [],
+                "order": "",
             }
 
         ai_ids = sorted(record["operative_id"] for record in operatives.values() if record["team"] == self.config.ai_team)
-        if not ai_ids:
+        if not ai_ids and not setup_mode_enabled:
             raise KillTeamSetupError("at least one AI operative is required")
         visible_opponents = [
             record["operative_id"]
@@ -829,6 +2140,37 @@ class KillTeamRuntime:
             deployment_subject = copy.deepcopy(deployment_candidates[0])
             visible_target = copy.deepcopy(target_candidates[0])
 
+        setup_state = None
+        if setup_mode_enabled:
+            initiative_side = _norm(self.config.initiative_side) or self.config.ai_team
+            setup_state = {
+                "mode": "roster_cards",
+                "stage": "roster_selection",
+                "initiative_side": initiative_side,
+                "current_side": initiative_side,
+                "current_batch_target": 0,
+                "current_batch_progress": 0,
+                "pending_side": None,
+                "pending_operative_id": None,
+                "pending_model_guid": None,
+                "sides": {
+                    side_id: {
+                        "side_id": side_id,
+                        "faction_decks_guid": mapping["faction_decks"],
+                        "roster_container_guid": mapping["roster"],
+                        "roster_list_zone_guid": mapping["roster_list_zone"],
+                        "deployed_zone_guid": mapping["deployed_zone"],
+                        "deployment_zone_guid": mapping["deployment"],
+                        "locked": False,
+                        "faction_id": "",
+                        "selected_operatives": {},
+                        "deployed_operatives": {},
+                        "batch_size": 0,
+                    }
+                    for side_id, mapping in side_objects.items()
+                },
+            }
+
         self._state = {
             "schema_version": 1,
             "status": "ready",
@@ -852,7 +2194,15 @@ class KillTeamRuntime:
             "counter_guids": counters,
             "units_per_inch": units_per_inch,
             "events": self._events,
+            "setup": setup_state,
         }
+        if setup_state is not None and auto_start:
+            self._setup_start_from_roster_models(setup_state)
+            self._state["revision"] += 1
+            self._record("setup.model_deployment_started", {
+                "initiative_side": setup_state["initiative_side"],
+                "batch_target": setup_state["current_batch_target"],
+            })
         self._record("setup.completed", {"ai_operatives": ai_ids, "visible_opponents": visible_opponents})
         result = {
             "status": "ready",
@@ -863,6 +2213,8 @@ class KillTeamRuntime:
             "map_revision": 0,
             "roller_guid": rollers[0],
         }
+        if setup_state is not None:
+            result["setup"] = self._setup_snapshot(self._state)
         if self._fixture_profile is not None:
             result.update({
                 "fixture_profile": self._fixture_profile.name,
@@ -889,7 +2241,7 @@ class KillTeamRuntime:
         }
         terrain = copy.deepcopy(state["terrain"])
         terrain_truncated = len(terrain) > 200
-        return {
+        result = {
             "schema_version": state["schema_version"],
             "revision": state["revision"],
             "observation_id": state["observation_id"],
@@ -905,6 +2257,677 @@ class KillTeamRuntime:
             "start_test_spot": copy.deepcopy(state.get("start_test_spot")),
             "truncated": self._listing_truncated or terrain_truncated,
         }
+        setup_snapshot = self._setup_snapshot(state)
+        if setup_snapshot is not None:
+            result["setup"] = setup_snapshot
+        return result
+
+    def _require_setup_state(self) -> dict[str, Any]:
+        state = self._require_state()
+        setup_state = state.get("setup")
+        if not isinstance(setup_state, dict):
+            raise KillTeamRuleError("semantic roster setup is not active")
+        return setup_state
+
+    def _setup_side_state(self, side_id: str) -> dict[str, Any]:
+        setup_state = self._require_setup_state()
+        side = setup_state["sides"].get(_norm(side_id))
+        if not isinstance(side, dict):
+            raise KillTeamRuleError(f"unknown setup side {side_id}")
+        return side
+
+    @staticmethod
+    def _setup_live_operative_id(side_id: str, operative_id: str) -> str:
+        return f"{_norm(side_id)}:{operative_id}"
+
+    def _setup_operative_model_item(
+        self,
+        side: dict[str, Any],
+        operative_id: str,
+    ) -> dict[str, Any]:
+        model_items = [
+            self._setup_model_from_container_item(item)
+            for item in self._setup_container_items(side["roster_container_guid"])
+        ]
+        matches = [item for item in model_items if item["operative_id"] == operative_id]
+        if len(matches) != 1:
+            raise KillTeamRuleError(
+                f"roster container must contain exactly one undeployed model for {operative_id}"
+            )
+        return matches[0]
+
+    def _setup_operative_model_item_by_guid(
+        self,
+        side: dict[str, Any],
+        model_guid: str,
+    ) -> dict[str, Any]:
+        model_items = [
+            self._setup_model_from_container_item(item)
+            for item in self._setup_container_items(side["roster_container_guid"])
+        ]
+        matches = [item for item in model_items if _norm(item["guid"]) == _norm(model_guid)]
+        if len(matches) != 1:
+            raise KillTeamRuleError(
+                f"roster container must contain exactly one undeployed model with guid {model_guid}"
+            )
+        return matches[0]
+
+    def _initiative_dice_guid(self, side_id: str) -> str:
+        state = self._require_state()
+        if side_id == self.config.ai_team:
+            team = self.config.ai_team
+        elif side_id == "opponent":
+            team = "opponent"
+        else:
+            team = side_id
+        dice = list(state["dice_by_team"].get(team, []))
+        if not dice:
+            raise KillTeamRuleError(f"no initiative die is available for side {side_id}")
+        return str(dice[0])
+
+    def _setup_update_turn_after_success(self, setup_state: dict[str, Any], side: dict[str, Any]) -> None:
+        side["pending_operative_id"] = None
+        setup_state["pending_side"] = None
+        setup_state["pending_operative_id"] = None
+        setup_state["pending_model_guid"] = None
+        setup_state["current_batch_progress"] += 1
+
+        all_complete = all(
+            len(item["deployed_operatives"]) >= len(item["selected_operatives"])
+            for item in setup_state["sides"].values()
+        )
+        if all_complete:
+            setup_state["stage"] = "complete"
+            setup_state["current_side"] = None
+            setup_state["current_batch_target"] = 0
+            setup_state["current_batch_progress"] = 0
+            return
+
+        side_remaining = len(side["selected_operatives"]) - len(side["deployed_operatives"])
+        if setup_state["current_batch_progress"] < setup_state["current_batch_target"] and side_remaining > 0:
+            return
+
+        ordered_sides = list(setup_state["sides"].keys())
+        current_index = ordered_sides.index(setup_state["current_side"])
+        next_side = None
+        for offset in range(1, len(ordered_sides) + 1):
+            candidate = ordered_sides[(current_index + offset) % len(ordered_sides)]
+            candidate_side = setup_state["sides"][candidate]
+            remaining = len(candidate_side["selected_operatives"]) - len(candidate_side["deployed_operatives"])
+            if remaining > 0:
+                next_side = candidate
+                break
+        if next_side is None:
+            setup_state["stage"] = "complete"
+            setup_state["current_side"] = None
+            setup_state["current_batch_target"] = 0
+            setup_state["current_batch_progress"] = 0
+            return
+        next_state = setup_state["sides"][next_side]
+        remaining = len(next_state["selected_operatives"]) - len(next_state["deployed_operatives"])
+        setup_state["current_side"] = next_side
+        setup_state["current_batch_target"] = min(int(next_state["batch_size"]), remaining)
+        setup_state["current_batch_progress"] = 0
+
+    def _operative_record_from_live_object(self, obj: dict[str, Any]) -> dict[str, Any]:
+        metadata = _metadata(obj)
+        operative_id = str(metadata.get("operative_id") or "").strip()
+        team = _norm(metadata.get("team") or metadata.get("side_id"))
+        if not operative_id or not team:
+            raise KillTeamSetupError("live operative is missing operative_id or team metadata")
+        profile = _profile(obj)
+        return {
+            "operative_id": operative_id,
+            "guid": str(obj["guid"]),
+            "team": team,
+            "name": obj.get("name"),
+            "description": obj.get("description", ""),
+            "type": obj.get("type"),
+            "tags": copy.deepcopy(obj.get("tags", [])),
+            "bounds": copy.deepcopy(obj.get("bounds")),
+            "profile_id": metadata.get("profile", ""),
+            "position": _position(obj),
+            "max_wounds": int(profile["wounds"]),
+            "wounds": int(profile["wounds"]),
+            "ap": 0,
+            "save": int(profile["save"]),
+            "defense_dice": int(profile.get("defense_dice", 3)),
+            "profile": profile,
+            "statuses": [],
+            "order": "",
+        }
+
+    def _deployment_legality(
+        self,
+        side: dict[str, Any],
+        obj: dict[str, Any],
+    ) -> None:
+        deployment_bounds = self._setup_zone_bounds(side["deployment_zone_guid"])
+        model_bounds = _bounds(obj)
+        if model_bounds is None:
+            raise KillTeamRuleError("deployed model is missing bounds")
+        if not _rect_contains_rect(deployment_bounds, model_bounds):
+            raise KillTeamRuleError("deployment position is not wholly within the side deployment zone")
+        for other_guid, other in self._objects.items():
+            if other_guid == str(obj.get("guid")):
+                continue
+            if _norm(_metadata(other).get("entity")) != "operative":
+                continue
+            other_bounds = _bounds(other)
+            if other_bounds is None:
+                continue
+            if _rects_overlap(model_bounds, other_bounds):
+                raise KillTeamRuleError(f"deployment position overlaps operative {other_guid}")
+
+    def _complete_setup_deployment(
+        self,
+        side_id: str,
+        operative_id: str,
+        obj: dict[str, Any],
+    ) -> dict[str, Any]:
+        state = self._require_state()
+        setup_state = self._require_setup_state()
+        side = self._setup_side_state(side_id)
+        operative = self._operative_record_from_live_object(obj)
+        semantic_operative_id = self._setup_live_operative_id(side_id, operative_id)
+        operative["operative_id"] = semantic_operative_id
+        operative["order"] = "conceal"
+        state["operatives"][semantic_operative_id] = operative
+        side["deployed_operatives"][operative_id] = {
+            "operative_id": operative_id,
+            "semantic_operative_id": semantic_operative_id,
+            "guid": operative["guid"],
+        }
+        state["revision"] += 1
+        self._setup_update_turn_after_success(setup_state, side)
+        self._record(
+            "setup.operative_deployed",
+            {
+                "side_id": side_id,
+                "operative_id": operative_id,
+                "semantic_operative_id": semantic_operative_id,
+                "guid": operative["guid"],
+                "model_guid": operative["guid"],
+                "position": operative["position"],
+            },
+        )
+        return {
+            "status": "deployed",
+            "side_id": side_id,
+            "operative_id": operative_id,
+            "semantic_operative_id": semantic_operative_id,
+            "guid": operative["guid"],
+            "model_guid": operative["guid"],
+            "position": copy.deepcopy(operative["position"]),
+            "revision": state["revision"],
+        }
+
+    def select_roster_card(
+        self,
+        contained_guid: str,
+        *,
+        action_id: str | None = None,
+    ) -> dict[str, Any]:
+        replay = self._replay_or_reject(action_id)
+        if replay is not None:
+            return replay
+        state = self._require_state()
+        setup_state = self._require_setup_state()
+        if setup_state["stage"] != "roster_selection":
+            raise KillTeamRuleError("roster selection is already locked")
+        side = self._setup_side_state(self.config.ai_team)
+        deck_items = self._setup_container_items(side["faction_decks_guid"])
+        candidate_item = next(
+            (item for item in deck_items if _norm(item.get("guid")) == _norm(contained_guid)),
+            None,
+        )
+        if candidate_item is None:
+            raise KillTeamRuleError(f"unknown roster card {contained_guid}")
+        candidate = self._setup_card_from_container_item(candidate_item)
+        if candidate["side_id"] != self.config.ai_team:
+            raise KillTeamRuleError("only the AI side can be selected semantically")
+        current_cards = self._setup_selected_cards(side["roster_list_zone_guid"])
+        self._validate_partial_setup_cards([*current_cards, candidate])
+        target = self._setup_zone_center(side["roster_list_zone_guid"])
+        try:
+            taken = self.bridge.take_from_container(
+                side["faction_decks_guid"],
+                item_guid=candidate["guid"],
+                position=target,
+                smooth=False,
+            )
+        except Exception as exc:
+            self._mark_uncertain(action_id)
+            raise KillTeamUncertainCommit("roster card selection commit is uncertain") from exc
+        taken_object = taken.get("object", {}) if isinstance(taken, dict) else {}
+        if not isinstance(taken_object, dict):
+            self._mark_uncertain(action_id)
+            raise KillTeamUncertainCommit("roster card selection returned an invalid object")
+        selected = self._setup_card_from_object(taken_object)
+        state["revision"] += 1
+        self._record(
+            "setup.roster_card_selected",
+            {
+                "side_id": self.config.ai_team,
+                "operative_id": selected["operative_id"],
+                "guid": selected["guid"],
+            },
+        )
+        result = {
+            "status": "selected",
+            "side_id": self.config.ai_team,
+            "operative_id": selected["operative_id"],
+            "guid": selected["guid"],
+            "selected_count": len(current_cards) + 1,
+            "revision": state["revision"],
+        }
+        return self._recorded_result(action_id, result)
+
+    def roll_initiative(self, *, action_id: str | None = None) -> dict[str, Any]:
+        replay = self._replay_or_reject(action_id)
+        if replay is not None:
+            return replay
+        state = self._require_state()
+        setup_state = self._require_setup_state()
+        if setup_state["stage"] not in {"initiative", "roster_selection"}:
+            raise KillTeamRuleError("initiative can only be determined before roster lock")
+        if setup_state["stage"] == "roster_selection" and setup_state["initiative_side"]:
+            raise KillTeamRuleError("initiative has already been determined")
+        ai_die = self._initiative_dice_guid(self.config.ai_team)
+        opponent_side_id = next(
+            side_id for side_id in setup_state["sides"].keys() if side_id != self.config.ai_team
+        )
+        opponent_die = self._initiative_dice_guid(opponent_side_id)
+        try:
+            ai_roll = self.bridge.roll_dice(
+                team=self.config.ai_team,
+                dice_guids=[ai_die],
+                roller_guid=state["roller_guid"],
+                purpose="initiative",
+            )
+            opponent_roll = self.bridge.roll_dice(
+                team="opponent",
+                dice_guids=[opponent_die],
+                roller_guid=state["roller_guid"],
+                purpose="initiative",
+            )
+        except Exception as exc:
+            self._mark_uncertain(action_id)
+            raise KillTeamUncertainCommit("initiative roll commit is uncertain") from exc
+        try:
+            ai_faces = [int(face) for face in list(ai_roll.get("faces", []))]
+            opponent_faces = [int(face) for face in list(opponent_roll.get("faces", []))]
+        except (AttributeError, TypeError, ValueError) as exc:
+            self._mark_uncertain(action_id)
+            raise KillTeamUncertainCommit("initiative roll returned invalid faces") from exc
+        if len(ai_faces) != 1 or len(opponent_faces) != 1:
+            self._mark_uncertain(action_id)
+            raise KillTeamUncertainCommit("initiative roll did not return exactly one face per side")
+        initiative_side = ""
+        if ai_faces[0] > opponent_faces[0]:
+            initiative_side = self.config.ai_team
+        elif opponent_faces[0] > ai_faces[0]:
+            initiative_side = opponent_side_id
+        setup_state["initiative_side"] = initiative_side
+        setup_state["stage"] = "roster_selection" if initiative_side else "initiative"
+        setup_state["current_side"] = initiative_side or None
+        state["revision"] += 1
+        self._record(
+            "setup.initiative_rolled",
+            {
+                "initiative_side": initiative_side,
+                "ai_roll": ai_faces,
+                "opponent_roll": opponent_faces,
+            },
+        )
+        result = {
+            "status": "resolved" if initiative_side else "tied",
+            "initiative_side": initiative_side,
+            "ai_roll": ai_faces,
+            "opponent_roll": opponent_faces,
+            "revision": state["revision"],
+        }
+        return self._recorded_result(action_id, result)
+
+    def lock_rosters(self, *, action_id: str | None = None) -> dict[str, Any]:
+        replay = self._replay_or_reject(action_id)
+        if replay is not None:
+            return replay
+        state = self._require_state()
+        setup_state = self._require_setup_state()
+        if setup_state["stage"] != "roster_selection":
+            raise KillTeamRuleError("rosters are already locked")
+        for side_id, side in setup_state["sides"].items():
+            cards = self._setup_selected_cards(side["roster_list_zone_guid"])
+            profile, faction_id = self._validate_locked_setup_cards(cards)
+            selected = {card["operative_id"]: copy.deepcopy(card) for card in cards}
+            for operative_id in selected:
+                self._setup_operative_model_item(side, operative_id)
+            side["locked"] = True
+            side["faction_id"] = faction_id
+            side["selected_operatives"] = selected
+            side["deployed_operatives"] = {}
+            # Kill Team setup uses the integer third of each team. A one- or
+            # two-model team still needs a deployment pass.
+            side["batch_size"] = max(1, len(selected) // 3)
+        setup_state["stage"] = "deployment"
+        setup_state["current_side"] = setup_state["initiative_side"]
+        initiative_side = setup_state["sides"][setup_state["current_side"]]
+        setup_state["current_batch_target"] = min(
+            int(initiative_side["batch_size"]),
+            len(initiative_side["selected_operatives"]),
+        )
+        setup_state["current_batch_progress"] = 0
+        state["revision"] += 1
+        self._record(
+            "setup.rosters_locked",
+            {
+                "initiative_side": setup_state["initiative_side"],
+                "batch_target": setup_state["current_batch_target"],
+            },
+        )
+        result = {
+            "status": "locked",
+            "revision": state["revision"],
+            "setup": self._setup_snapshot(state),
+        }
+        return self._recorded_result(action_id, result)
+
+    def start_setup_deployment(
+        self,
+        operative_id: str,
+        *,
+        action_id: str | None = None,
+    ) -> dict[str, Any]:
+        replay = self._replay_or_reject(action_id)
+        if replay is not None:
+            return replay
+        state = self._require_state()
+        setup_state = self._require_setup_state()
+        if setup_state["stage"] != "deployment":
+            raise KillTeamRuleError("setup deployment is not active")
+        if setup_state["current_side"] != self.config.ai_team:
+            raise KillTeamRuleError("it is not the AI side's deployment pass")
+        if setup_state["pending_operative_id"]:
+            raise KillTeamRuleError("another setup operative is already pending deployment")
+        side = self._setup_side_state(self.config.ai_team)
+        if operative_id in side["deployed_operatives"]:
+            raise KillTeamRuleError(f"operative {operative_id} is already deployed")
+        if operative_id not in side["selected_operatives"]:
+            raise KillTeamRuleError(f"operative {operative_id} is not in the locked roster list")
+        model_item = self._setup_operative_model_item(side, operative_id)
+        recommended_position = self._setup_recommended_position(side, model_item)
+        if setup_state.get("mode") == "model_deployment":
+            setup_state["pending_side"] = self.config.ai_team
+            setup_state["pending_operative_id"] = operative_id
+            setup_state["pending_model_guid"] = model_item["guid"]
+            side["pending_operative_id"] = operative_id
+            state["revision"] += 1
+            self._record("setup.deployment_started", {
+                "side_id": self.config.ai_team,
+                "operative_id": operative_id,
+                "model_guid": model_item["guid"],
+                "recommended_position": recommended_position,
+            })
+            return self._recorded_result(action_id, {
+                "status": "pending_model",
+                "side_id": self.config.ai_team,
+                "operative_id": operative_id,
+                "model_guid": model_item["guid"],
+                "recommended_position": recommended_position,
+                "revision": state["revision"],
+            })
+        roster_cards = self._setup_selected_cards(side["roster_list_zone_guid"])
+        match = next((card for card in roster_cards if card["operative_id"] == operative_id), None)
+        if match is None:
+            raise KillTeamRuleError(f"operative {operative_id} is not currently in the roster list zone")
+        target = self._setup_zone_center(side["deployed_zone_guid"])
+        try:
+            self.bridge.move_object(match["guid"], target)
+            actual = self.bridge.get_object(match["guid"])
+        except Exception as exc:
+            self._mark_uncertain(action_id)
+            raise KillTeamUncertainCommit("setup card movement commit is uncertain") from exc
+        moved = self._setup_card_from_object(actual)
+        setup_state["pending_side"] = self.config.ai_team
+        setup_state["pending_operative_id"] = operative_id
+        setup_state["pending_model_guid"] = model_item["guid"]
+        side["pending_operative_id"] = operative_id
+        state["revision"] += 1
+        self._record(
+            "setup.deployment_started",
+            {
+                "side_id": self.config.ai_team,
+                "operative_id": operative_id,
+                "guid": moved["guid"],
+                "model_guid": model_item["guid"],
+            },
+        )
+        result = {
+            "status": "pending_model",
+            "side_id": self.config.ai_team,
+            "operative_id": operative_id,
+            "guid": moved["guid"],
+            "model_guid": model_item["guid"],
+            "recommended_position": recommended_position,
+            "revision": state["revision"],
+        }
+        return self._recorded_result(action_id, result)
+
+    def deploy_setup_operative(
+        self,
+        model_guid: str,
+        position: dict[str, float],
+        *,
+        action_id: str | None = None,
+        verification_tolerance: float = 0.05,
+    ) -> dict[str, Any]:
+        replay = self._replay_or_reject(action_id)
+        if replay is not None:
+            return replay
+        if verification_tolerance <= 0:
+            raise KillTeamRuleError("deployment verification tolerance must be positive")
+        state = self._require_state()
+        setup_state = self._require_setup_state()
+        if setup_state["current_side"] != self.config.ai_team:
+            raise KillTeamRuleError("it is not the AI side's deployment pass")
+        side = self._setup_side_state(self.config.ai_team)
+        target = {axis: _number(position.get(axis, 0), f"position.{axis}") for axis in ("x", "y", "z")}
+        model_item = self._setup_operative_model_item_by_guid(side, model_guid)
+        operative_id = model_item["operative_id"]
+        if setup_state["pending_operative_id"] != operative_id:
+            raise KillTeamRuleError(f"model {model_guid} is not the pending deployment")
+        pending_model_guid = _norm(str(setup_state.get("pending_model_guid") or ""))
+        if pending_model_guid and pending_model_guid != _norm(model_guid):
+            raise KillTeamRuleError(f"model {model_guid} is not the pending deployment")
+        try:
+            taken = self.bridge.take_from_container(
+                side["roster_container_guid"],
+                item_guid=model_item["guid"],
+                position=target,
+                smooth=False,
+            )
+        except Exception as exc:
+            self._mark_uncertain(action_id)
+            raise KillTeamUncertainCommit("setup operative deployment commit is uncertain") from exc
+        live = taken.get("object", {}) if isinstance(taken, dict) else {}
+        if not isinstance(live, dict):
+            self._mark_uncertain(action_id)
+            raise KillTeamUncertainCommit("setup operative deployment returned an invalid object")
+        try:
+            actual = self.bridge.get_object(str(live.get("guid") or ""))
+            actual_position = _position(actual)
+        except Exception as exc:
+            self._mark_uncertain(action_id)
+            raise KillTeamUncertainCommit("setup operative deployment readback is invalid") from exc
+        if any(abs(actual_position[axis] - target[axis]) > verification_tolerance for axis in ("x", "y", "z")):
+            self._mark_uncertain(action_id)
+            raise KillTeamUncertainCommit("setup operative deployment did not verify")
+        try:
+            self._refresh()
+            actual = self._objects[str(live["guid"])]
+            self._deployment_legality(side, actual)
+        except KillTeamRuleError:
+            try:
+                self.bridge.put_object_into_container(side["roster_container_guid"], str(live["guid"]))
+                self._refresh()
+            except Exception as exc:
+                self._mark_uncertain(action_id)
+                raise KillTeamUncertainCommit("illegal deployment could not be rolled back safely") from exc
+            raise
+        result = self._complete_setup_deployment(self.config.ai_team, operative_id, actual)
+        return self._recorded_result(action_id, result)
+
+    def rollback_pending_deployment(self, *, action_id: str | None = None) -> dict[str, Any]:
+        replay = self._replay_or_reject(action_id)
+        if replay is not None:
+            return replay
+        state = self._require_state()
+        setup_state = self._require_setup_state()
+        side_id = str(setup_state.get("pending_side") or "")
+        operative_id = str(setup_state.get("pending_operative_id") or "")
+        if not side_id or not operative_id:
+            raise KillTeamRuleError("no setup deployment is pending")
+        side = self._setup_side_state(side_id)
+        if setup_state.get("mode") == "model_deployment":
+            # Model deployment does not move a roster card before placement;
+            # rollback only clears the pending reservation.
+            side["pending_operative_id"] = None
+            setup_state["pending_side"] = None
+            setup_state["pending_operative_id"] = None
+            setup_state["pending_model_guid"] = None
+            state["revision"] += 1
+            self._record("setup.deployment_rolled_back", {"side_id": side_id, "operative_id": operative_id})
+            result = {
+                "status": "rolled_back",
+                "side_id": side_id,
+                "operative_id": operative_id,
+                "revision": state["revision"],
+            }
+            return self._recorded_result(action_id, result)
+        deployed_cards = self._setup_selected_cards(side["deployed_zone_guid"])
+        match = next((card for card in deployed_cards if card["operative_id"] == operative_id), None)
+        if match is None:
+            raise KillTeamRuleError("pending deployment card is not in the deployed zone")
+        target = self._setup_zone_center(side["roster_list_zone_guid"])
+        try:
+            self.bridge.move_object(match["guid"], target)
+        except Exception as exc:
+            self._mark_uncertain(action_id)
+            raise KillTeamUncertainCommit("pending deployment rollback is uncertain") from exc
+        side["pending_operative_id"] = None
+        setup_state["pending_side"] = None
+        setup_state["pending_operative_id"] = None
+        setup_state["pending_model_guid"] = None
+        state["revision"] += 1
+        self._record("setup.deployment_rolled_back", {"side_id": side_id, "operative_id": operative_id})
+        result = {
+            "status": "rolled_back",
+            "side_id": side_id,
+            "operative_id": operative_id,
+            "revision": state["revision"],
+        }
+        return self._recorded_result(action_id, result)
+
+    def reconcile_setup_step(
+        self,
+        side_id: str,
+        *,
+        action_id: str | None = None,
+    ) -> dict[str, Any]:
+        replay = self._replay_or_reject(action_id)
+        if replay is not None:
+            return replay
+        setup_state = self._require_setup_state()
+        side_id = _norm(side_id)
+        if setup_state["stage"] != "deployment":
+            raise KillTeamRuleError("setup deployment is not active")
+        if setup_state["current_side"] != side_id:
+            raise KillTeamRuleError(f"it is not {side_id}'s deployment pass")
+        side = self._setup_side_state(side_id)
+        if not side["locked"]:
+            raise KillTeamRuleError(f"side {side_id} does not have a locked roster list")
+        self._refresh()
+        deployed_cards = self._setup_selected_cards(side["deployed_zone_guid"])
+        pending_cards = [
+            card for card in deployed_cards if card["operative_id"] not in side["deployed_operatives"]
+        ]
+        if not pending_cards:
+            deployment_bounds = self._setup_zone_bounds(side["deployment_zone_guid"])
+            pending_models = []
+            for obj in self._objects.values():
+                metadata = _metadata(obj)
+                if (
+                    _norm(metadata.get("entity")) != "operative"
+                    or _norm(metadata.get("side_id") or metadata.get("team")) != side_id
+                ):
+                    continue
+                operative_id = str(metadata.get("operative_id") or "").strip()
+                if not operative_id or operative_id not in side["selected_operatives"]:
+                    continue
+                if operative_id in side["deployed_operatives"]:
+                    continue
+                model_bounds = _bounds(obj)
+                if model_bounds is not None and _rect_contains_rect(deployment_bounds, model_bounds):
+                    pending_models.append((operative_id, obj))
+            if not pending_models:
+                return {
+                    "status": "waiting_for_model",
+                    "side_id": side_id,
+                    "batch_target": int(setup_state.get("current_batch_target", 0)),
+                    "batch_progress": int(setup_state.get("current_batch_progress", 0)),
+                }
+            remaining_batch = max(
+                0,
+                int(setup_state.get("current_batch_target", 0))
+                - int(setup_state.get("current_batch_progress", 0)),
+            )
+            if len(pending_models) > remaining_batch:
+                raise KillTeamRuleError(
+                    f"human side placed {len(pending_models)} models, but only {remaining_batch} remain in this setup batch"
+                )
+            pending_models.sort(key=lambda item: (item[1].get("position", {}).get("z", 0), item[1].get("position", {}).get("x", 0), item[0]))
+            results = []
+            for operative_id, model in pending_models:
+                self._deployment_legality(side, model)
+                setup_state["pending_side"] = side_id
+                setup_state["pending_operative_id"] = operative_id
+                setup_state["pending_model_guid"] = str(model.get("guid") or "")
+                side["pending_operative_id"] = operative_id
+                results.append(self._complete_setup_deployment(side_id, operative_id, model))
+            result = copy.deepcopy(results[-1])
+            result["deployed_count"] = len(results)
+            result["batch_complete"] = setup_state.get("current_side") != side_id
+            return self._recorded_result(action_id, result)
+        if len(pending_cards) > 1:
+            raise KillTeamRuleError("only one setup card may be pending deployment at a time")
+        pending = pending_cards[0]
+        setup_state["pending_side"] = side_id
+        setup_state["pending_operative_id"] = pending["operative_id"]
+        side["pending_operative_id"] = pending["operative_id"]
+        try:
+            setup_state["pending_model_guid"] = self._setup_operative_model_item(side, pending["operative_id"])["guid"]
+        except Exception:
+            setup_state["pending_model_guid"] = None
+        matching = [
+            obj
+            for obj in self._objects.values()
+            if _norm(_metadata(obj).get("entity")) == "operative"
+            and str(_metadata(obj).get("operative_id") or "").strip() == pending["operative_id"]
+            and _norm(_metadata(obj).get("side_id") or _metadata(obj).get("team")) == side_id
+        ]
+        if not matching:
+            return {
+                "status": "waiting_for_model",
+                "side_id": side_id,
+                "operative_id": pending["operative_id"],
+                "model_guid": setup_state.get("pending_model_guid"),
+            }
+        if len(matching) != 1:
+            raise KillTeamRuleError(f"deployment model identity is ambiguous for {pending['operative_id']}")
+        self._deployment_legality(side, matching[0])
+        result = self._complete_setup_deployment(side_id, pending["operative_id"], matching[0])
+        return self._recorded_result(action_id, result)
 
     def get_roster(self) -> dict[str, Any]:
         """Return bounded contents of the dedicated AI roster container."""
@@ -967,9 +2990,19 @@ class KillTeamRuntime:
             raise KillTeamRuleError(f"operative {operative_id} is not visible")
         return record
 
+    def _operative_by_guid(self, guid: str, *, visible: bool = True) -> tuple[str, dict[str, Any]]:
+        state = self._require_state()
+        ref = _norm(guid)
+        for operative_id, candidate in state["operatives"].items():
+            if _norm(candidate["guid"]) == ref:
+                if visible and candidate["team"] != self.config.ai_team and operative_id not in self._visible_operatives():
+                    raise KillTeamRuleError(f"operative {guid} is not visible")
+                return operative_id, candidate
+        raise KillTeamRuleError(f"unknown operative {guid}")
+
     def place_operative(
         self,
-        operative_id: str,
+        guid: str,
         path: list[dict[str, float]],
         *,
         action_id: str | None = None,
@@ -983,7 +3016,7 @@ class KillTeamRuntime:
             raise KillTeamRuleError("placement path is required")
         if verification_tolerance <= 0:
             raise KillTeamRuleError("placement verification tolerance must be positive")
-        operative = self._operative(operative_id, visible=False)
+        operative_id, operative = self._operative_by_guid(guid, visible=False)
         if operative["team"] != self.config.ai_team:
             raise KillTeamRuleError("only the AI can place its own operative")
         previous = operative["position"]
@@ -1014,8 +3047,211 @@ class KillTeamRuntime:
             raise KillTeamUncertainCommit("operative placement did not verify")
         operative["position"] = actual_position
         state["revision"] += 1
-        self._record("operative.placed", {"operative_id": operative_id, "position": actual_position})
-        return self._recorded_result(action_id, {"status": "verified", "operative_id": operative_id, "position": actual_position, "revision": state["revision"]})
+        self._record("operative.placed", {"operative_id": operative_id, "guid": operative["guid"], "position": actual_position})
+        return self._recorded_result(action_id, {
+            "status": "verified",
+            "operative_id": operative_id,
+            "guid": operative["guid"],
+            "position": actual_position,
+            "revision": state["revision"],
+        })
+
+    def plan_objective_move(
+        self,
+        operative_id: str,
+        *,
+        action_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Plan a bounded objective-control move and return a MOVE command target."""
+        replay = self._replay_or_reject(action_id)
+        if replay is not None:
+            return replay
+        state = self._require_state()
+        self.observe()
+        operative = self._operative(operative_id, visible=False)
+        if operative["team"] != self.config.ai_team:
+            raise KillTeamRuleError("only the AI can plan an objective-control move for its own operative")
+
+        objective_objects = [
+            {
+                "guid": guid,
+                "name": str(obj.get("name") or ""),
+                "position": _position(obj),
+                "bounds": _bounds(obj),
+            }
+            for guid, obj in self._objects.items()
+            if _norm(_metadata(obj).get("entity")) == "objective" and _bounds(obj) is not None
+        ]
+        if not objective_objects:
+            raise KillTeamRuleError("no mission objectives are available")
+
+        current = operative["position"]
+        live_object = self._objects.get(operative["guid"], {})
+        model_bounds = _bounds(live_object)
+        if model_bounds is None:
+            model_bounds = _bounds(operative)
+        if model_bounds is None:
+            raise KillTeamRuleError("the operative is missing usable bounds")
+        model_half_x = max(0.1, (model_bounds[1] - model_bounds[0]) / 2)
+        model_half_z = max(0.1, (model_bounds[3] - model_bounds[2]) / 2)
+
+        combat_zone_bounds = None
+        combat_zone_guid = str(state.get("combat_zone_guid") or "").strip()
+        if combat_zone_guid and combat_zone_guid in self._objects:
+            combat_zone_bounds = _bounds(self._objects[combat_zone_guid])
+
+        blockers: list[dict[str, Any]] = []
+        for guid, obj in self._objects.items():
+            if guid == operative["guid"]:
+                continue
+            entity = _norm(_metadata(obj).get("entity"))
+            if entity not in {"terrain", "objective", "operative"}:
+                continue
+            bounds = _bounds(obj)
+            if bounds is None:
+                continue
+            blockers.append({
+                "guid": guid,
+                "entity": entity,
+                "bounds": bounds,
+                "position": _position(obj),
+                "name": str(obj.get("name") or ""),
+            })
+
+        enemies = [
+            {
+                "operative_id": record["operative_id"],
+                "guid": record["guid"],
+                "position": copy.deepcopy(record["position"]),
+                "name": str(record.get("name") or ""),
+            }
+            for record in self._visible_operatives().values()
+            if record["team"] != self.config.ai_team and int(record.get("wounds", 0)) > 0
+        ]
+
+        move_range = float(operative["profile"]["move"]) * float(state["units_per_inch"])
+        grid_step = 0.5
+        max_steps = max(1, int(math.ceil(move_range / grid_step)))
+
+        def candidate_rect(x: float, z: float) -> tuple[float, float, float, float]:
+            return (x - model_half_x, x + model_half_x, z - model_half_z, z + model_half_z)
+
+        def candidate_is_legal(x: float, z: float) -> bool:
+            rect = candidate_rect(x, z)
+            if combat_zone_bounds is not None and not _rect_contains_rect(combat_zone_bounds, rect):
+                return False
+            for blocker in blockers:
+                if _rects_overlap(rect, blocker["bounds"]):
+                    return False
+            return True
+
+        def candidate_summary(objective: dict[str, Any], x: float, z: float, *, contestable: bool) -> dict[str, Any]:
+            position = {"x": x, "y": current["y"], "z": z}
+            objective_position = objective["position"]
+            exposure = 0
+            cover_score = 0
+            for enemy in enemies:
+                blocked_by = 0
+                for blocker in blockers:
+                    if blocker["guid"] == enemy["guid"]:
+                        continue
+                    if _segment_intersects_rect(position, enemy["position"], blocker["bounds"]):
+                        blocked_by += 1
+                if blocked_by == 0:
+                    exposure += 1
+                cover_score += blocked_by
+            path_distance = math.hypot(x - current["x"], z - current["z"])
+            objective_distance = math.hypot(x - objective_position["x"], z - objective_position["z"])
+            return {
+                "objective": copy.deepcopy(objective),
+                "target_position": position,
+                "contestable": contestable,
+                "exposure": exposure,
+                "cover_score": cover_score,
+                "path_distance": path_distance,
+                "objective_distance": objective_distance,
+                "score_contest": (exposure, -cover_score, path_distance, objective_distance, x, z),
+                "score_staging": (exposure, -cover_score, objective_distance, path_distance, x, z),
+            }
+
+        objective_plans: list[dict[str, Any]] = []
+        for objective in objective_objects:
+            objective_bounds = objective["bounds"]
+            assert objective_bounds is not None
+            objective_center = _rect_center(objective_bounds)
+            objective_radius = max(
+                (objective_bounds[1] - objective_bounds[0]) / 2,
+                (objective_bounds[3] - objective_bounds[2]) / 2,
+            )
+            contest_radius = objective_radius + max(model_half_x, model_half_z) + 0.5
+            contestable_candidates: list[dict[str, Any]] = []
+            staging_candidates: list[dict[str, Any]] = []
+            for ix in range(-max_steps, max_steps + 1):
+                x = current["x"] + (ix * grid_step)
+                for iz in range(-max_steps, max_steps + 1):
+                    z = current["z"] + (iz * grid_step)
+                    if math.hypot(x - current["x"], z - current["z"]) > move_range + 1e-6:
+                        continue
+                    if not candidate_is_legal(x, z):
+                        continue
+                    objective_distance = math.hypot(x - objective_center["x"], z - objective_center["z"])
+                    if objective_distance > contest_radius + 1e-6:
+                        staging_candidates.append(candidate_summary(objective, x, z, contestable=False))
+                        continue
+                    summary = candidate_summary(objective, x, z, contestable=True)
+                    contestable_candidates.append(summary)
+                    staging_candidates.append(summary)
+
+            best_contestable = min(contestable_candidates, key=lambda item: item["score_contest"]) if contestable_candidates else None
+            best_staging = min(staging_candidates, key=lambda item: item["score_staging"]) if staging_candidates else None
+            objective_plans.append({
+                "objective": objective,
+                "objective_distance": math.hypot(current["x"] - objective_center["x"], current["z"] - objective_center["z"]),
+                "best_contestable": best_contestable,
+                "best_staging": best_staging,
+            })
+
+        contestable_plans = [plan for plan in objective_plans if plan["best_contestable"] is not None]
+        if contestable_plans:
+            selected_plan = min(
+                contestable_plans,
+                key=lambda plan: (
+                    plan["best_contestable"]["score_contest"],
+                    plan["objective_distance"],
+                    str(plan["objective"]["guid"]),
+                ),
+            )
+            selected_candidate = copy.deepcopy(selected_plan["best_contestable"])
+            mode = "contest"
+        else:
+            selected_plan = min(
+                objective_plans,
+                key=lambda plan: (
+                    plan["objective_distance"],
+                    str(plan["objective"]["guid"]),
+                ),
+            )
+            if selected_plan["best_staging"] is None:
+                raise KillTeamRuleError("no legal tactical staging point could be found")
+            selected_candidate = copy.deepcopy(selected_plan["best_staging"])
+            mode = "staging"
+
+        target_position = copy.deepcopy(selected_candidate["target_position"])
+        move_command = f"MOVE[{operative['guid']},{target_position['x']},{target_position['y']},{target_position['z']}]"
+        result = {
+            "status": "planned",
+            "mode": mode,
+            "operative_id": operative_id,
+            "guid": operative["guid"],
+            "move_command": move_command,
+            "target_position": target_position,
+            "objective": copy.deepcopy(selected_plan["objective"]),
+            "selection": selected_candidate,
+            "objective_count": len(objective_objects),
+            "planned_objective_count": len(objective_plans),
+            "revision": state["revision"],
+        }
+        return self._recorded_result(action_id, result)
 
     def deploy_test_model(self, *, action_id: str | None = None) -> dict[str, Any]:
         """Move the named test model to the tagged deployment zone without setup."""
@@ -1025,12 +3261,7 @@ class KillTeamRuntime:
         model_name = "Plague Marine Warrior"
         target_tag = "_deployment_zone_blue"
         try:
-            snapshot = self.bridge.list_objects(
-                max_results=2,
-                compact=True,
-                query_names=[model_name],
-                query_tags=[target_tag],
-            )
+            snapshot = self.bridge.list_objects(max_results=1000, compact=True)
         except Exception as exc:
             raise KillTeamSetupError("test deployment objects could not be inspected") from exc
         objects = snapshot.get("objects", []) if isinstance(snapshot, dict) else []
@@ -1227,14 +3458,14 @@ class KillTeamRuntime:
         if not attacker_id or not target_id or not isinstance(snap_position, dict):
             raise KillTeamSetupError("Save 131 validation roles are incomplete")
 
+        attacker = self._operative(attacker_id, visible=False)
         placement_action_id = f"{action_id}:placement" if action_id else None
         placement = self.place_operative(
-            attacker_id,
+            attacker["guid"],
             [copy.deepcopy(snap_position)],
             action_id=placement_action_id,
         )
         self.activate_operative(attacker_id)
-        attacker = self._operative(attacker_id, visible=False)
         target = self._operative(target_id)
         weapon_id = "boltgun"
         weapon = attacker["profile"].get("weapons", {}).get(weapon_id)

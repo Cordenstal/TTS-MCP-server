@@ -19,6 +19,12 @@ interaction. Requests are explicit and are subject to visibility filtering,
 exact GUID mutation targets, bounded plans, destructive-action policy, and
 post-action verification.
 
+For ordinary object motion, the AI-facing command language should use explicit
+`MOVE[guid,x,y,z]` instructions instead of prose descriptions. The bridge may
+still translate that command into the underlying TTS Lua movement call, but
+the structured move token is the preferred AI-side contract because it is short,
+auditable, and maps directly to an exact GUID and target position.
+
 Autonomous game play is not part of the generic core. It may be added through
 an optional game-specific adapter that supplies rules, turn ownership, and
 plan authority. External integrations such as the HTTP AI gateway are

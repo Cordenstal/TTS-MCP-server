@@ -399,6 +399,7 @@ class PublicAITextTests(unittest.TestCase):
 
         self.assertNotIn("tts_mcp_global.lua", result["text"])
         self.assertIn("couldn't inspect", result["text"].lower())
+        self.assertIn("TTS observation callback timed out", result["text"])
 
     def test_failed_execution_is_reported_without_dispatching_more_actions(self) -> None:
         backend = ChatBackend()
@@ -487,6 +488,7 @@ class PublicAITextTests(unittest.TestCase):
         self.assertIn("tts_killteam_probe_collection", OBSERVATION_TOOL_NAMES)
         self.assertIn("tts_killteam_probe_line_of_sight", OBSERVATION_TOOL_NAMES)
         self.assertIn("tts_killteam_get_roster", OBSERVATION_TOOL_NAMES)
+        self.assertIn("tts_killteam_plan_objective_move", OBSERVATION_TOOL_NAMES)
 
     def test_ai_can_dispatch_killteam_line_of_sight_probe(self) -> None:
         backend = ChatBackend()
@@ -534,6 +536,26 @@ class PublicAITextTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["container_guid"], "e5adb7")
         self.assertEqual(calls, [{}])
+
+    def test_ai_can_dispatch_killteam_objective_move_planner(self) -> None:
+        backend = ChatBackend()
+        calls = []
+        backend.configure_observation_tools({
+            "tts_killteam_plan_objective_move": lambda args: calls.append(args) or {
+                "status": "planned",
+                "move_command": "MOVE[ai-1,2.5,1.0,0.0]",
+                "target_position": {"x": 2.5, "y": 1.0, "z": 0.0},
+            },
+        })
+
+        result = backend._invoke_observation({
+            "name": "tts_killteam_plan_objective_move",
+            "arguments": {"operative_id": "plague-warrior-01"},
+        })
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(calls, [{"operative_id": "plague-warrior-01"}])
+        self.assertEqual(result["move_command"], "MOVE[ai-1,2.5,1.0,0.0]")
 
     def test_killteam_backend_uses_role_filtered_observation_tools(self) -> None:
         backend = ChatBackend()
@@ -619,6 +641,38 @@ class PublicAITextTests(unittest.TestCase):
             }),
             ("observe", {}),
         ])
+
+    def test_killteam_observe_failure_is_traced_with_tool_name_and_error(self) -> None:
+        backend = ChatBackend()
+        traces: list[tuple[str, dict[str, object]]] = []
+
+        def record(event: str, **fields: object) -> str:
+            traces.append((event, dict(fields)))
+            return "trace-id"
+
+        def observe(_args: dict[str, object]) -> dict[str, object]:
+            raise RuntimeError("bridge not ready")
+
+        backend.configure_observation_tools({
+            "tts_killteam_observe": observe,
+        })
+
+        with patch("http_gateway._record_trace", side_effect=record):
+            result = backend._invoke_observation({
+                "id": "call-17",
+                "name": "tts_killteam_observe",
+                "arguments": {},
+            })
+
+        self.assertFalse(result["ok"])
+        self.assertIn("tts_killteam_observe failed: bridge not ready", result["error"])
+        self.assertTrue(any(
+            event == "ai_observation_tool_error"
+            and fields.get("tool") == "tts_killteam_observe"
+            and "bridge not ready" in str(fields.get("error", ""))
+            and fields.get("call_id") == "call-17"
+            for event, fields in traces
+        ))
 
     def test_killteam_observation_keeps_bounded_terrain_evidence(self) -> None:
         backend = ChatBackend()
@@ -929,6 +983,74 @@ class PublicAITextTests(unittest.TestCase):
         self.assertTrue(result["execution"]["stopped"])
         self.assertIn("deterministic checkers", result["text"].lower())
 
+    def test_generic_model_move_is_allowed_while_killteam_is_active(self) -> None:
+        backend = ChatBackend()
+        backend.controller_provider = lambda: {"state": "running", "active_game": "killteam"}
+        executed: list[dict] = []
+
+        class Executor:
+            def execute(self, commands, **_kwargs):
+                executed.extend(command.args for command in commands)
+                return {"executed": [{"action": "move_object", "status": "executed"}], "approval_required": [], "stopped": False}
+
+        backend.command_execution = Executor()
+
+        result = backend._finalize_result({"text": "MOVE[abcdef,1,2,3]"}, {})
+
+        self.assertEqual(executed, [{"guid": "abcdef", "x": 1.0, "y": 2.0, "z": 3.0}])
+        self.assertFalse(result["execution"]["stopped"])
+        self.assertEqual(result["execution"]["executed"][0]["action"], "move_object")
+        self.assertEqual(result["execution"]["blocked"], [])
+
+    def test_killteam_deploy_test_routes_directly_to_the_placement_model(self) -> None:
+        backend = ChatBackend()
+        backend.controller_provider = lambda: {"state": "running", "active_game": "killteam"}
+        requested: list[tuple[str, dict]] = []
+
+        class Executor:
+            def request(self, action, args):
+                requested.append((action, args))
+                return {
+                    "status": "verified",
+                    "model_name": "Plague Marine",
+                    "target_tag": "blue test marker",
+                }
+
+        backend.command_execution = Executor()
+
+        result = backend.handle_killteam_setup_board_command("KILLTEAM_DEPLOY_TEST", is_host=True)
+
+        self.assertEqual(requested, [("killteam_deploy_test_model", {})])
+        self.assertIsNotNone(result)
+        self.assertIn("Placement test complete", result["text"])
+        self.assertEqual(result["killteam_deploy_test"]["status"], "verified")
+
+    def test_command_only_move_bypasses_the_model_and_executes_locally(self) -> None:
+        backend = ChatBackend()
+        backend.reload({
+            "kind": "http",
+            "url": "http://127.0.0.1:11434/v1/chat/completions",
+            "format": "openai",
+            "model": "test-model",
+        })
+        backend.controller_provider = lambda: {"state": "running", "active_game": "killteam"}
+        executed: list[dict] = []
+
+        class Executor:
+            def execute(self, commands, **_kwargs):
+                executed.extend(command.args for command in commands)
+                return {"executed": [{"action": "move_object", "status": "executed"}], "approval_required": [], "stopped": False}
+
+        backend.command_execution = Executor()
+
+        with patch("http_gateway.urlopen", side_effect=AssertionError("AI backend should not be called for a direct MOVE command")):
+            result = backend.complete({"message": "MOVE[96fe20,-18.0858974456787,1.489675760269165,-8.608673095703125]"})
+
+        self.assertEqual(executed, [{"guid": "96fe20", "x": -18.0858974456787, "y": 1.489675760269165, "z": -8.608673095703125}])
+        self.assertIn("Executing command.", result["text"])
+        self.assertEqual(result["execution"]["executed"][0]["action"], "move_object")
+        self.assertFalse(result["execution"]["stopped"])
+
     def test_ollama_disables_thinking_for_bounded_gameplay_replies(self) -> None:
         backend = ChatBackend()
         backend.reload({
@@ -1066,6 +1188,77 @@ class KillTeamDefenseAcknowledgmentTests(unittest.TestCase):
 
         self.assertEqual(calls, [])
         self.assertIn("Only Red or the host", result["text"])
+
+
+class KillTeamSetupBoardCommandTests(unittest.TestCase):
+    def test_plan_command_requests_runtime_plan(self) -> None:
+        calls = []
+        backend = ChatBackend()
+        backend.configure_gameplay(
+            controller_provider=lambda: {
+                "active_game": "killteam",
+                "state": "running",
+            },
+            request=lambda action, args: calls.append((action, args)) or {
+                "status": "planned",
+                "plan_id": "abc123",
+                "placements": [{"model_guid": "96fe20"}],
+                "renames": [],
+            },
+            propose=lambda _proposal: "unused",
+        )
+
+        result = backend.handle_killteam_setup_board_command(
+            "KILLTEAM_PLAN_SETUP",
+            is_host=False,
+        )
+
+        self.assertEqual(calls, [("killteam_plan_setup_board", {"clearance": 0.25})])
+        self.assertIn("abc123", result["text"])
+        self.assertEqual(result["killteam_setup_plan"]["plan_id"], "abc123")
+
+    def test_execute_command_is_host_only(self) -> None:
+        calls = []
+        backend = ChatBackend()
+        backend.configure_gameplay(
+            controller_provider=lambda: {
+                "active_game": "killteam",
+                "state": "running",
+            },
+            request=lambda action, args: calls.append((action, args)) or {},
+            propose=lambda _proposal: "unused",
+        )
+
+        result = backend.handle_killteam_setup_board_command(
+            "KILLTEAM_EXECUTE_SETUP[abc123]",
+            is_host=False,
+        )
+
+        self.assertEqual(calls, [])
+        self.assertIn("Only the host", result["text"])
+
+    def test_host_execute_command_requests_frozen_plan(self) -> None:
+        calls = []
+        backend = ChatBackend()
+        backend.configure_gameplay(
+            controller_provider=lambda: {
+                "active_game": "killteam",
+                "state": "running",
+            },
+            request=lambda action, args: calls.append((action, args)) or {
+                "status": "executed",
+                "completed": [{"model_guid": "96fe20"}],
+            },
+            propose=lambda _proposal: "unused",
+        )
+
+        result = backend.handle_killteam_setup_board_command(
+            "KILLTEAM_EXECUTE_SETUP[abc123]",
+            is_host=True,
+        )
+
+        self.assertEqual(calls, [("killteam_execute_setup_board", {"plan_id": "abc123"})])
+        self.assertIn("executed", result["text"])
 
 
 if __name__ == "__main__":

@@ -38,6 +38,12 @@ compact broad inspection call. It includes
 object identity, transforms, bounds, movement state, velocity, axes, zone
 membership, and bounded container summaries.
 
+The listing response's `total_matching` count includes every valid top-level
+object matching the filters, while `count` is the number returned after the
+`max_results` bound. TTS references with a missing, empty, or `-1` GUID are
+skipped and reported in `skipped_invalid`; they are never exposed as usable
+object identities.
+
 `tts_calibrate_view` validates a screen rectangle and reports monitor geometry.
 `tts_capture_view_info` returns capture timestamp, dimensions, contrast, and a
 blank-frame heuristic. Use these before relying on a screenshot from a new
@@ -46,6 +52,11 @@ display layout.
 `tts_focus_object_and_capture` derives a camera target and distance from the
 object's bounds. `tts_wait_for_object_settle` should be used after smooth moves
 or spawns before treating the returned position as final.
+
+`tts_killteam_plan_objective_move` plans a tactical objective-control move for
+one AI operative and returns a suggested `MOVE[guid,x,y,z]` target plus the
+candidate ranking evidence. Use it before emitting `MOVE[...]` when the goal
+is to contest or stage around an objective.
 
 ## Mutation workflow
 
@@ -81,8 +92,10 @@ lattice from their positions, rejects lateral/backward ordinary-man moves and
 occupied destinations, preserves the source Y coordinate, and waits for the
 piece to settle. Pass `target_zone_tag` (for example `C5`) to use the
 authoritative invisible LayoutZone destination; the tool resolves the zone's
-world-space X/Z center internally. Keep using `tts_move_object` for unrestricted
-generic moves.
+world-space X/Z center internally. For ordinary object movement initiated by
+the AI, emit `MOVE[guid,x,y,z]` at the command layer and let the bridge resolve
+it to the underlying TTS move call. Keep using `tts_move_object` for
+unrestricted generic moves.
 
 `tts_place_in_tagged_zone` is the board-game placement primitive for invisible
 tagged square zones. For chess, pass the moving piece GUID as `target_guid` and

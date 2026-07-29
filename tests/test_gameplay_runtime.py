@@ -320,7 +320,7 @@ def test_parser_supports_semantic_killteam_placement() -> None:
     assert len(commands) == 1
     assert commands[0].action == "killteam_place_operative"
     assert commands[0].args == {
-        "operative_id": "plague-warrior-01",
+        "guid": "plague-warrior-01",
         "x": 1.5,
         "y": 1.0,
         "z": -3.25,
@@ -332,7 +332,7 @@ def test_command_execution_dispatches_semantic_killteam_placement() -> None:
 
     def request(action, args):
         calls.append((action, args))
-        return {"status": "verified", "operative_id": args["operative_id"]}
+        return {"status": "verified", "guid": args["guid"]}
 
     executor = CommandExecution(request, lambda _: "unused")
     result = executor.execute(
@@ -344,12 +344,25 @@ def test_command_execution_dispatches_semantic_killteam_placement() -> None:
     assert result["executed"][0]["status"] == "executed"
     assert calls == [
         ("killteam_place_operative", {
-            "operative_id": "plague-warrior-01",
+            "guid": "plague-warrior-01",
             "x": 1.5,
             "y": 1.0,
             "z": -3.25,
         }),
     ]
+
+
+def test_parser_supports_guid_based_killteam_deployment() -> None:
+    commands = parse_ai_commands("KILLTEAM_DEPLOY_SETUP[model-ai-warrior-1, -2.0, 1.0, 3.5]")
+
+    assert len(commands) == 1
+    assert commands[0].action == "killteam_deploy_setup_operative"
+    assert commands[0].args == {
+        "guid": "model-ai-warrior-1",
+        "x": -2.0,
+        "y": 1.0,
+        "z": 3.5,
+    }
 
 
 def test_parser_supports_v6_catalog_spawn_and_place() -> None:
@@ -566,7 +579,7 @@ class KillTeamCommandProtocolTests(unittest.TestCase):
     def test_parser_supports_semantic_placement(self) -> None:
         commands = parse_ai_commands("KILLTEAM_PLACE[plague-warrior-01, 1.5, 1.0, -3.25]")
         self.assertEqual(commands[0].action, "killteam_place_operative")
-        self.assertEqual(commands[0].args["operative_id"], "plague-warrior-01")
+        self.assertEqual(commands[0].args["guid"], "plague-warrior-01")
 
     def test_command_execution_dispatches_semantic_placement(self) -> None:
         calls: list[tuple[str, dict]] = []
@@ -636,7 +649,13 @@ class KillTeamCommandProtocolTests(unittest.TestCase):
             context={},
         )
         self.assertIn("tts_killteam_observe", prompt)
-        self.assertIn("KILLTEAM_PLACE[operative_id,target_x,target_y,target_z]", prompt)
+        self.assertIn("setup.ai_plan", prompt)
+        self.assertIn("KILLTEAM_LOCK_ROSTERS", prompt)
+        self.assertIn("tts_killteam_plan_objective_move", prompt)
+        self.assertIn("MOVE[guid,x,y,z]", prompt)
+        self.assertNotIn("tts_list_objects", prompt)
+        self.assertIn("MOVE[guid,target_x,target_y,target_z]", prompt)
+        self.assertNotIn("KILLTEAM_DEPLOY_SETUP[guid,target_x,target_y,target_z]", prompt)
+        self.assertNotIn("KILLTEAM_PLACE[operative_id,target_x,target_y,target_z]", prompt)
         self.assertIn("\nKILLTEAM_DEPLOY_TEST\n", prompt)
         self.assertIn("KILLTEAM_VALIDATE_SETUP[action_id]", prompt)
-        self.assertIn("Do not emit generic MOVE", prompt)

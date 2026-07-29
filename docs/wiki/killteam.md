@@ -60,6 +60,12 @@ The model descriptions may be parsed once for static profile data. Dynamic
 wounds, AP, statuses, activations, resources, and scoring remain runtime state
 and may be mirrored to TTS names, counters, and markers.
 
+When the Save 131 fixture profile is not in use, the runtime can also enter a
+generic semantic pregame-setup mode. In that mode it discovers side-tagged
+faction-deck containers, roster model containers, `Roster List <side>` zones,
+`Deployed Zone <side>` zones, and deployment zones, then tracks initiative,
+roster locking, and deployment cadence in the typed state machine.
+
 ## Observation and map model
 
 Before each activation and before each attack, the AI must obtain a fresh
@@ -78,9 +84,10 @@ visible operative records, terrain, AI dice references, counters, roller GUID,
 and an explicit truncation flag. Setup is a start-of-game operation and must
 not be repeated during an activation. The gateway exposes these two bounded
 tools to the AI backend. The gateway also accepts the bounded semantic
-`KILLTEAM_PLACE[operative_id,x,y,z]` command for initial AI placement; the
-runtime resolves the operative ID to a live GUID. Activation and attacks
-remain on the semantic MCP interface.
+`tts_killteam_plan_objective_move` planner for objective-control placement and
+`MOVE[guid,x,y,z]` command for initial AI placement; the runtime uses the live
+figurine GUID at the move step and keeps the semantic operative identity
+separate. Activation and attacks remain on the semantic MCP interface.
 
 `tts_killteam_probe_line_of_sight` is the bounded physical visibility query.
 It accepts semantic attacker and visible-target IDs, converts them to TTS
@@ -98,6 +105,30 @@ Dialogus, and deployment names without enumerating the full scene, then
 returns compact live summaries. Call it before movement or LOS work and
 confirm the intended model's `Figurine` type, `Operative` tag, faction tags,
 and unique live GUID.
+
+### Validated named-model attack workflow
+
+The live attack test establishes the bounded workflow for models that have
+display names and faction tags rather than canonical `tts_mcp:*` tags:
+
+1. Use `tts_killteam_search_deployment_names`, normalize display-name markup,
+   and require one live `Figurine` matching the intended name, `Operative`, and
+   faction tags. The Plague Marine Warrior requires Chaos/LEGIONARY evidence;
+   Novitiate Dialogus requires Imperium/NOVITIATE evidence. The returned GUIDs
+   are authoritative only for that current action.
+2. Resolve named Blue Dice individually and require their `_dice_blue` tags.
+   Resolve the unique Blue roller from `_blue_dice_roller`; it may be used to
+   recover a die from an earlier failed attempt, but it is not the roll API.
+3. Run the nine-ray physics LOS probe against the resolved GUIDs. At least one
+   target ray is required before a ranged attack dice commit.
+4. Invoke TTS's native `Object.roll()` operation for the selected physical
+   dice. Do not use `putObject` to insert them into the roller: that bypasses
+   the roller's player-drop callback and produces no roll. Wait for native
+   dice to settle before reading their upward faces.
+5. A missing face after the roll is an uncertain physical commit. Keep the
+   dice/result in place and use read-only settled-value recovery; never reroll
+   automatically. Do not project wounds until the defender provides physical
+   save results, including whether a save is normal or critical.
 
 `tts_killteam_get_roster` is the fallback roster query. It reads only the
 dedicated AI roster container, currently GUID `e5adb7`, and returns bounded
@@ -157,8 +188,10 @@ is a resumable opt-in live test and requires the host to freshly load
 6. Cast the nine-ray silhouette LOS probe to `377732`. At least one ray must
    reach the target. Zero target rays, malformed bounds, or unavailable
    collider evidence stops the pipeline before dice.
-7. Fire `96fe20`'s Boltgun: four Blue attack dice, hit on 3+, damage 3/4.
-   Physical randomness is valid; the test does not require damage.
+7. Fire `96fe20`'s Boltgun with four resolved Blue attack dice using TTS's
+   native die Roll operation, not mechanical insertion into the roller. Hit
+   on 3+, damage 3/4. Physical randomness is valid; the test does not require
+   damage.
 8. Pause and ask Red to roll `377732`'s three defense dice at 4+ through
    read-only roll station `f1adc9`. Resume only after an explicit Red/host
    acknowledgment that the defense roll is complete, then read the settled
@@ -184,7 +217,7 @@ one complete ranged activation:
 - validate turning point, phase, initiative, active operative, and APL;
 - move an operative using an explicit path/waypoints;
 - check distance, terrain, LOS, and target visibility;
-- roll attack dice through the tagged AI dice pool and roller;
+- resolve the tagged AI dice and invoke native physical rolls;
 - pause for the human defender's physical roll, then resolve hits, saves,
   damage, wounds, and statuses;
 - update CP/VP through semantic resource/scoring events;
@@ -197,6 +230,12 @@ wound-state projection. Resource scoring, camera-assisted ambiguity handling,
 broader human-event reconciliation, and turn/scenario rules remain subsequent
 slices. The public MCP entry points are
 `tts_killteam_setup`, `tts_killteam_observe`,
+`tts_killteam_get_roster`, `tts_killteam_plan_objective_move`,
+`tts_killteam_select_roster_card`,
+`tts_killteam_lock_rosters`, `tts_killteam_start_setup_deployment`,
+`tts_killteam_deploy_setup_operative`,
+`tts_killteam_rollback_pending_deployment`,
+`tts_killteam_reconcile_setup_step`,
 `tts_killteam_probe_line_of_sight`, `tts_killteam_place_operative`,
 `tts_killteam_deploy_test_model`,
 `tts_killteam_activate_operative`, `tts_killteam_shoot`,
@@ -206,6 +245,37 @@ isolated deployment smoke test with `KILLTEAM_DEPLOY_TEST` and
 starts the fixture pipeline with `KILLTEAM_VALIDATE_SETUP[action_id]`. The
 fixture pipeline resumes only
 when authenticated Red or host chat says `Defense roll complete`.
+
+### Setup deployment state machine
+
+Semantic pregame setup follows this bounded sequence:
+
+1. `tts_killteam_setup(...)` discovers the tagged setup objects and starts
+   model deployment directly from the side-tagged roster containers. The
+   generic path queries the standard setup tags directly and does not depend on
+   a placeholder target GUID. The Save 131 validation fixture is opt-in; it is
+   not the default setup path.
+2. The runtime assumes the AI side has initiative by default, so roster
+   selection can begin immediately. Use `tts_killteam_roll_initiative` only
+   when the host explicitly overrides that default and wants a physical
+   initiative roll instead.
+3. The AI receives `setup.next_action` and `setup.ai_plan`, which identify its
+   first model and a legal recommended position. It calls
+   `tts_killteam_start_setup_deployment`, then
+   `tts_killteam_deploy_setup_operative` for that model. The position is
+   revalidated against the live model bounds before the move is committed.
+4. Deployment then follows the configured cadence: starting with the AI-first
+   `initiative_side` unless the host overrode it, each side alternates setup
+   passes and places `floor(N/3)` operatives per pass, with a minimum pass of
+   one operative and a smaller final remainder when fewer remain.
+5. The human side places its current batch directly into its deployment zone.
+   `tts_killteam_reconcile_setup_step` detects those live models, validates
+   whole-zone containment and non-overlap, consumes the batch, and advances the
+   turn. The AI then selects and places the next model or batch.
+6. Every AI placement is verified against live position and geometry, and each
+   deployed operative receives a starting `Conceal` order. The lower-level
+   roster-card selection and lock actions remain available for tables that
+   explicitly use physical roster-card lists.
 
 The runtime exposes semantic actions such as `move_operative`, `shoot`,
 `roll_attack_dice`, `score_objective`, `gain_cp`, and `spend_cp`. GUIDs are

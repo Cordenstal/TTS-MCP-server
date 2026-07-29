@@ -72,10 +72,22 @@ class LuaBridgeSourceTests(unittest.TestCase):
         source = Path("tts_mcp_global.lua").read_text(encoding="utf-8")
 
         self.assertIn("MCP_HANDLERS.killteam_roll_dice", source)
+        self.assertIn("MCP_HANDLERS.killteam_read_dice_values", source)
         self.assertIn("MCP_HANDLERS.set_counter_value", source)
         self.assertIn('mcp_has_tag(die, "tts_mcp:entity=die")', source)
         self.assertIn("getRotationValue", source)
         self.assertIn("Counter.setValue", source)
+
+    def test_killteam_dice_roll_waits_for_the_bundled_roller_to_settle(self) -> None:
+        source = Path("tts_mcp_global.lua").read_text(encoding="utf-8")
+        dice_handler = source[
+            source.index("MCP_HANDLERS.killteam_roll_dice"):
+            source.index("MCP_HANDLERS.killteam_read_dice_values")
+        ]
+
+        self.assertIn("end, 120)", dice_handler)
+        self.assertIn(".roll()", dice_handler)
+        self.assertNotIn("roller.putObject(die)", dice_handler)
 
     def test_killteam_dice_and_los_handlers_decode_scalar_safe_inputs(self) -> None:
         source = Path("tts_mcp_global.lua").read_text(encoding="utf-8")
@@ -100,10 +112,27 @@ class LuaBridgeSourceTests(unittest.TestCase):
         self.assertIn("MCP_HANDLERS.killteam_observe_defense_roll", source)
         self.assertIn("expected_count", source)
         self.assertIn("MCP_HANDLERS.killteam_apply_damage", source)
+
+    def test_save_131_setup_collection_uses_a_zero_argument_lua_action(self) -> None:
+        source = Path("tts_mcp_global.lua").read_text(encoding="utf-8")
+        self.assertIn("MCP_HANDLERS.killteam_save_131_setup_objects", source)
+        self.assertIn('or action == "killteam_save_131_setup_objects"', source)
+        self.assertIn(
+            "return MCP_HANDLERS.killteam_deployment_test_objects(args, request_id)",
+            source,
+        )
         self.assertIn('operative.call("damage"', source)
         self.assertIn("expected_wounds", source)
         self.assertIn("before_wounds", source)
         self.assertIn("after_wounds", source)
+
+    def test_setup_roster_cards_uses_fixed_layout_zone_fast_path(self) -> None:
+        source = Path("tts_mcp_global.lua").read_text(encoding="utf-8")
+        self.assertIn("MCP_HANDLERS.killteam_setup_roster_cards", source)
+        self.assertIn('local zone_guid = "aefe3b"', source)
+        self.assertIn("zone.getObjects(false)", source)
+        self.assertIn("summary.layout_index = index", source)
+        self.assertIn('or action == "killteam_setup_roster_cards"', source)
 
     def test_killteam_roster_handler_reads_bounded_dedicated_container_contents(self) -> None:
         source = Path("tts_mcp_global.lua").read_text(encoding="utf-8")
@@ -142,9 +171,22 @@ class LuaBridgeSourceTests(unittest.TestCase):
         listing = source[start:end]
 
         self.assertIn("mcp_live_object(obj)", listing)
+        self.assertIn("local objects_ok, objects_or_error = pcall(getObjects)", listing)
+        self.assertIn("local live_ok, live = pcall(mcp_live_object, obj)", listing)
+        self.assertIn("skipped_invalid = skipped_invalid + 1", listing)
+        self.assertIn("skipped_invalid = skipped_invalid", listing)
         self.assertIn("pcall(function()", listing)
         self.assertIn("summary.guid", listing)
         self.assertIn("mcp_safe_object_tags(obj)", source)
+
+    def test_json_safe_serialization_handles_unreadable_managed_tables(self) -> None:
+        source = Path("tts_mcp_global.lua").read_text(encoding="utf-8")
+        start = source.index("local function mcp_json_safe")
+        end = source.index("local function mcp_post_bridge_response", start)
+        serializer = source[start:end]
+
+        self.assertIn("local encoded_ok = pcall(function()", serializer)
+        self.assertIn('return "<unreadable>"', serializer)
 
     def test_external_message_boundary_returns_a_correlated_error_when_dispatch_escapes(self) -> None:
         source = Path("tts_mcp_global.lua").read_text(encoding="utf-8")
@@ -226,6 +268,8 @@ class LuaBridgeSourceTests(unittest.TestCase):
         self.assertIn("getObjectsWithTag(tag)", resolver)
         self.assertIn("for _, obj in ipairs(getObjects()) do", resolver)
         self.assertIn("string.find(object_name, name, 1, true)", resolver)
+        self.assertIn("mcp_is_roster_card_summary(summary)", resolver)
+        self.assertIn("mcp_is_deployment_figurine(summary)", resolver)
         self.assertNotIn("mcp_canonical_deployment_tag", resolver)
         self.assertIn("mcp_deployment_object_summary(obj)", resolver)
         summary_start = source.index(
@@ -248,7 +292,7 @@ class LuaBridgeSourceTests(unittest.TestCase):
         self.assertNotIn('"*_*plague*_*marine_war_1"', resolver)
         self.assertNotIn('wanted_combat_tag = "combat_zone"', resolver)
         self.assertNotIn('wanted_target_tag = "_deployment_test_blue"', resolver)
-        self.assertIn("count = 2", resolver)
+        self.assertIn("must resolve to exactly one figurine", resolver)
 
     def test_deployment_name_search_is_zero_argument_and_bounded(self) -> None:
         source = Path("tts_mcp_global.lua").read_text(encoding="utf-8")
@@ -296,6 +340,17 @@ class LuaBridgeSourceTests(unittest.TestCase):
 
         self.assertIn("local summary_ok, summary = pcall(function()", handler)
         self.assertIn("if not summary_ok or type(summary) ~= \"table\" then", handler)
+
+    def test_generic_killteam_listing_drops_stale_save_131_guid(self) -> None:
+        source = Path("tts_mcp_global.lua").read_text(encoding="utf-8")
+        start = source.index("MCP_HANDLERS.killteam_list_objects = function")
+        end = source.index("MCP_HANDLERS.killteam_get_roster", start)
+        handler = source[start:end]
+
+        self.assertIn("local generic_query = #query_tags == 0", handler)
+        self.assertIn("if generic_query and #required_guids == 1", handler)
+        self.assertIn('required_guid == "96fe20"', handler)
+        self.assertIn("required_guids = {}", handler)
 
     def test_external_message_bridge_keeps_killteam_collection_inputs_scalar(self) -> None:
         source = Path("tts_mcp_global.lua").read_text(encoding="utf-8")

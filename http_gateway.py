@@ -418,6 +418,26 @@ OBSERVATION_TOOL_SPECS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "tts_killteam_plan_setup_board",
+            "description": "Plan Save 131 AI setup from live Deployed Zone cards and exact legal coordinates without moving anything.",
+            "parameters": {"type": "object", "properties": {
+                "clearance": {"type": "number", "minimum": 0},
+            }},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "tts_killteam_plan_objective_move",
+            "description": "Plan a tactical objective-control move for one AI operative and return a suggested MOVE target.",
+            "parameters": {"type": "object", "properties": {
+                "operative_id": {"type": "string"},
+            }, "required": ["operative_id"]},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "tts_killteam_probe_line_of_sight",
             "description": "Probe visible Kill Team target visibility with nine bounded TTS physics rays; returns blockers, visibility fraction, and collider uncertainty.",
             "parameters": {"type": "object", "properties": {
@@ -474,6 +494,8 @@ KILLTEAM_OBSERVATION_TOOL_NAMES = {
     "tts_killteam_observe",
     "tts_killteam_probe_line_of_sight",
     "tts_killteam_get_roster",
+    "tts_killteam_plan_setup_board",
+    "tts_killteam_plan_objective_move",
     "tts_capture_view",
     "tts_capture_view_info",
 }
@@ -844,6 +866,83 @@ class ChatBackend:
             "killteam_validation": result,
         }
 
+    def handle_killteam_setup_board_command(
+        self,
+        message: str,
+        *,
+        is_host: bool,
+    ) -> dict[str, Any] | None:
+        """Handle explicit Save 131 setup-board plan and execution commands."""
+        controller = self.controller_provider() if self.controller_provider else {}
+        if str(controller.get("active_game", "")).strip().casefold() != "killteam":
+            return None
+        text = str(message or "").strip()
+        if re.fullmatch(r"KILLTEAM_DEPLOY_TEST", text, re.I):
+            if not is_host:
+                return {
+                    "text": "Only the host can start the Kill Team placement test.",
+                    "commands": [],
+                }
+            if self.command_execution is None:
+                raise RuntimeError("Kill Team gameplay execution is not configured")
+            result = self.command_execution.request("killteam_deploy_test_model", {})
+            if str(result.get("status", "")).strip().lower() == "verified":
+                text_result = (
+                    f"Placement test complete: {result.get('model_name')} moved to "
+                    f"{result.get('target_tag')}."
+                )
+            else:
+                text_result = (
+                    f"Placement test stopped during {result.get('status', 'execution')}."
+                )
+            return {
+                "text": text_result,
+                "commands": [],
+                "killteam_deploy_test": result,
+            }
+        if re.fullmatch(r"KILLTEAM_PLAN_SETUP(?:\s+([0-9]+(?:\.[0-9]+)?))?", text, re.I):
+            if self.command_execution is None:
+                raise RuntimeError("Kill Team gameplay execution is not configured")
+            match = re.fullmatch(r"KILLTEAM_PLAN_SETUP(?:\s+([0-9]+(?:\.[0-9]+)?))?", text, re.I)
+            clearance = float(match.group(1)) if match and match.group(1) else 0.25
+            result = self.command_execution.request(
+                "killteam_plan_setup_board",
+                {"clearance": clearance},
+            )
+            return {
+                "text": (
+                    f"Setup plan {result.get('plan_id')} is ready: "
+                    f"{len(result.get('placements', []))} placements, "
+                    f"{len(result.get('renames', []))} renames."
+                ),
+                "commands": [],
+                "killteam_setup_plan": result,
+            }
+        match = re.fullmatch(r"KILLTEAM_EXECUTE_SETUP\[([A-Za-z0-9_-]+)\]", text, re.I)
+        if not match:
+            return None
+        if not is_host:
+            return {
+                "text": "Only the host can execute the Kill Team setup plan.",
+                "commands": [],
+            }
+        if self.command_execution is None:
+            raise RuntimeError("Kill Team gameplay execution is not configured")
+        result = self.command_execution.request(
+            "killteam_execute_setup_board",
+            {"plan_id": match.group(1)},
+        )
+        status = str(result.get("status", "unknown"))
+        if status == "executed":
+            text_result = f"Setup plan {match.group(1)} executed: {len(result.get('completed', []))} models placed."
+        else:
+            text_result = f"Setup plan {match.group(1)} stopped during {result.get('failed_phase', 'execution')}."
+        return {
+            "text": text_result,
+            "commands": [],
+            "killteam_setup_execution": result,
+        }
+
     def _observation_tool_specs(self) -> list[dict[str, Any]]:
         controller = self.controller_provider() if self.controller_provider else {}
         if str(controller.get("active_game", "")).strip().lower() == "killteam":
@@ -866,18 +965,32 @@ class ChatBackend:
     @staticmethod
     def _observation_instructions() -> str:
         return (
-            "Live TTS scene data is not included automatically. For a move, first use tts_list_objects for exact "
-            "GUIDs, tags, transforms, and occupancy. Use tts_capture_view when board orientation, appearance, "
-            "stacking, occupancy, or other visual evidence is needed; it captures the current view without moving "
-            "the camera and returns an image to the model. Image review is expensive: request at most one "
-            "successful screenshot per turn, and only after structured observations leave a genuinely visual question "
-            "unresolved. If a capture fails or returns no image, it does not consume the visual budget. A post-move "
-            "position discrepancy greater than 0.5 world units on any axis requires visual review. Never guess a "
-            "GUID, coordinate, or visual fact. Screenshots do not prove exact transforms. If any action or "
-            "verification fails, stop issuing actions and wait for player instructions. "
-            "For Kill Team, call tts_killteam_setup once at the start of the loaded game, then use "
-            "tts_killteam_observe before activation or attack preparation. Do not call setup again during a live "
-            "activation because it creates a new scene epoch and discards the prior canonical state. "
+            "Live TTS scene data is not included automatically. For ordinary scene moves, first use "
+            "tts_list_objects for exact GUIDs, tags, transforms, and occupancy. Use tts_capture_view when board "
+            "orientation, appearance, stacking, occupancy, or other visual evidence is needed; it captures the "
+            "current view without moving the camera and returns an image to the model. Image review is expensive: "
+            "request at most one successful screenshot per turn, and only after structured observations leave a "
+            "genuinely visual question unresolved. If a capture fails or returns no image, it does not consume the "
+            "visual budget. A post-move position discrepancy greater than 0.5 world units on any axis requires "
+            "visual review. Never guess a GUID, coordinate, or visual fact. Screenshots do not prove exact "
+            "transforms. If any action or verification fails, stop issuing actions and wait for player "
+            "instructions. "
+            "For Kill Team, do not use tts_list_objects. Call tts_killteam_setup once at the start of the loaded "
+            "game. In the normal model-deployment mode, use setup.next_action and setup.ai_plan to take the first "
+            "AI model and its recommended position, then call tts_killteam_start_setup_deployment followed by "
+            "tts_killteam_deploy_setup_operative for one model at a time. Honor setup.current_batch_target, then "
+            "stop while the human places the active batch. If setup.mode is roster_cards, select the outstanding "
+            "AI roster cards and call tts_killteam_lock_rosters before deployment. After locking, follow "
+            "setup.ai_plan.deployment_order, taking the first undeployed entry for the active stage. Use "
+            "tts_killteam_observe only when you need fresh live state outside that scripted flow. The observation returns exact operative IDs and live GUIDs; use the "
+            "GUID from that observation directly in "
+            "MOVE[guid,x,y,z] when repositioning an AI operative. Do not use KILLTEAM_PLACE for ordinary movement. "
+            "For setup deployment, use the live figurine GUID rather than an operative_id when calling "
+            "tts_killteam_deploy_setup_operative or the semantic KILLTEAM_DEPLOY_SETUP command. "
+            "When objective control is the goal, call tts_killteam_plan_objective_move with the operative_id "
+            "before emitting MOVE and use the returned target position instead of inventing coordinates. "
+            "After the AI completes current_batch_target deployments, stop and wait for the human side to place "
+            "its current batch. Never issue another AI deployment after current_side changes to the opponent. "
             "If a model profile or roster identity is missing, call tts_killteam_get_roster; it reads only the "
             "dedicated AI roster container. Do not inspect arbitrary containers. "
             "For Kill Team, use tts_killteam_probe_line_of_sight on a visible target before entering an exposed "
@@ -923,6 +1036,8 @@ class ChatBackend:
             "tts_killteam_probe_collection": {"stage", "index", "item_index"},
             "tts_killteam_observe": set(),
             "tts_killteam_get_roster": set(),
+            "tts_killteam_plan_setup_board": {"clearance"},
+            "tts_killteam_plan_objective_move": {"operative_id"},
             "tts_killteam_probe_line_of_sight": {"attacker_id", "target_id", "eye_local"},
             "tts_get_scene_summary": {"max_results"},
             "tts_capture_view": {"left", "top", "width", "height", "max_width", "jpeg_quality"},
@@ -964,6 +1079,12 @@ class ChatBackend:
                 raise ValueError("tts_killteam_probe_collection requires a supported stage")
             bounded["index"] = max(1, min(int(bounded.get("index", 1)), 32))
             bounded["item_index"] = max(1, min(int(bounded.get("item_index", 1)), 1000))
+        if name == "tts_killteam_plan_setup_board":
+            bounded["clearance"] = max(0.0, min(float(bounded.get("clearance", 0.25)), 5.0))
+        if name == "tts_killteam_plan_objective_move":
+            bounded["operative_id"] = str(bounded.get("operative_id", "")).strip()
+            if not bounded["operative_id"]:
+                raise ValueError("tts_killteam_plan_objective_move requires operative_id")
         if name == "tts_killteam_probe_line_of_sight":
             for key in ("attacker_id", "target_id"):
                 bounded[key] = str(bounded.get(key, "")).strip()
@@ -998,7 +1119,13 @@ class ChatBackend:
         try:
             name, arguments = self._validate_observation_call(call)
         except (KeyError, TypeError, ValueError) as exc:
-            return {"ok": False, "error": f"invalid observation tool call: {str(exc)[:300]}"}
+            error = f"invalid observation tool call: {str(exc)[:300]}"
+            self._trace_observation_failure(
+                str(call.get("name", "")).strip(),
+                error,
+                call_id=str(call.get("id", "")).strip() or None,
+            )
+            return {"ok": False, "error": error}
         available_names = {
             str(item.get("function", {}).get("name", ""))
             for item in self._observation_tool_specs()
@@ -1010,13 +1137,14 @@ class ChatBackend:
             guidance = ""
             if active_game == "killteam":
                 guidance = " Call tts_killteam_setup, then tts_killteam_observe instead."
-            return {
-                "ok": False,
-                "error": f"{name} is not available for the active game.{guidance}",
-            }
+            error = f"{name} is not available for the active game.{guidance}"
+            self._trace_observation_failure(name, error, call_id=str(call.get("id", "")).strip() or None)
+            return {"ok": False, "error": error}
         callback = self.observation_tools.get(name)
         if callback is None:
-            return {"ok": False, "error": "observation tools are unavailable this turn"}
+            error = "observation tools are unavailable this turn"
+            self._trace_observation_failure(name, error, call_id=str(call.get("id", "")).strip() or None)
+            return {"ok": False, "error": error}
         try:
             result = callback(arguments)
             if not isinstance(result, dict):
@@ -1026,14 +1154,26 @@ class ChatBackend:
                 checkers_board = _checkers_board_observation(result)
                 if checkers_board is not None:
                     return checkers_board
-            list_limit = 200 if name in {"tts_killteam_setup", "tts_killteam_observe"} else 50
+            list_limit = 200 if name in {"tts_killteam_setup", "tts_killteam_observe", "tts_killteam_plan_setup_board", "tts_killteam_plan_objective_move"} else 50
             compact = _compact_tool_value(result, list_limit=list_limit)
             if not isinstance(compact, dict):
                 compact = {"value": compact}
             compact.setdefault("ok", True)
+            if compact.get("ok") is False:
+                self._trace_observation_failure(
+                    name,
+                    str(compact.get("error", "observation failed"))[:300],
+                    call_id=str(call.get("id", "")).strip() or None,
+                )
             return compact
         except Exception as exc:
-            return {"ok": False, "error": f"{name} failed: {str(exc)[:300]}"}
+            error = f"{name} failed: {str(exc)[:300]}"
+            self._trace_observation_failure(
+                name,
+                str(exc)[:300],
+                call_id=str(call.get("id", "")).strip() or None,
+            )
+            return {"ok": False, "error": error}
 
     def _invoke_observation_with_image_budget(
         self,
@@ -1057,12 +1197,40 @@ class ChatBackend:
         return self._invoke_observation(call), image_count
 
     @staticmethod
-    def _observation_failure_report() -> str:
+    def _observation_failure_report(failures: list[dict[str, Any]] | None = None) -> str:
         """Describe an observation failure without guessing its infrastructure cause."""
-        return (
-            "I couldn't inspect the board because a live observation tool failed. "
-            "I won't assume the Lua bridge is missing. Please provide further instructions or ask me to retry."
-        )
+        prefix = "I couldn't inspect the board because a live observation tool failed."
+        detail = ""
+        if failures:
+            for failure in failures:
+                if not isinstance(failure, dict):
+                    continue
+                name = str(failure.get("name", "")).strip()
+                error = str(failure.get("error", "")).strip()
+                if name and error:
+                    detail = f"{name} failed: {error}"
+                    break
+                if error:
+                    detail = error
+                    break
+                if name:
+                    detail = f"{name} failed"
+                    break
+        suffix = " I won't assume the Lua bridge is missing. Please provide further instructions or ask me to retry."
+        if detail:
+            return f"{prefix} {detail}{suffix}"
+        return f"{prefix}{suffix}"
+
+    @staticmethod
+    def _trace_observation_failure(name: str, error: str, *, call_id: str | None = None) -> None:
+        """Record the exact observation tool and error for trace review."""
+        payload: dict[str, Any] = {
+            "tool": name,
+            "error": error,
+        }
+        if call_id:
+            payload["call_id"] = call_id
+        _record_trace("ai_observation_tool_error", **payload)
 
     @staticmethod
     def _extract_tool_calls(payload: Any) -> list[dict[str, Any]]:
@@ -1732,7 +1900,7 @@ class ChatBackend:
             calls = self._extract_tool_calls(result.get("backend_response"))
             if not calls:
                 if observation_failures and not observation_successes:
-                    result["text"] = self._observation_failure_report()
+                    result["text"] = self._observation_failure_report(observation_failures)
                 result["observation_failures"] = observation_failures
                 result["observation_successes"] = observation_successes
                 return result
@@ -1858,7 +2026,7 @@ class ChatBackend:
             if not calls:
                 text = _extract_text(response)
                 if observation_failures and not observation_successes:
-                    text = self._observation_failure_report()
+                    text = self._observation_failure_report(observation_failures)
                 elif not text.strip() and _response_was_truncated(response):
                     text = (
                         "I reached my response limit before I could finish analyzing the board, so I stopped. "
@@ -1923,6 +2091,18 @@ class ChatBackend:
         payload = dict(payload)
         payload.setdefault("message", message)
         controller = self.controller_provider() if self.controller_provider else {}
+        direct_commands = parse_ai_commands(message)
+        if direct_commands and not _public_ai_text(message).strip():
+            if self.command_execution is None:
+                raise RuntimeError("AI command execution is not configured")
+            result = self._finalize_result({"text": f"Executing command.\n{message}", "commands": []}, payload)
+            if result.get("text"):
+                self.history.append(self._conversation(payload), [
+                    {"role": "user", "content": _public_ai_text(message)},
+                    {"role": "assistant", "content": _public_ai_text(str(result["text"]))},
+                ])
+            _record_trace("ai_response", direction="ai_backend_to_gateway", response=result)
+            return result
         if (
             str(controller.get("active_game", "")).strip().lower() == "checkers"
             and self._is_checkers_turn_request(message)
@@ -2190,6 +2370,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 player_identity=player_identity,
                 is_host=is_host,
             )
+            setup_result = self.backend.handle_killteam_setup_board_command(
+                str(payload.get("message", "")),
+                is_host=is_host,
+            )
             draw_result = self.controller.handle_draw_message(
                 str(payload.get("message", "")),
                 player_identity=player_identity,
@@ -2201,7 +2385,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             payload.setdefault("conversation_id", self.controller.conversation_id())
             if str(payload.get("message", "")).strip().lower() == "!ai start fresh":
                 self.backend.reset(payload["conversation_id"])
-            result = defense_result or draw_result or command_result or self.backend.complete(payload)
+            result = defense_result or setup_result or draw_result or command_result or self.backend.complete(payload)
             _record_trace(
                 "ai_message_response",
                 direction="ai_gateway_to_tts",

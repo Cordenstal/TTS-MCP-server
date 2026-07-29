@@ -185,6 +185,12 @@ See the [Kill Team design](docs/wiki/killteam.md),
 
 The first implementation slice is now available through these semantic MCP
 tools: `tts_killteam_setup`, `tts_killteam_observe`,
+`tts_killteam_get_roster`, `tts_killteam_plan_objective_move`,
+`tts_killteam_select_roster_card`,
+`tts_killteam_lock_rosters`, `tts_killteam_start_setup_deployment`,
+`tts_killteam_deploy_setup_operative`,
+`tts_killteam_rollback_pending_deployment`,
+`tts_killteam_reconcile_setup_step`,
 `tts_killteam_probe_line_of_sight`, `tts_killteam_place_operative`,
 `tts_killteam_deploy_test_model`,
 `tts_killteam_search_deployment_names`,
@@ -192,16 +198,25 @@ tools: `tts_killteam_setup`, `tts_killteam_observe`,
 `tts_killteam_begin_setup_validation`, and
 `tts_killteam_complete_setup_validation`. The dedicated snapshot uses bounded
 native tag/GUID queries and scalar-safe JSON collection arguments instead of
-generic whole-mod enumeration. The Save 131 profile resolves its global snap
-point, staged Plague Marine, visible target, dice stations, roster, and
-separate counters without modifying the save. The resumable validation action
-places and verifies the operative, probes nine physical LOS rays, rolls only
-Blue's four dice through the object tagged `_blue_dice_roller` (resolving its
-current GUID only at the bridge boundary), then pauses. Red rolls through station
-`f1adc9`; only authenticated Red/host chat acknowledgment resumes resolution.
-Damage is projected through the target model's own `damage` function and its
-real `state.wounds` value is read back. If collider evidence, a physical
-commit, or readback is ambiguous, the action stops without an automatic retry.
+generic whole-mod enumeration. When the Save 131 fixture profile is not used,
+the runtime can enter the generic roster-card setup path: it discovers
+side-tagged faction-deck containers, roster-list zones, deployed zones,
+roster model containers, and deployment zones; begins in an initiative stage
+that is normally resolved by `tts_killteam_roll_initiative`; allows the AI to
+select one roster card at a time; locks both rosters only after faction
+legality and physical model availability validate; then enforces official
+alternating setup passes using one pending operative at a time. The Save 131 profile still
+resolves its global snap point, staged Plague Marine, visible target, dice
+stations, roster, and separate counters without modifying the save. The
+resumable validation action places and verifies the operative, probes nine
+physical LOS rays, resolves the four named/tagged Blue dice and invokes their
+native TTS Roll operation (the roller remains an identity/recovery anchor;
+mechanically inserting dice into it does not trigger its drop workflow), then
+pauses. Red rolls through station `f1adc9`; only authenticated Red/host chat
+acknowledgment resumes resolution. Damage is projected through the target
+model's own `damage` function and its real `state.wounds` value is read back.
+If collider evidence, a physical commit, or readback is ambiguous, the action
+stops without an automatic retry.
 The deterministic placement smoke test is exposed separately as
 `tts_killteam_deploy_test_model`: it resolves the unique model whose name
 contains `Plague Marine Warrior` and the unique destination tagged
@@ -216,18 +231,30 @@ known Plague Marine, Novitiate Dialogus, and deployment names without a full
 scene dump. It returns compact live summaries with GUIDs, names, tags, types,
 lock state, and positions. Verify a candidate is a unique `Figurine` with the
 expected `Operative` and faction tags before using its GUID for movement or
-LOS.
+LOS. For an attack, resolve every selected die the same way, prove LOS first,
+and use native die rolls rather than `putObject` into the roller. A roll with
+missing face readback is an uncertain commit: recover read-only and never
+automatically reroll or change wounds. Apply damage only after the defender
+states whether each save is normal or critical.
 
 The in-game AI gateway can also call the bounded `tts_killteam_setup`,
-`tts_killteam_observe`, `tts_killteam_get_roster`, and
-`tts_killteam_probe_line_of_sight` tools. The roster query reads the dedicated
-AI container, currently `e5adb7`, only when the live observation lacks a
-needed profile or model identity. Setup is intended once per loaded game;
-subsequent turns should use fresh observation and on-demand LOS probes. For
-the initial placement test, the gateway accepts
-the semantic `KILLTEAM_PLACE[operative_id,x,y,z]` command after observing the
-AI roster; the runtime resolves the operative ID to its live GUID and verifies
-the placement. The isolated deployment smoke test uses
+`tts_killteam_observe`, `tts_killteam_get_roster`,
+`tts_killteam_plan_objective_move`, and `tts_killteam_probe_line_of_sight`
+tools. The roster query reads the dedicated AI container, currently `e5adb7`,
+only when the live observation lacks a needed profile or model identity. The
+objective planner returns a suggested `MOVE[guid,x,y,z]` target for safe
+contesting or staging around an objective. Setup is intended once per loaded
+game; subsequent turns should use fresh observation and on-demand LOS probes.
+For semantic roster setup, the gateway accepts `KILLTEAM_ROLL_INITIATIVE`,
+`KILLTEAM_SELECT_ROSTER[contained_guid]`,
+`KILLTEAM_LOCK_ROSTERS`, `KILLTEAM_START_DEPLOYMENT[operative_id]`,
+`MOVE[guid,x,y,z]`, `KILLTEAM_ROLLBACK_PENDING`,
+and `KILLTEAM_RECONCILE_SETUP[side_id]`. Use `KILLTEAM_ROLL_INITIATIVE` as
+the first semantic setup step unless initiative has already been explicitly
+overridden outside the runtime. For the initial placement test, the gateway accepts
+`MOVE[guid,x,y,z]` after observing the AI roster; the runtime uses the live
+figurine GUID at the move step and verifies the placement. The isolated
+deployment smoke test uses
 the standalone zero-argument command `KILLTEAM_DEPLOY_TEST`; it bypasses setup
 and moves only the uniquely named test model to the uniquely tagged zone.
 The agreed vertical-slice run uses
@@ -252,10 +279,11 @@ py -3.10 -m venv .venv
 python -m pip install mcp mss Pillow
 ```
 
-The screenshot tools capture a screen rectangle using `mss`; by default they
-assume TTS occupies the primary 1920x1080 display. Pass `left`, `top`,
-`width`, and `height` when TTS is in another window or monitor. The combined
-camera tool returns an on-demand JPEG snapshot, not a video stream.
+The screenshot tools prefer `mss` and fall back to Pillow screen capture if
+`mss` is unavailable; by default they assume TTS occupies the primary
+1920x1080 display. Pass `left`, `top`, `width`, and `height` when TTS is in
+another window or monitor. The combined camera tool returns an on-demand JPEG
+snapshot, not a video stream.
 
 ## HTTP AI gateway
 
@@ -385,8 +413,10 @@ instead of guessing. It requests live scene/search context through the
 allowlisted observation tools. AI
 responses may contain only these bounded commands:
 `SPAWN`, `PLACE`, `MOVE`, `ROTATE`, `LOCK`, `UNLOCK`, `SPAWN_BUILTIN`,
-`BROADCAST`, and `DESTROY`. Catalog-based `SPAWN` and `PLACE` resolution is
-disabled; use live object GUIDs or built-in object spawning. Safe commands execute only while `!ai` is running; destructive
+`BROADCAST`, and `DESTROY`. When the AI needs to move an existing object, it
+should emit a direct `MOVE[guid,x,y,z]` command rather than describing the move
+in prose; this is the simplest and preferred movement path. Catalog-based
+`SPAWN` and `PLACE` resolution is disabled; use live object GUIDs or built-in object spawning. Safe commands execute only while `!ai` is running; destructive
 commands become persisted host approvals. Executed move/rotate/lock commands
 are read back from TTS. A failed action is an uncertainty stop: the gateway
 does not automatically retry it or execute later actions from the same

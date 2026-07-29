@@ -141,9 +141,28 @@ def parse_ai_commands(text: str, *, max_commands: int = 50) -> list[ParsedComman
 
     for m in re.finditer(rf"MOVE\[({_GUID}),\s*({_NUMBER}),\s*({_NUMBER}),\s*({_NUMBER})\]", text, re.I):
         add("move_object", {"guid": m.group(1), "x": float(m.group(2)), "y": float(m.group(3)), "z": float(m.group(4))})
+    for _ in re.finditer(r"^\s*KILLTEAM_ROLL_INITIATIVE\s*$", text, re.I | re.M):
+        add("killteam_roll_initiative", {})
+    for m in re.finditer(r"KILLTEAM_SELECT_ROSTER\[([^\]]+)\]", text, re.I):
+        add("killteam_select_roster_card", {"contained_guid": m.group(1).strip()})
+    for _ in re.finditer(r"^\s*KILLTEAM_LOCK_ROSTERS\s*$", text, re.I | re.M):
+        add("killteam_lock_rosters", {})
+    for m in re.finditer(r"KILLTEAM_START_DEPLOYMENT\[([^\]]+)\]", text, re.I):
+        add("killteam_start_setup_deployment", {"operative_id": m.group(1).strip()})
+    for m in re.finditer(r"KILLTEAM_DEPLOY_SETUP\[([^,\]]+),\s*(" + _NUMBER + r"),\s*(" + _NUMBER + r"),\s*(" + _NUMBER + r")\]", text, re.I):
+        add("killteam_deploy_setup_operative", {
+            "guid": m.group(1).strip(),
+            "x": float(m.group(2)),
+            "y": float(m.group(3)),
+            "z": float(m.group(4)),
+        })
+    for _ in re.finditer(r"^\s*KILLTEAM_ROLLBACK_PENDING\s*$", text, re.I | re.M):
+        add("killteam_rollback_pending_deployment", {})
+    for m in re.finditer(r"KILLTEAM_RECONCILE_SETUP\[([^\]]+)\]", text, re.I):
+        add("killteam_reconcile_setup_step", {"side_id": m.group(1).strip()})
     for m in re.finditer(r"KILLTEAM_PLACE\[([^,\]]+),\s*(" + _NUMBER + r"),\s*(" + _NUMBER + r"),\s*(" + _NUMBER + r")\]", text, re.I):
         add("killteam_place_operative", {
-            "operative_id": m.group(1).strip(),
+            "guid": m.group(1).strip(),
             "x": float(m.group(2)),
             "y": float(m.group(3)),
             "z": float(m.group(4)),
@@ -178,7 +197,26 @@ def parse_ai_commands(text: str, *, max_commands: int = 50) -> list[ParsedComman
         for item in entries:
             if not isinstance(item, dict) or not isinstance(item.get("action"), str) or not isinstance(item.get("args", {}), dict):
                 continue
-            if item["action"] in {"move_object", "killteam_place_operative", "killteam_deploy_test_model", "killteam_begin_setup_validation", "rotate_object", "set_object_lock", "spawn_builtin", "spawn_catalog", "place_catalog", "broadcast", "destroy_object"}:
+            if item["action"] in {
+                "move_object",
+                "killteam_roll_initiative",
+                "killteam_select_roster_card",
+                "killteam_lock_rosters",
+                "killteam_start_setup_deployment",
+                "killteam_deploy_setup_operative",
+                "killteam_rollback_pending_deployment",
+                "killteam_reconcile_setup_step",
+                "killteam_place_operative",
+                "killteam_deploy_test_model",
+                "killteam_begin_setup_validation",
+                "rotate_object",
+                "set_object_lock",
+                "spawn_builtin",
+                "spawn_catalog",
+                "place_catalog",
+                "broadcast",
+                "destroy_object",
+            }:
                 add(item["action"], dict(item.get("args", {})), item["action"] == "destroy_object")
     return commands
 
@@ -298,20 +336,36 @@ class GamePromptBuilder:
             )
         if selected_game.lower() == "killteam":
             sections.append(
-                "KILL TEAM OBSERVATION AND PLACEMENT PROTOCOL (mandatory):\n"
+                "KILL TEAM OBSERVATION AND MOVEMENT PROTOCOL (mandatory):\n"
                 "Call tts_killteam_setup once when the loaded table or roster changes, then call "
-                "tts_killteam_observe before choosing a model or position. The returned AI operatives contain "
-                "operative_id, exact TTS guid, name, description, profile, bounds, and x/y/z position. Use those "
-                "records to identify the AI's models; never infer a GUID from a screenshot or invent one.\n"
+                "tts_killteam_observe only when you need fresh live state outside automatic setup. The returned AI "
+                "operatives contain operative_id, exact TTS guid, name, description, profile, bounds, and x/y/z "
+                "position. Use those records to identify the AI's models; never infer a GUID from a screenshot or "
+                "invent one.\n"
                 "If the live observation does not contain the model or profile needed for the requested action, call "
                 "tts_killteam_get_roster. It reads only the dedicated AI roster container and returns bounded item "
                 "names, descriptions, tags, and contained GUID metadata. Do not inspect arbitrary containers.\n"
-                "To place one of the AI's own models, emit exactly one standalone line in this form:\n"
-                "KILLTEAM_PLACE[operative_id,target_x,target_y,target_z]\n"
-                "Use the operative_id from the role-filtered Kill Team observation. This semantic command resolves "
-                "the model GUID server-side and validates the placement path. Do not emit generic MOVE for an AI "
-                "operative. Before placing a model near an enemy, inspect the current board and use the visible "
-                "model positions, terrain bounds, and line-of-sight probe; stop if any identity or position is unclear."
+                "When objective control is the goal, call tts_killteam_plan_objective_move with the operative_id "
+                "before emitting MOVE. Use the returned MOVE target instead of inventing a coordinate and prefer "
+                "the safest contesting point the planner returns.\n"
+                "To move one of the AI's own models, emit exactly one standalone line in this form:\n"
+                "MOVE[guid,x,y,z]\n"
+                "Use the live GUID from tts_killteam_observe or the current setup deployment plan. Preserve the source y coordinate unless you are "
+                "intentionally changing elevation. Do not emit KILLTEAM_PLACE for ordinary movement. Before moving "
+                "a model near an enemy, inspect the current board and use the visible model positions, terrain "
+                "bounds, and line-of-sight probe; stop if any identity or position is unclear."
+                "\nFor semantic pregame roster setup, use these setup commands before the firefight phase:\n"
+                "KILLTEAM_ROLL_INITIATIVE\n"
+                "KILLTEAM_SELECT_ROSTER[contained_guid]\n"
+                "KILLTEAM_LOCK_ROSTERS\n"
+                "KILLTEAM_START_DEPLOYMENT[operative_id]\n"
+                "MOVE[guid,target_x,target_y,target_z]\n"
+                "KILLTEAM_ROLLBACK_PENDING\n"
+                "KILLTEAM_RECONCILE_SETUP[side_id]\n"
+                "Assume the AI side has initiative unless the host explicitly overrides it outside the runtime. After tts_killteam_setup, use setup.next_action and setup.ai_plan to select the first AI model and use its recommended position. Call KILLTEAM_START_DEPLOYMENT for one model at a time, then emit exactly one MOVE using the live figurine GUID and recommended coordinates, then call KILLTEAM_RECONCILE_SETUP for the active side. Deploy only the number shown by setup.current_batch_target for the active AI pass; after the AI batch is complete, stop and wait for the player to place the active human batch. Never emit an extra AI deployment after the runtime switches current_side to the opponent. If setup.mode is roster_cards, use KILLTEAM_SELECT_ROSTER and KILLTEAM_LOCK_ROSTERS first. "
+                "Follow setup.ai_plan.deployment_order during model deployment, taking the first undeployed entry for the active stage. Use the live figurine GUID from setup.next_action or the roster/model observation when placing the model. "
+                "The runtime tracks the pending setup operative and the active side after each confirmed deployment.\n"
+                "Use MOVE[guid,target_x,target_y,target_z] for the live figurine move. The GUID must identify the figurine you are placing, not the roster-card operative ID; preserve its live y coordinate. Do not use KILLTEAM_DEPLOY_SETUP for placement."
                 "\nFor the deployment smoke test, emit exactly one standalone line:\n"
                 "KILLTEAM_DEPLOY_TEST\n"
                 "This zero-argument command resolves exactly one model whose name contains Plague Marine Warrior "

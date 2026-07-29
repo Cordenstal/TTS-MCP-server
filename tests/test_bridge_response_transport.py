@@ -3,8 +3,9 @@ from __future__ import annotations
 import json
 import os
 import queue
+import socket
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from urllib.request import Request, urlopen
 
 from http_gateway import HttpGateway
@@ -12,6 +13,21 @@ from server import TTSBridge, _ai_observation_bridge_timeout
 
 
 class BridgeResponseTransportTests(unittest.TestCase):
+    def test_windows_listener_claims_exclusive_callback_port(self) -> None:
+        bridge = TTSBridge()
+        listener = Mock()
+        bridge._listener_stop.set()
+
+        with patch("server.os.name", "nt"), patch(
+            "server.socket.socket", return_value=listener
+        ):
+            bridge._listen_loop()
+
+        listener.setsockopt.assert_called_once_with(
+            socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1
+        )
+        listener.bind.assert_called_once_with((bridge.host, bridge.receive_port))
+
     def test_ai_facing_bridge_deadlines_default_to_300_seconds(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
             self.assertEqual(TTSBridge().timeout, 300.0)
@@ -68,6 +84,7 @@ class BridgeResponseTransportTests(unittest.TestCase):
             sent["customMessage"]["snap_point_tag_count"],  # type: ignore[index]
             0,
         )
+        self.assertNotIn("args", sent["customMessage"])  # type: ignore[arg-type]
 
     def test_loopback_bridge_response_releases_the_matching_waiter(self) -> None:
         bridge = TTSBridge()

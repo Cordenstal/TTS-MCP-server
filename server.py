@@ -20,7 +20,10 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-import mss
+try:
+    import mss
+except ModuleNotFoundError:  # pragma: no cover - exercised by fallback tests
+    mss = None
 from PIL import Image as PILImage
 from PIL import ImageGrab as PILImageGrab
 from mcp.server.fastmcp import FastMCP
@@ -149,7 +152,15 @@ class TTSBridge:
         server: socket.socket | None = None
         try:
             server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            # On Windows, SO_REUSEADDR permits a second bridge process to bind
+            # 39998. TTS then delivers callbacks to whichever listener wins,
+            # causing the other process to send requests that always time out.
+            # Exclusive ownership converts that race into an actionable startup
+            # error. POSIX keeps address reuse for quick local restarts.
+            if os.name == "nt" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+                server.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            else:
+                server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             server.bind((self.host, self.receive_port))
             server.listen(16)
             server.settimeout(0.5)
@@ -415,12 +426,18 @@ class TTSBridge:
 
         try:
             request_args = dict(args or {})
-            custom_message = {
+            custom_message: dict[str, Any] = {
                 "channel": "tts-mcp",
                 "requestId": request_id,
                 "action": action,
-                "args": request_args,
             }
+            # This action is intentionally scalar-only on the Lua side. TTS
+            # can fail before onExternalMessage reaches Lua when an otherwise
+            # unused nested args object accompanies its root scalar fields.
+            # Leave the map out completely; the bridge reconstructs every
+            # supported collection from the mirrored scalar slots below.
+            if action != "killteam_list_objects":
+                custom_message["args"] = request_args
             # Certain External Editor builds lose nested customMessage values
             # while preserving direct properties. Keep the canonical args map
             # and mirror its fields for the Lua bridge's compatibility merge.
@@ -809,7 +826,7 @@ CAPABILITY_MANIFEST: list[dict[str, Any]] = [
         "category": "game-domain",
         "mutates": False,
         "confirmation": "explicit setup boundary; fails closed on ambiguity",
-        "verification": "tagged roster, dice, roller, counters, terrain, and visibility are validated",
+        "verification": "tagged roster, dice, roller, counters, terrain, visibility, and optional roster-card setup scaffolding are validated",
     },
     {
         "name": "tts_killteam_observe",
@@ -826,6 +843,76 @@ CAPABILITY_MANIFEST: list[dict[str, Any]] = [
         "verification": "bounded contents of the configured dedicated AI roster container",
     },
     {
+        "name": "tts_killteam_plan_setup_board",
+        "category": "game-domain",
+        "mutates": False,
+        "confirmation": "none",
+        "verification": "Deployed Zone card order, model GUIDs, planned renames, exact coordinates, and blocker evidence",
+    },
+    {
+        "name": "tts_killteam_plan_objective_move",
+        "category": "game-domain",
+        "mutates": False,
+        "confirmation": "none",
+        "verification": "objective selection, tactical candidate ranking, and the recommended MOVE command target",
+    },
+    {
+        "name": "tts_killteam_execute_setup_board",
+        "category": "game-domain",
+        "mutates": True,
+        "confirmation": "host-gated frozen setup plan execution",
+        "verification": "preflight snapshot, unlock and rename readback, exact move readback, and stop-on-first-failure report",
+    },
+    {
+        "name": "tts_killteam_select_roster_card",
+        "category": "game-domain",
+        "mutates": True,
+        "confirmation": "semantic AI-side roster selection from the tagged faction-deck container",
+        "verification": "contained card identity, roster-list zone placement, and partial list legality",
+    },
+    {
+        "name": "tts_killteam_lock_rosters",
+        "category": "game-domain",
+        "mutates": True,
+        "confirmation": "explicit roster-lock boundary before deployment",
+        "verification": "both sides' roster lists, faction composition, model availability, and deployment pass state",
+    },
+    {
+        "name": "tts_killteam_roll_initiative",
+        "category": "game-domain",
+        "mutates": True,
+        "confirmation": "explicit initiative override when the host does not want the AI-first default",
+        "verification": "one physical die per side, tie detection, and setup-stage transition",
+    },
+    {
+        "name": "tts_killteam_start_setup_deployment",
+        "category": "game-domain",
+        "mutates": True,
+        "confirmation": "begin exactly one AI model deployment for the active setup pass",
+        "verification": "pending model identity, recommended position, and current-side/pass legality",
+    },
+    {
+        "name": "tts_killteam_deploy_setup_operative",
+        "category": "game-domain",
+        "mutates": True,
+        "confirmation": "deploy the pending setup model using its live figurine GUID",
+        "verification": "exact position, deployment-zone containment, overlap check, GUID readback, and batch advancement",
+    },
+    {
+        "name": "tts_killteam_rollback_pending_deployment",
+        "category": "game-domain",
+        "mutates": True,
+        "confirmation": "explicit rollback of the currently pending setup operative",
+        "verification": "legacy pending card returns to the roster-list zone, or model reservation clears in direct deployment mode",
+    },
+    {
+        "name": "tts_killteam_reconcile_setup_step",
+        "category": "game-domain",
+        "mutates": True,
+        "confirmation": "read-only table reconciliation plus runtime state update for one setup operative",
+        "verification": "matching model identity, whole-zone legality, non-overlap, batch completion, and pass advancement",
+    },
+    {
         "name": "tts_killteam_probe_line_of_sight",
         "category": "game-domain",
         "mutates": False,
@@ -836,7 +923,7 @@ CAPABILITY_MANIFEST: list[dict[str, Any]] = [
         "name": "tts_killteam_place_operative",
         "category": "game-domain",
         "mutates": True,
-        "confirmation": "semantic placement; exact GUID remains adapter-internal",
+        "confirmation": "semantic placement using the live figurine GUID as the mover identity",
         "verification": "validated path and exact post-position",
     },
     {
@@ -1224,6 +1311,7 @@ def _killteam_setup_sync(
     opponent_dice_count: int = 1,
     roster_container_guid: str = "e5adb7",
     fixture_profile: str = SAVE_131_FIXTURE_PROFILE.name,
+    initiative_side: str = "",
 ) -> dict[str, Any]:
     """Start a fresh Kill Team scene epoch and validate it through TTS."""
     global _killteam_runtime
@@ -1235,6 +1323,9 @@ def _killteam_setup_sync(
         raise ValueError("dice counts must be positive")
     if not roster_container_guid.strip():
         raise ValueError("roster_container_guid must not be empty")
+    selected_fixture_profile = fixture_profile.strip()
+    if initiative_side.strip() and selected_fixture_profile == SAVE_131_FIXTURE_PROFILE.name:
+        selected_fixture_profile = ""
     with _killteam_lock:
         _killteam_runtime = KillTeamRuntime(
             TTSKillTeamBridge(bridge.request),
@@ -1244,10 +1335,34 @@ def _killteam_setup_sync(
                 ai_dice_count=int(ai_dice_count),
                 opponent_dice_count=int(opponent_dice_count),
                 roster_container_guid=roster_container_guid.strip().lower(),
-                fixture_profile=fixture_profile.strip(),
+                fixture_profile=selected_fixture_profile,
+                initiative_side=initiative_side.strip().lower(),
             ),
         )
-    return _killteam_call("setup")
+    return _killteam_call("setup", auto_start=True)
+
+
+def _killteam_plan_setup_board_sync(
+    *,
+    clearance: float = 0.25,
+) -> dict[str, Any]:
+    """Plan Save 131 board setup without using the legacy setup state machine."""
+    global _killteam_runtime
+    with _killteam_lock:
+        config = getattr(_killteam_runtime, "config", KillTeamConfig())
+        if config.fixture_profile != SAVE_131_FIXTURE_PROFILE.name:
+            _killteam_runtime = KillTeamRuntime(
+                TTSKillTeamBridge(bridge.request),
+                KillTeamConfig(fixture_profile=SAVE_131_FIXTURE_PROFILE.name),
+            )
+        try:
+            return _killteam_runtime.plan_setup_board(clearance=float(clearance))
+        except KillTeamError as exc:
+            session_store.record_event(
+                "killteam_action_error",
+                {"method": "plan_setup_board", "error_type": type(exc).__name__, "error": str(exc)},
+            )
+            raise
 
 
 @mcp.tool()
@@ -1257,9 +1372,16 @@ async def tts_killteam_setup(
     ai_dice_count: int = 1,
     opponent_dice_count: int = 1,
     roster_container_guid: str = "e5adb7",
-    fixture_profile: str = SAVE_131_FIXTURE_PROFILE.name,
+    fixture_profile: str = "",
+    initiative_side: str = "",
 ) -> dict[str, Any]:
-    """Validate Save 131's native Kill Team setup and build role-filtered state."""
+    """Start tagged Kill Team roster setup and build role-filtered state.
+
+    The Save 131 validation fixture remains available when callers explicitly
+    pass its profile name. The normal setup command enters model deployment
+    directly from tagged roster containers so the AI can select and deploy its
+    team one model at a time.
+    """
     return await asyncio.to_thread(
         _killteam_setup_sync,
         ai_team=ai_team,
@@ -1268,7 +1390,37 @@ async def tts_killteam_setup(
         opponent_dice_count=opponent_dice_count,
         roster_container_guid=roster_container_guid,
         fixture_profile=fixture_profile,
+        initiative_side=initiative_side,
     )
+
+
+@mcp.tool()
+async def tts_killteam_plan_setup_board(clearance: float = 0.25) -> dict[str, Any]:
+    """Plan Save 131 AI setup from live Deployed Zone cards and exact legal coordinates."""
+    return await asyncio.to_thread(
+        _killteam_plan_setup_board_sync,
+        clearance=float(clearance),
+    )
+
+
+@mcp.tool()
+async def tts_killteam_plan_objective_move(operative_id: str) -> dict[str, Any]:
+    """Plan a tactical objective-control move for one AI operative and return a MOVE target."""
+    if not operative_id.strip():
+        raise ValueError("operative_id is required")
+    return await asyncio.to_thread(
+        _killteam_call,
+        "plan_objective_move",
+        operative_id.strip(),
+    )
+
+
+@mcp.tool()
+async def tts_killteam_execute_setup_board(plan_id: str) -> dict[str, Any]:
+    """Execute a frozen Save 131 setup-board plan by GUID with readback after each move."""
+    if not plan_id.strip():
+        raise ValueError("plan_id is required")
+    return await asyncio.to_thread(_killteam_call, "execute_setup_board", plan_id.strip())
 
 
 @mcp.tool()
@@ -1281,6 +1433,104 @@ async def tts_killteam_observe() -> dict[str, Any]:
 async def tts_killteam_get_roster() -> dict[str, Any]:
     """Inspect the bounded dedicated AI roster container."""
     return await asyncio.to_thread(_killteam_call, "get_roster")
+
+
+@mcp.tool()
+async def tts_killteam_select_roster_card(
+    contained_guid: str,
+    action_id: str = "",
+) -> dict[str, Any]:
+    """Select one AI roster card from the tagged faction-deck container."""
+    if not contained_guid.strip():
+        raise ValueError("contained_guid is required")
+    return await asyncio.to_thread(
+        _killteam_call,
+        "select_roster_card",
+        contained_guid.strip(),
+        action_id=action_id.strip() or None,
+    )
+
+
+@mcp.tool()
+async def tts_killteam_lock_rosters(action_id: str = "") -> dict[str, Any]:
+    """Lock both sides' roster lists and begin official setup deployment cadence."""
+    return await asyncio.to_thread(
+        _killteam_call,
+        "lock_rosters",
+        action_id=action_id.strip() or None,
+    )
+
+
+@mcp.tool()
+async def tts_killteam_roll_initiative(action_id: str = "") -> dict[str, Any]:
+    """Roll one initiative die per side when the host wants to override the AI-first default."""
+    return await asyncio.to_thread(
+        _killteam_call,
+        "roll_initiative",
+        action_id=action_id.strip() or None,
+    )
+
+
+@mcp.tool()
+async def tts_killteam_start_setup_deployment(
+    operative_id: str,
+    action_id: str = "",
+) -> dict[str, Any]:
+    """Begin one AI model deployment and return its live GUID and recommended position."""
+    if not operative_id.strip():
+        raise ValueError("operative_id is required")
+    return await asyncio.to_thread(
+        _killteam_call,
+        "start_setup_deployment",
+        operative_id.strip(),
+        action_id=action_id.strip() or None,
+    )
+
+
+@mcp.tool()
+async def tts_killteam_deploy_setup_operative(
+    guid: str,
+    x: float,
+    y: float,
+    z: float,
+    action_id: str = "",
+) -> dict[str, Any]:
+    """Place the pending AI setup model at a validated deployment position."""
+    if not guid.strip():
+        raise ValueError("guid is required")
+    return await asyncio.to_thread(
+        _killteam_call,
+        "deploy_setup_operative",
+        guid.strip(),
+        {"x": float(x), "y": float(y), "z": float(z)},
+        action_id=action_id.strip() or None,
+    )
+
+
+@mcp.tool()
+async def tts_killteam_rollback_pending_deployment(action_id: str = "") -> dict[str, Any]:
+    """Clear a pending setup deployment, moving a legacy roster card back when applicable."""
+    return await asyncio.to_thread(
+        _killteam_call,
+        "rollback_pending_deployment",
+        action_id=action_id.strip() or None,
+    )
+
+
+@mcp.tool()
+async def tts_killteam_reconcile_setup_step(
+    side_id: str,
+    action_id: str = "",
+) -> dict[str, Any]:
+    """Validate one physical setup step for the named side and advance setup state if legal."""
+    if not side_id.strip():
+        raise ValueError("side_id is required")
+    return await asyncio.to_thread(
+        _killteam_call,
+        "reconcile_setup_step",
+        side_id.strip(),
+        action_id=action_id.strip() or None,
+    )
 
 
 @mcp.tool()
@@ -1313,17 +1563,17 @@ async def tts_killteam_probe_line_of_sight(
 
 @mcp.tool()
 async def tts_killteam_place_operative(
-    operative_id: str,
+    guid: str,
     path: list[dict[str, float]],
     action_id: str = "",
 ) -> dict[str, Any]:
     """Place or move an AI operative along a validated horizontal path."""
-    if not operative_id.strip() or not path:
-        raise ValueError("operative_id and a non-empty path are required")
+    if not guid.strip() or not path:
+        raise ValueError("guid and a non-empty path are required")
     return await asyncio.to_thread(
         _killteam_call,
         "place_operative",
-        operative_id.strip(),
+        guid.strip(),
         path,
         action_id=action_id.strip() or None,
     )
@@ -2594,13 +2844,20 @@ def _capture_view_snapshot(
     if max_width <= 0:
         raise ValueError("max_width must be positive")
 
-    try:
-        with mss.mss() as capture:
-            screenshot = capture.grab(
-                {"left": left, "top": top, "width": width, "height": height}
-            )
-        image = PILImage.frombytes("RGB", screenshot.size, screenshot.rgb)
-    except Exception as mss_error:
+    mss_error: Exception | None = None
+    if mss is not None:
+        try:
+            with mss.mss() as capture:
+                screenshot = capture.grab(
+                    {"left": left, "top": top, "width": width, "height": height}
+                )
+            image = PILImage.frombytes("RGB", screenshot.size, screenshot.rgb)
+        except Exception as exc:
+            mss_error = exc
+    else:
+        mss_error = ModuleNotFoundError("mss is not installed")
+
+    if mss_error is not None:
         # Pillow uses a separate Windows capture path and can succeed when
         # mss/BitBlt fails for a layered or multi-monitor TTS window.
         try:
@@ -2892,17 +3149,56 @@ def _ai_observation_bridge_timeout() -> float:
 
 def _ai_gameplay_request(action: str, args: dict[str, Any]) -> dict[str, Any]:
     """Route Kill Team chat placement through the semantic runtime."""
-    if action == "killteam_place_operative":
+    if action == "killteam_select_roster_card":
+        contained_guid = str(args.get("contained_guid", "")).strip()
+        if not contained_guid:
+            raise ValueError("killteam roster selection requires contained_guid")
+        return _killteam_call("select_roster_card", contained_guid)
+    if action == "killteam_roll_initiative":
+        return _killteam_call("roll_initiative")
+    if action == "killteam_lock_rosters":
+        return _killteam_call("lock_rosters")
+    if action == "killteam_start_setup_deployment":
         operative_id = str(args.get("operative_id", "")).strip()
         if not operative_id:
-            raise ValueError("killteam placement requires operative_id")
+            raise ValueError("killteam setup deployment requires operative_id")
+        return _killteam_call("start_setup_deployment", operative_id)
+    if action == "killteam_deploy_setup_operative":
+        guid = str(args.get("guid", "")).strip()
+        if not guid:
+            raise ValueError("killteam setup deployment requires guid")
+        try:
+            position = {axis: float(args[axis]) for axis in ("x", "y", "z")}
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("killteam setup deployment requires numeric x, y, and z") from exc
+        return _killteam_call("deploy_setup_operative", guid, position)
+    if action == "killteam_rollback_pending_deployment":
+        return _killteam_call("rollback_pending_deployment")
+    if action == "killteam_reconcile_setup_step":
+        side_id = str(args.get("side_id", "")).strip()
+        if not side_id:
+            raise ValueError("killteam setup reconciliation requires side_id")
+        return _killteam_call("reconcile_setup_step", side_id)
+    if action == "killteam_place_operative":
+        guid = str(args.get("guid", "")).strip()
+        if not guid:
+            raise ValueError("killteam placement requires guid")
         try:
             position = {axis: float(args[axis]) for axis in ("x", "y", "z")}
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError("killteam placement requires numeric x, y, and z") from exc
-        return _killteam_call("place_operative", operative_id, [position])
+        return _killteam_call("place_operative", guid, [position])
     if action == "killteam_deploy_test_model":
         return _killteam_call("deploy_test_model")
+    if action == "killteam_plan_setup_board":
+        return _killteam_plan_setup_board_sync(
+            clearance=float(args.get("clearance", 0.25)),
+        )
+    if action == "killteam_execute_setup_board":
+        return _killteam_call(
+            "execute_setup_board",
+            str(args.get("plan_id", "")).strip(),
+        )
     if action == "killteam_begin_setup_validation":
         action_id = str(args.get("action_id", "")).strip()
         if not action_id:
@@ -2936,6 +3232,8 @@ def _ai_observation_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
             units_per_inch=float(args.get("units_per_inch", 1.0)),
             ai_dice_count=int(args.get("ai_dice_count", 1)),
             opponent_dice_count=int(args.get("opponent_dice_count", 1)),
+            fixture_profile=str(args.get("fixture_profile", "")),
+            initiative_side=str(args.get("initiative_side", "")),
         )
     if name == "tts_killteam_probe_collection":
         return bridge.request(
@@ -2963,6 +3261,15 @@ def _ai_observation_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         return _killteam_call("observe")
     if name == "tts_killteam_get_roster":
         return _killteam_call("get_roster")
+    if name == "tts_killteam_plan_setup_board":
+        return _killteam_plan_setup_board_sync(
+            clearance=float(args.get("clearance", 0.25)),
+        )
+    if name == "tts_killteam_plan_objective_move":
+        operative_id = str(args.get("operative_id", "")).strip()
+        if not operative_id:
+            raise ValueError("Kill Team objective planning requires operative_id")
+        return _killteam_call("plan_objective_move", operative_id)
     if name == "tts_killteam_probe_line_of_sight":
         eye_local = args.get("eye_local")
         return _killteam_call(

@@ -194,7 +194,10 @@ recorded in [the Kill Team wiki page](killteam.md),
   normalization remains.
 - `[done]` Define the versioned Kill Team state schema and event types.
 - `[partial]` Build setup ingestion and fail-closed invariant validation.
-  Native tags, exact anchors, and global snap-point uniqueness remain.
+  Native tags, exact anchors, and global snap-point uniqueness remain. Generic
+  roster-card setup now validates clean starts, initiative as a first-class
+  setup stage, roster legality, physical model availability, and official
+  alternating deployment-pass cadence.
 - `[partial]` Add role-filtered structured observations. Approved camera views
   for activation/attack preparation remain.
 - `[partial]` Implement calibrated combat-zone geometry, terrain overrides,
@@ -228,6 +231,9 @@ ranged-action slice:
    keeping arbitrary mutations behind the semantic MCP interface. The gateway
    may execute only the bounded semantic initial-placement command after a
    role-filtered observation; it must not expose raw hidden objects or Lua.
+   The semantic setup surface now also covers AI roster-card selection, roster
+   locking, one-card-at-a-time setup deployment, rollback of the pending setup
+   operative, and one-step human-side reconciliation.
 4. `[done]` Make compact object evidence sufficient for inspection by retaining
    descriptions/profile metadata, exact type, tags, transforms, bounds, and
    truncation information. Add the bounded fallback roster query for dedicated

@@ -310,6 +310,10 @@ _Avoid_: Unvalidated scale assumption, mandatory calibration prop, screenshot-de
 The live AI-owned operative selected for placement from its staging area into the AI deployment zone during setup.
 _Avoid_: Ranged target, contained roster model, arbitrary scene object
 
+**Deployment figurine GUID**:
+The live TTS GUID of the deployment subject's figurine; placement and movement actions use this identifier to move the model itself.
+_Avoid_: Roster-card GUID, semantic operative ID, guessed selection
+
 **Setup placement anchor**:
 A fixture-defined exact point or object-relative relation that resolves to a deterministic legal placement using current bounds, base clearance, and zone boundaries.
 _Avoid_: Tactical destination, deployment-zone center assumption, guessed coordinates

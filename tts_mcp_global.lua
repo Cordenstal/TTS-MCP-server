@@ -10,7 +10,7 @@ local MCP_CHANNEL = "tts-mcp"
 -- Change this whenever the installed Global bridge has a behavior change.
 -- `tts_ping` returns it so a live TTS table can be distinguished from the
 -- source file on disk when the External Editor reports only guid=-1.
-local MCP_BRIDGE_VERSION = "2026-07-28-named-warrior-zone-v16"
+local MCP_BRIDGE_VERSION = "2026-07-29-generic-killteam-move-v17"
 local MCP_HTTP_CHAT_URL = "http://127.0.0.1:8765/chat"
 -- A private callback for bridge results. Unlike print(), this never appears
 -- in the in-game player chat or console feed.
@@ -221,11 +221,20 @@ local function mcp_json_safe(value, depth)
     end
     if value_type == "table" then
         local safe = {}
-        for key, item in pairs(value) do
-            local key_type = type(key)
-            if key_type == "string" or key_type == "number" then
-                safe[key] = mcp_json_safe(item, depth + 1)
+        -- A TTS-managed table can become invalid while a model or container
+        -- is unloading. Keep serialization from escaping the dispatch pcall;
+        -- the caller still receives a correlated response with a bounded
+        -- placeholder instead of an External Editor timeout.
+        local encoded_ok = pcall(function()
+            for key, item in pairs(value) do
+                local key_type = type(key)
+                if key_type == "string" or key_type == "number" then
+                    safe[key] = mcp_json_safe(item, depth + 1)
+                end
             end
+        end)
+        if not encoded_ok then
+            return "<unreadable>"
         end
         return safe
     end
@@ -270,6 +279,9 @@ local function mcp_send_bridge_response(response)
 
     -- Retain the next-frame retry for TTS builds that drop an immediate
     -- External Editor callback, while isolating it from any callback error.
+    -- The bundled roller waits 0.3 seconds, then waits another 35 frames
+    -- before assigning die values. Sampling after 30 frames reads the dice
+    -- before that callback has settled and can return an empty face list.
     Wait.frames(function()
         local retried, retry_err = pcall(sendExternalMessage, response)
         if not retried then
@@ -420,9 +432,24 @@ MCP_HANDLERS.list_objects = function(args, request_id)
 
     local results = {}
     local total_matching = 0
+    local skipped_invalid = 0
 
-    for _, obj in ipairs(getObjects()) do
-        if mcp_live_object(obj) then
+    -- Keep scene enumeration itself correlated. Individual stale references
+    -- are filtered below, but a failed getObjects() call must not leave the
+    -- MCP client waiting for a response that TTS will never send.
+    local objects_ok, objects_or_error = pcall(getObjects)
+    if not objects_ok then
+        error("TTS scene enumeration failed: " .. tostring(objects_or_error))
+    end
+    if type(objects_or_error) ~= "table" then
+        error("TTS scene enumeration returned an invalid object list")
+    end
+
+    for _, obj in ipairs(objects_or_error) do
+        local live_ok, live = pcall(mcp_live_object, obj)
+        if not live_ok or not live then
+            skipped_invalid = skipped_invalid + 1
+        else
             local object_name = string.lower(tostring(mcp_try(function() return obj.getName() end) or ""))
             local name_matches = name_filter == "" or string.find(
                 object_name,
@@ -448,6 +475,7 @@ MCP_HANDLERS.list_objects = function(args, request_id)
     return {
         count = #results,
         total_matching = total_matching,
+        skipped_invalid = skipped_invalid,
         truncated = total_matching > #results,
         objects = results,
     }
@@ -931,12 +959,47 @@ local function mcp_deployment_object_summary(obj)
     }
 end
 
+local function mcp_is_roster_card_summary(summary)
+    local summary_type = string.lower(tostring(summary.type or ""))
+    if summary_type == "card" or summary_type == "cardcustom" or summary_type == "deck" then
+        return true
+    end
+    for _, tag in ipairs(summary.tags or {}) do
+        local lowered = string.lower(tostring(tag))
+        if lowered == "_roster_card" or lowered == "roster card" then
+            return true
+        end
+    end
+    return false
+end
+
+local function mcp_is_deployment_figurine(summary)
+    if mcp_is_roster_card_summary(summary) then
+        return false
+    end
+
+    local summary_type = string.lower(tostring(summary.type or ""))
+    if summary_type == "custom_model" or summary_type == "figurine" then
+        return true
+    end
+
+    for _, tag in ipairs(summary.tags or {}) do
+        local lowered = string.lower(tostring(tag))
+        if lowered == "operative" or lowered == "ktuimini" then
+            return true
+        end
+    end
+
+    return false
+end
+
 MCP_HANDLERS.killteam_deployment_test_objects = function(args, request_id)
     local wanted_model_name = "plague marine warrior"
     local wanted_target_tag = "_deployment_zone_blue"
 
     local function resolve_unique_name(name)
-        local matches = {}
+        local figurine_matches = {}
+        local roster_card_matches = {}
         for _, obj in ipairs(getObjects()) do
             if mcp_live_object(obj) then
                 local object_name = string.lower(tostring(
@@ -949,20 +1012,27 @@ MCP_HANDLERS.killteam_deployment_test_objects = function(args, request_id)
                     if ok and type(summary) == "table" then
                         local guid = string.lower(tostring(summary.guid or ""))
                         if guid ~= "" and guid ~= "-1" then
-                            table.insert(matches, summary)
+                            if mcp_is_roster_card_summary(summary) then
+                                table.insert(roster_card_matches, summary)
+                            elseif mcp_is_deployment_figurine(summary) then
+                                table.insert(figurine_matches, summary)
+                            end
                         end
                     end
                 end
             end
         end
-        if #matches ~= 1 then
+        if #figurine_matches ~= 1 then
             error(
                 "test deployment name " .. name
-                .. " must resolve to exactly one object; found "
-                .. tostring(#matches)
+                .. " must resolve to exactly one figurine; found "
+                .. tostring(#figurine_matches)
+                .. " figurines and "
+                .. tostring(#roster_card_matches)
+                .. " roster cards"
             )
         end
-        return matches[1]
+        return figurine_matches[1]
     end
 
     local function resolve_unique_tag(tag)
@@ -1047,6 +1117,33 @@ MCP_HANDLERS.killteam_deployment_name_search = function(args, request_id)
     }
 end
 
+MCP_HANDLERS.killteam_setup_roster_cards = function(args, request_id)
+    local zone_guid = "aefe3b"
+    local zone = mcp_require_object(zone_guid)
+    local objects = mcp_try(function()
+        return zone.getObjects(false)
+    end)
+    local cards = {}
+    for index, obj in ipairs(objects) do
+        if mcp_live_object(obj) then
+            local ok, summary = pcall(function()
+                return mcp_compact_object_summary(obj)
+            end)
+            if ok and type(summary) == "table" then
+                summary.layout_index = index
+                table.insert(cards, summary)
+            end
+        end
+    end
+    return {
+        zone_guid = zone_guid,
+        zone_name = mcp_try(function() return zone.getName() end),
+        order_source = "layout_zone.getObjects",
+        count = #cards,
+        objects = cards,
+    }
+end
+
 MCP_HANDLERS.killteam_list_objects = function(args, request_id)
     local max_results = math.max(1, math.min(tonumber(args.max_results) or 200, 1000))
     local query_tags = mcp_decode_json_array(args.query_tags_json, "query_tags_json")
@@ -1056,7 +1153,8 @@ MCP_HANDLERS.killteam_list_objects = function(args, request_id)
         or type(snap_point_tags) ~= "table" then
         error("Kill Team snapshot collection arguments must decode to arrays")
     end
-    if #query_tags == 0 then
+    local generic_query = #query_tags == 0
+    if generic_query then
         query_tags = {
             "tts_mcp:entity=operative",
             "tts_mcp:entity=die",
@@ -1067,6 +1165,16 @@ MCP_HANDLERS.killteam_list_objects = function(args, request_id)
             "tts_mcp:entity=deployment",
             "tts_mcp:entity=objective",
         }
+    end
+    -- Some older setup callers still mirror the Save 131 placeholder GUID
+    -- even when the live scene does not contain that object. If the scene
+    -- lacks the sentinel, treat the request as generic setup instead of
+    -- aborting before observation can begin.
+    if generic_query and #required_guids == 1 and #snap_point_tags == 0 then
+        local required_guid = string.lower(tostring(required_guids[1] or ""))
+        if required_guid == "96fe20" and getObjectFromGUID(required_guid) == nil then
+            required_guids = {}
+        end
     end
     local results = {}
     local seen = {}
@@ -1175,6 +1283,12 @@ MCP_HANDLERS.killteam_list_objects = function(args, request_id)
         snap_points = snap_points,
         observation_scope = "killteam_tagged",
     }
+end
+
+MCP_HANDLERS.killteam_save_131_setup_objects = function(args, request_id)
+    -- The Save 131 fixture is stable and bounded. Keeping these filters in
+    -- Lua avoids TTS's managed External Editor wrappers for collection fields.
+    return MCP_HANDLERS.killteam_deployment_test_objects(args, request_id)
 end
 
 MCP_HANDLERS.killteam_get_roster = function(args, request_id)
@@ -1356,52 +1470,116 @@ MCP_HANDLERS.killteam_roll_dice = function(args, request_id)
     end
     local team = tostring(args.team or "")
     local requested = {}
-    for _, guid in ipairs(dice_guids) do
+    local pending_dice = {}
+    local roller_position = mcp_vector(mcp_try(function() return roller.getPosition() end))
+        or { x = 0, y = 3, z = 0 }
+    for index, guid in ipairs(dice_guids) do
         guid = string.lower(tostring(guid or ""))
         if not string.match(guid, "^[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]$") then
             error("Kill Team die GUID is invalid: " .. guid)
         end
-        local die = mcp_require_object(tostring(guid))
-        local has_canonical_tag = mcp_has_tag(die, "tts_mcp:entity=die")
-        local has_native_tag = args.die_tag ~= nil
-            and args.die_tag ~= ""
-            and mcp_has_tag(die, args.die_tag)
-        if not has_canonical_tag and not has_native_tag then
-            error("Object " .. tostring(guid) .. " is not tagged as a Kill Team die")
+        local die = mcp_try(function() return getObjectFromGUID(guid) end)
+        if die == nil then
+            -- A prior failed mechanical attempt may have placed a requested
+            -- die inside the roller. Release only that exact GUID before
+            -- using the native Roll command below.
+            local contained = false
+            for _, item in ipairs(mcp_try(function() return roller.getObjects() end) or {}) do
+                if string.lower(tostring(item.guid or "")) == guid then
+                    contained = true
+                    break
+                end
+            end
+            if not contained then
+                error("requested die is not in the scene or the selected roller: " .. guid)
+            end
+            roller.takeObject({
+                guid = guid,
+                position = {
+                    x = roller_position.x + index * 1.5,
+                    y = roller_position.y + 3,
+                    z = roller_position.z,
+                },
+                smooth = false,
+            })
         end
-        if team ~= "" and not has_native_tag and not mcp_has_tag(die, "tts_mcp:team=" .. team) then
-            error("Die " .. tostring(guid) .. " is not assigned to team " .. team)
+        if die ~= nil then
+            local has_canonical_tag = mcp_has_tag(die, "tts_mcp:entity=die")
+            local has_native_tag = args.die_tag ~= nil
+                and args.die_tag ~= ""
+                and mcp_has_tag(die, args.die_tag)
+            if not has_canonical_tag and not has_native_tag then
+                error("Object " .. tostring(guid) .. " is not tagged as a Kill Team die")
+            end
+            if team ~= "" and not has_native_tag and not mcp_has_tag(die, "tts_mcp:team=" .. team) then
+                error("Die " .. tostring(guid) .. " is not assigned to team " .. team)
+            end
         end
         requested[guid] = true
-        roller.putObject(die)
+        table.insert(pending_dice, guid)
     end
 
     Wait.frames(function()
-        local rolled_values = mcp_try(function() return roller.getTable("diceGuids") end) or {}
-        local faces = {}
-        local items = {}
-        for _, raw_guid in ipairs(dice_guids) do
-            local guid = string.lower(tostring(raw_guid))
-            local face = tonumber(rolled_values[guid])
-            if face == nil then
-                local die = mcp_try(function() return getObjectFromGUID(guid) end)
-                face = mcp_die_value(die)
-            end
-            table.insert(faces, face)
-            table.insert(items, {
-                guid = guid,
-                die_value = face,
-            })
+        for _, guid in ipairs(pending_dice) do
+            mcp_require_object(guid).roll()
         end
-        mcp_send_ok(request_id, {
-            team = team,
-            purpose = tostring(args.purpose or ""),
-            roller_guid = args.roller_guid,
-            faces = faces,
-            items = items,
-        })
-    end, 30)
+        -- Native rolls are asynchronous; wait for all dice to settle before
+        -- reading their upward face values.
+        Wait.frames(function()
+            local faces = {}
+            local items = {}
+            for _, raw_guid in ipairs(dice_guids) do
+                local guid = string.lower(tostring(raw_guid))
+                local face = mcp_die_value(mcp_require_object(guid))
+                table.insert(faces, face)
+                table.insert(items, {
+                    guid = guid,
+                    die_value = face,
+                })
+            end
+            mcp_send_ok(request_id, {
+                team = team,
+                purpose = tostring(args.purpose or ""),
+                roller_guid = args.roller_guid,
+                faces = faces,
+                items = items,
+                roll_method = "native_die_roll",
+            })
+        end, 120)
+    end, 15)
     return nil, true
+end
+
+MCP_HANDLERS.killteam_read_dice_values = function(args, request_id)
+    -- Read a committed physical roll without moving, rerolling, or otherwise
+    -- changing the dice. This is the recovery path when a deferred roller
+    -- response arrived before its object-script callbacks had settled.
+    local roller = mcp_require_object(args.roller_guid)
+    local dice_guids = mcp_decode_json_array(args.dice_guids_json, "dice_guids_json")
+    if type(dice_guids) ~= "table" or #dice_guids == 0 or #dice_guids > 12 then
+        error("dice_guids must contain at least one die GUID")
+    end
+    local rolled_values = mcp_try(function() return roller.getTable("diceGuids") end) or {}
+    local faces = {}
+    local items = {}
+    for _, raw_guid in ipairs(dice_guids) do
+        local guid = string.lower(tostring(raw_guid or ""))
+        if not string.match(guid, "^[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]$") then
+            error("Kill Team die GUID is invalid: " .. guid)
+        end
+        local face = tonumber(rolled_values[guid])
+        if face == nil then
+            face = mcp_die_value(mcp_require_object(guid))
+        end
+        table.insert(faces, face)
+        table.insert(items, { guid = guid, die_value = face })
+    end
+    return {
+        roller_guid = tostring(roller.getGUID()),
+        faces = faces,
+        items = items,
+        settled = not (#faces == 0 or #faces ~= #dice_guids),
+    }
 end
 
 MCP_HANDLERS.killteam_observe_defense_roll = function(args, request_id)
@@ -1885,7 +2063,9 @@ function mcp_handleExternalMessage(data)
     end
 
     if action == "killteam_deployment_test_objects"
-        or action == "killteam_deployment_name_search" then
+        or action == "killteam_deployment_name_search"
+        or action == "killteam_setup_roster_cards"
+        or action == "killteam_save_131_setup_objects" then
         local handler = MCP_HANDLERS[action]
         mcp_debug("[tts-mcp] received action: " .. action)
         local ok, result, deferred = pcall(handler, {}, request_id)
