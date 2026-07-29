@@ -114,6 +114,16 @@ class TTSKillTeamBridge:
         self._request = request
 
     def list_objects(self, **kwargs: Any) -> dict[str, Any]:
+        if kwargs.pop("raw", False):
+            payload: dict[str, Any] = {
+                "max_results": kwargs.get("max_results", 1000),
+                "compact": bool(kwargs.get("compact", False)),
+            }
+            if "name_contains" in kwargs:
+                payload["name_contains"] = kwargs["name_contains"]
+            if "tag" in kwargs:
+                payload["tag"] = kwargs["tag"]
+            return self._request("list_objects", payload)
         query_names = list(kwargs.get("query_names") or [])
         query_tags = list(kwargs.get("query_tags") or [])
         required_guids = list(kwargs.get("required_guids") or [])
@@ -783,8 +793,11 @@ class KillTeamRuntime:
             and not objects
             and query_tags == list(_GENERIC_SETUP_QUERY_TAGS)
         ):
-            fallback_kwargs = dict(list_kwargs)
-            fallback_kwargs["query_tags"] = list(_GENERIC_NATIVE_SETUP_QUERY_TAGS)
+            fallback_kwargs = {
+                "max_results": 1000,
+                "compact": True,
+                "raw": True,
+            }
             result = self.bridge.list_objects(**fallback_kwargs)
             self._listing_truncated = bool(result.get("truncated")) if isinstance(result, dict) else True
             objects = result.get("objects", []) if isinstance(result, dict) else []

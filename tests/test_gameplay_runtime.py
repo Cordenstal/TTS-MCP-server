@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from gameplay_runtime import (
+from tts_mcp.runtime.gameplay_runtime import (
     CatalogIndex,
     CommandExecution,
     GamePromptBuilder,
@@ -352,6 +352,44 @@ def test_command_execution_dispatches_semantic_killteam_placement() -> None:
     ]
 
 
+def test_parser_supports_dedicated_killteam_setup_placement() -> None:
+    commands = parse_ai_commands("KILLTEAM_SETUP_PLACE[model-ai-warrior-1, -2.0, 1.0, 3.5]")
+
+    assert len(commands) == 1
+    assert commands[0].action == "killteam_setup_place_model"
+    assert commands[0].args == {
+        "guid": "model-ai-warrior-1",
+        "x": -2.0,
+        "y": 1.0,
+        "z": 3.5,
+    }
+
+
+def test_command_execution_dispatches_dedicated_killteam_setup_placement() -> None:
+    calls = []
+
+    def request(action, args):
+        calls.append((action, args))
+        return {"status": "verified", "guid": args["guid"]}
+
+    executor = CommandExecution(request, lambda _: "unused")
+    result = executor.execute(
+        parse_ai_commands("KILLTEAM_SETUP_PLACE[model-ai-warrior-1, -2.0, 1.0, 3.5]"),
+        running=True,
+        active_game="killteam",
+    )
+
+    assert result["executed"][0]["status"] == "executed"
+    assert calls == [
+        ("killteam_setup_place_model", {
+            "guid": "model-ai-warrior-1",
+            "x": -2.0,
+            "y": 1.0,
+            "z": 3.5,
+        }),
+    ]
+
+
 def test_parser_supports_guid_based_killteam_deployment() -> None:
     commands = parse_ai_commands("KILLTEAM_DEPLOY_SETUP[model-ai-warrior-1, -2.0, 1.0, 3.5]")
 
@@ -655,6 +693,7 @@ class KillTeamCommandProtocolTests(unittest.TestCase):
         self.assertIn("MOVE[guid,x,y,z]", prompt)
         self.assertNotIn("tts_list_objects", prompt)
         self.assertIn("MOVE[guid,target_x,target_y,target_z]", prompt)
+        self.assertIn("KILLTEAM_SETUP_PLACE[guid,x,y,z]", prompt)
         self.assertNotIn("KILLTEAM_DEPLOY_SETUP[guid,target_x,target_y,target_z]", prompt)
         self.assertNotIn("KILLTEAM_PLACE[operative_id,target_x,target_y,target_z]", prompt)
         self.assertIn("\nKILLTEAM_DEPLOY_TEST\n", prompt)

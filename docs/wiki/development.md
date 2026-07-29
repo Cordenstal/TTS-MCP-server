@@ -28,7 +28,8 @@ python -m unittest discover -s tests -v
 
 When TTS is available:
 
-1. Install the current `tts_mcp_global.lua` in the Global script.
+1. Install `tts_mcp_global.lua` in the Global script for the full runtime.
+2. Install `tts_killteam_setup_global.lua` in the Global script when you want the placement-only setup bridge.
 2. Call `tts_ping`.
 3. Call `tts_get_scene_summary` and `tts_get_object` for a known GUID.
 4. Move or rotate a disposable object and verify returned post-state.

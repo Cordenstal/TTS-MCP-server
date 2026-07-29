@@ -1,6 +1,6 @@
 import unittest
 
-from action_plan import expectation_failures, validate_action_plan
+from tts_mcp.support.action_plan import expectation_failures, validate_action_plan
 
 
 class ActionPlanValidationTests(unittest.TestCase):

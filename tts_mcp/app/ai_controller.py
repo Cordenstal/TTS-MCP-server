@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from session_store import SessionStore
+from ..support.session_store import SessionStore
 
 
 ACTION_ID = re.compile(r"^[A-Za-z0-9]{4,12}$")

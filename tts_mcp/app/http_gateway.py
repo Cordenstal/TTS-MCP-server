@@ -18,10 +18,10 @@ from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from ai_controller import AIController
-from session_store import SessionStore
-from runtime_trace import record as _record_trace
-from gameplay_runtime import (
+from .ai_controller import AIController
+from ..support.session_store import SessionStore
+from ..support.runtime_trace import record as _record_trace
+from ..runtime.gameplay_runtime import (
     CatalogIndex,
     CommandExecution,
     GamePromptBuilder,
@@ -30,7 +30,10 @@ from gameplay_runtime import (
     classify_intent,
     parse_ai_commands,
 )
-from checkers_runtime import AutonomousCheckersTurn, CheckersBoardAdapter
+from ..runtime.checkers_runtime import AutonomousCheckersTurn, CheckersBoardAdapter
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -379,6 +382,27 @@ OBSERVATION_TOOL_SPECS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "tts_killteam_setup_ping",
+            "description": "Check that the dedicated placement-only Kill Team setup bridge responds.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "tts_killteam_setup_list_objects",
+            "description": "List objects through the dedicated placement-only Kill Team setup bridge.",
+            "parameters": {"type": "object", "properties": {
+                "name_contains": {"type": "string"},
+                "tag": {"type": "string"},
+                "max_results": {"type": "integer", "minimum": 1, "maximum": 1000},
+                "compact": {"type": "boolean"},
+            }},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "tts_killteam_probe_collection",
             "description": "Diagnose one bounded stage of the Kill Team setup observation collector.",
             "parameters": {"type": "object", "properties": {
@@ -490,6 +514,8 @@ OBSERVATION_TOOL_NAMES = {
 KILLTEAM_OBSERVATION_TOOL_NAMES = {
     "tts_ping",
     "tts_killteam_setup",
+    "tts_killteam_setup_ping",
+    "tts_killteam_setup_list_objects",
     "tts_killteam_probe_collection",
     "tts_killteam_observe",
     "tts_killteam_probe_line_of_sight",
@@ -789,7 +815,7 @@ class ChatBackend:
         # Do not implicitly import or discover the former V6 catalog. Scene
         # awareness comes exclusively from live TTS objects and screenshots.
         self.catalog = CatalogIndex(catalog_path or None)
-        self.prompt_builder = GamePromptBuilder(Path(__file__).resolve().parent / "game_rules", self.catalog)
+        self.prompt_builder = GamePromptBuilder(PROJECT_ROOT / "game_rules", self.catalog)
         self.scene_intelligence = ScenePlacementIntelligence(self.catalog)
         self._inbox: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=200)
         self.reload(self.config_store.load())
@@ -877,6 +903,28 @@ class ChatBackend:
         if str(controller.get("active_game", "")).strip().casefold() != "killteam":
             return None
         text = str(message or "").strip()
+        match = re.fullmatch(r"KILLTEAM_SETUP_PLACE\[([^,\]]+),\s*(-?[0-9]+(?:\.[0-9]+)?),\s*(-?[0-9]+(?:\.[0-9]+)?),\s*(-?[0-9]+(?:\.[0-9]+)?)\]", text, re.I)
+        if match:
+            if self.command_execution is None:
+                raise RuntimeError("Kill Team gameplay execution is not configured")
+            result = self.command_execution.request(
+                "killteam_setup_place_model",
+                {
+                    "guid": match.group(1).strip(),
+                    "x": float(match.group(2)),
+                    "y": float(match.group(3)),
+                    "z": float(match.group(4)),
+                },
+            )
+            position = result.get("position", {}) if isinstance(result, dict) else {}
+            return {
+                "text": (
+                    f"Setup placement verified for {result.get('name') or result.get('guid', match.group(1).strip())} "
+                    f"at ({position.get('x')}, {position.get('y')}, {position.get('z')})."
+                ),
+                "commands": [],
+                "killteam_setup_placement": result,
+            }
         if re.fullmatch(r"KILLTEAM_DEPLOY_TEST", text, re.I):
             if not is_host:
                 return {
@@ -985,6 +1033,9 @@ class ChatBackend:
             "tts_killteam_observe only when you need fresh live state outside that scripted flow. The observation returns exact operative IDs and live GUIDs; use the "
             "GUID from that observation directly in "
             "MOVE[guid,x,y,z] when repositioning an AI operative. Do not use KILLTEAM_PLACE for ordinary movement. "
+            "If you are only performing setup placement through the dedicated placement-only bridge, use "
+            "tts_killteam_setup_ping, tts_killteam_setup_list_objects, and tts_killteam_setup_place_model; "
+            "this bridge is separate from the larger Kill Team runtime. "
             "For setup deployment, use the live figurine GUID rather than an operative_id when calling "
             "tts_killteam_deploy_setup_operative or the semantic KILLTEAM_DEPLOY_SETUP command. "
             "When objective control is the goal, call tts_killteam_plan_objective_move with the operative_id "
@@ -1033,6 +1084,8 @@ class ChatBackend:
             "tts_find_objects_in_region": {"minimum_x", "minimum_y", "minimum_z", "maximum_x", "maximum_y", "maximum_z", "name_contains", "tag", "max_results"},
             "tts_get_zone_objects": {"guid", "ignore_tags"},
             "tts_killteam_setup": {"ai_team", "units_per_inch", "ai_dice_count", "opponent_dice_count"},
+            "tts_killteam_setup_ping": set(),
+            "tts_killteam_setup_list_objects": {"name_contains", "tag", "max_results", "compact"},
             "tts_killteam_probe_collection": {"stage", "index", "item_index"},
             "tts_killteam_observe": set(),
             "tts_killteam_get_roster": set(),
@@ -1064,6 +1117,11 @@ class ChatBackend:
                 raise ValueError("tts_killteam_setup requires positive units_per_inch")
             bounded["ai_dice_count"] = max(1, int(bounded.get("ai_dice_count", 1)))
             bounded["opponent_dice_count"] = max(1, int(bounded.get("opponent_dice_count", 1)))
+        if name == "tts_killteam_setup_list_objects":
+            bounded["name_contains"] = str(bounded.get("name_contains", ""))
+            bounded["tag"] = str(bounded.get("tag", ""))
+            bounded["max_results"] = max(1, min(int(bounded.get("max_results", 200)), 1000))
+            bounded["compact"] = bool(bounded.get("compact", True))
         if name == "tts_killteam_probe_collection":
             allowed_stages = {
                 "decode",
@@ -1154,7 +1212,7 @@ class ChatBackend:
                 checkers_board = _checkers_board_observation(result)
                 if checkers_board is not None:
                     return checkers_board
-            list_limit = 200 if name in {"tts_killteam_setup", "tts_killteam_observe", "tts_killteam_plan_setup_board", "tts_killteam_plan_objective_move"} else 50
+            list_limit = 200 if name in {"tts_killteam_setup", "tts_killteam_setup_list_objects", "tts_killteam_observe", "tts_killteam_plan_setup_board", "tts_killteam_plan_objective_move"} else 50
             compact = _compact_tool_value(result, list_limit=list_limit)
             if not isinstance(compact, dict):
                 compact = {"value": compact}
@@ -2154,7 +2212,7 @@ class ChatBackend:
 class GatewayHandler(BaseHTTPRequestHandler):
     backend = ChatBackend()
     controller = AIController(
-        Path(__file__).resolve().parent / "game_rules",
+        PROJECT_ROOT / "game_rules",
         SessionStore(),
     )
     backend.context_provider = controller.context

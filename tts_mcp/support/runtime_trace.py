@@ -22,7 +22,7 @@ TRACE_ENABLED = os.getenv("TTS_TRACE", "1").strip().lower() not in {
 }
 TRACE_LOG_PATH = os.getenv(
     "TTS_TRACE_LOG",
-    str(Path(__file__).resolve().parent / ".tmp" / "tts_mcp_trace.log"),
+    str(Path(__file__).resolve().parents[2] / ".tmp" / "tts_mcp_trace.log"),
 )
 _trace_path = Path(TRACE_LOG_PATH)
 TRACE_JSON_LOG_PATH = os.getenv(

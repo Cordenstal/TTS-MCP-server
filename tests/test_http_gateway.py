@@ -4,7 +4,7 @@ import unittest
 from unittest.mock import patch
 import json
 
-from http_gateway import ChatBackend, _public_ai_text
+from tts_mcp.app.http_gateway import ChatBackend, _public_ai_text
 
 
 class PublicAITextTests(unittest.TestCase):
@@ -135,7 +135,7 @@ class PublicAITextTests(unittest.TestCase):
             })),
         ])
 
-        with patch("http_gateway.urlopen", side_effect=lambda *args, **kwargs: next(responses)) as request:
+        with patch("tts_mcp.app.http_gateway.urlopen", side_effect=lambda *args, **kwargs: next(responses)) as request:
             result = backend.complete({"message": "Where is the red pawn?", "conversation_id": "tool-test"})
 
         self.assertEqual(result["text"], "I found the red pawn.")
@@ -186,7 +186,7 @@ class PublicAITextTests(unittest.TestCase):
             })})),
             Response(json.dumps({"text": "That is the red pawn."})),
         ])
-        with patch("http_gateway.urlopen", side_effect=lambda *args, **kwargs: next(responses)):
+        with patch("tts_mcp.app.http_gateway.urlopen", side_effect=lambda *args, **kwargs: next(responses)):
             result = backend.complete({"message": "What is abcdef?", "conversation_id": "fallback-test"})
 
         self.assertEqual(result["text"], "That is the red pawn.")
@@ -224,7 +224,7 @@ class PublicAITextTests(unittest.TestCase):
             }}]})),
             Response(json.dumps({"choices": [{"message": {"content": "I can see the table."}}]})),
         ])
-        with patch("http_gateway.urlopen", side_effect=lambda *args, **kwargs: next(responses)) as request:
+        with patch("tts_mcp.app.http_gateway.urlopen", side_effect=lambda *args, **kwargs: next(responses)) as request:
             result = backend.complete({"message": "Look at the current table.", "conversation_id": "image-test"})
 
         self.assertEqual(result["text"], "I can see the table.")
@@ -272,7 +272,7 @@ class PublicAITextTests(unittest.TestCase):
                 "role": "assistant", "content": "I inspected the board."
             }})),
         ])
-        with patch("http_gateway.urlopen", side_effect=lambda *args, **kwargs: next(responses)) as request:
+        with patch("tts_mcp.app.http_gateway.urlopen", side_effect=lambda *args, **kwargs: next(responses)) as request:
             result = backend.complete({"message": "Inspect the board.", "conversation_id": "ollama-image-test"})
 
         self.assertEqual(result["text"], "I inspected the board.")
@@ -318,7 +318,7 @@ class PublicAITextTests(unittest.TestCase):
             }}]})),
             Response(json.dumps({"choices": [{"message": {"content": "I reviewed one current view."}}]})),
         ])
-        with patch("http_gateway.urlopen", side_effect=lambda *args, **kwargs: next(responses)):
+        with patch("tts_mcp.app.http_gateway.urlopen", side_effect=lambda *args, **kwargs: next(responses)):
             result = backend.complete({"message": "Review the board visually.", "conversation_id": "image-budget-test"})
 
         self.assertEqual(result["text"], "I reviewed one current view.")
@@ -394,7 +394,7 @@ class PublicAITextTests(unittest.TestCase):
             }}),
         ])
 
-        with patch("http_gateway.urlopen", side_effect=lambda *args, **kwargs: next(responses)):
+        with patch("tts_mcp.app.http_gateway.urlopen", side_effect=lambda *args, **kwargs: next(responses)):
             result = backend.complete({"message": "Make your move.", "conversation_id": "observation-failure-test"})
 
         self.assertNotIn("tts_mcp_global.lua", result["text"])
@@ -463,7 +463,7 @@ class PublicAITextTests(unittest.TestCase):
             def read(self):
                 return json.dumps({"message": {"content": "The piece is visibly away from the target square."}}).encode()
 
-        with patch("http_gateway.urlopen", return_value=Response()) as outbound:
+        with patch("tts_mcp.app.http_gateway.urlopen", return_value=Response()) as outbound:
             result = backend._finalize_result({"text": "MOVE[abcdef,1,2,3]"}, {})
 
         self.assertIn("Visual review", result["text"])
@@ -471,19 +471,21 @@ class PublicAITextTests(unittest.TestCase):
         self.assertTrue(any(message.get("images") == ["ZmFrZQ=="] for message in payload["messages"]))
 
     def test_observation_registry_exposes_direct_object_listing(self) -> None:
-        from http_gateway import OBSERVATION_TOOL_NAMES
+        from tts_mcp.app.http_gateway import OBSERVATION_TOOL_NAMES
 
         self.assertIn("tts_list_objects", OBSERVATION_TOOL_NAMES)
 
     def test_observation_registry_exposes_bridge_ping(self) -> None:
-        from http_gateway import OBSERVATION_TOOL_NAMES
+        from tts_mcp.app.http_gateway import OBSERVATION_TOOL_NAMES
 
         self.assertIn("tts_ping", OBSERVATION_TOOL_NAMES)
 
     def test_observation_registry_exposes_killteam_setup_and_observe(self) -> None:
-        from http_gateway import OBSERVATION_TOOL_NAMES
+        from tts_mcp.app.http_gateway import OBSERVATION_TOOL_NAMES
 
         self.assertIn("tts_killteam_setup", OBSERVATION_TOOL_NAMES)
+        self.assertIn("tts_killteam_setup_ping", OBSERVATION_TOOL_NAMES)
+        self.assertIn("tts_killteam_setup_list_objects", OBSERVATION_TOOL_NAMES)
         self.assertIn("tts_killteam_observe", OBSERVATION_TOOL_NAMES)
         self.assertIn("tts_killteam_probe_collection", OBSERVATION_TOOL_NAMES)
         self.assertIn("tts_killteam_probe_line_of_sight", OBSERVATION_TOOL_NAMES)
@@ -537,6 +539,39 @@ class PublicAITextTests(unittest.TestCase):
         self.assertEqual(result["container_guid"], "e5adb7")
         self.assertEqual(calls, [{}])
 
+    def test_ai_can_dispatch_dedicated_killteam_setup_observations(self) -> None:
+        backend = ChatBackend()
+        calls = []
+        backend.configure_observation_tools({
+            "tts_killteam_setup_ping": lambda args: calls.append(("ping", args)) or {
+                "bridge_version": "2026-07-29-setup-placement-v1",
+            },
+            "tts_killteam_setup_list_objects": lambda args: calls.append(("list", args)) or {
+                "objects": [{"guid": "model-1"}],
+            },
+        })
+
+        ping = backend._invoke_observation({
+            "name": "tts_killteam_setup_ping",
+            "arguments": {},
+        })
+        listing = backend._invoke_observation({
+            "name": "tts_killteam_setup_list_objects",
+            "arguments": {"name_contains": "warrior", "max_results": 5},
+        })
+
+        self.assertTrue(ping["ok"])
+        self.assertTrue(listing["ok"])
+        self.assertEqual(calls, [
+            ("ping", {}),
+            ("list", {
+                "name_contains": "warrior",
+                "tag": "",
+                "max_results": 5,
+                "compact": True,
+            }),
+        ])
+
     def test_ai_can_dispatch_killteam_objective_move_planner(self) -> None:
         backend = ChatBackend()
         calls = []
@@ -567,6 +602,8 @@ class PublicAITextTests(unittest.TestCase):
         }
 
         self.assertIn("tts_killteam_setup", names)
+        self.assertIn("tts_killteam_setup_ping", names)
+        self.assertIn("tts_killteam_setup_list_objects", names)
         self.assertIn("tts_killteam_observe", names)
         self.assertIn("tts_killteam_probe_line_of_sight", names)
         self.assertIn("tts_ping", names)
@@ -657,7 +694,7 @@ class PublicAITextTests(unittest.TestCase):
             "tts_killteam_observe": observe,
         })
 
-        with patch("http_gateway._record_trace", side_effect=record):
+        with patch("tts_mcp.app.http_gateway._record_trace", side_effect=record):
             result = backend._invoke_observation({
                 "id": "call-17",
                 "name": "tts_killteam_observe",
@@ -726,7 +763,7 @@ class PublicAITextTests(unittest.TestCase):
             }}]})),
             Response(json.dumps({"choices": [{"message": {"content": "I found the checker."}}]})),
         ])
-        with patch("http_gateway.urlopen", side_effect=lambda *args, **kwargs: next(responses)):
+        with patch("tts_mcp.app.http_gateway.urlopen", side_effect=lambda *args, **kwargs: next(responses)):
             result = backend.complete({"message": "List the board objects.", "conversation_id": "list-test"})
 
         self.assertEqual(result["text"], "I found the checker.")
@@ -1043,7 +1080,7 @@ class PublicAITextTests(unittest.TestCase):
 
         backend.command_execution = Executor()
 
-        with patch("http_gateway.urlopen", side_effect=AssertionError("AI backend should not be called for a direct MOVE command")):
+        with patch("tts_mcp.app.http_gateway.urlopen", side_effect=AssertionError("AI backend should not be called for a direct MOVE command")):
             result = backend.complete({"message": "MOVE[96fe20,-18.0858974456787,1.489675760269165,-8.608673095703125]"})
 
         self.assertEqual(executed, [{"guid": "96fe20", "x": -18.0858974456787, "y": 1.489675760269165, "z": -8.608673095703125}])
@@ -1070,7 +1107,7 @@ class PublicAITextTests(unittest.TestCase):
             def read(self):
                 return b'{"message":{"content":"Ready."}}'
 
-        with patch("http_gateway.urlopen", return_value=Response()) as request:
+        with patch("tts_mcp.app.http_gateway.urlopen", return_value=Response()) as request:
             backend.complete({"message": "hello", "conversation_id": "think-test"})
 
         payload = json.loads(request.call_args.args[0].data.decode("utf-8"))
@@ -1095,7 +1132,7 @@ class PublicAITextTests(unittest.TestCase):
             def read(self):
                 return b'{"message":{"content":""},"done":true,"done_reason":"length"}'
 
-        with patch("http_gateway.urlopen", return_value=Response()):
+        with patch("tts_mcp.app.http_gateway.urlopen", return_value=Response()):
             result = backend.complete({"message": "Make a move", "conversation_id": "truncated-test"})
 
         self.assertIn("response limit", result["text"])
@@ -1120,7 +1157,7 @@ class PublicAITextTests(unittest.TestCase):
             def read(self):
                 return b'{"message":{"content":"ready"}}'
 
-        with patch("http_gateway.urlopen", return_value=Response()) as request:
+        with patch("tts_mcp.app.http_gateway.urlopen", return_value=Response()) as request:
             backend.complete({"message": "hello", "conversation_id": "keep-alive-test"})
 
         payload = json.loads(request.call_args.args[0].data.decode("utf-8"))

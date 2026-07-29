@@ -2,8 +2,8 @@ import threading
 import unittest
 from unittest.mock import patch
 
-import runtime_trace
-from runtime_trace import console_event, pretty_event, record, snapshot
+import tts_mcp.support.runtime_trace as runtime_trace
+from tts_mcp.support.runtime_trace import console_event, pretty_event, record, snapshot
 
 
 class RuntimeTraceTests(unittest.TestCase):

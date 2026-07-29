@@ -8,18 +8,26 @@ import unittest
 from unittest.mock import Mock, patch
 from urllib.request import Request, urlopen
 
-from http_gateway import HttpGateway
-from server import TTSBridge, _ai_observation_bridge_timeout
+from tts_mcp.app.http_gateway import HttpGateway
+try:
+    from tts_mcp.app import server
+except ModuleNotFoundError as exc:  # pragma: no cover - dependency-gated test import
+    server = None
+    _SERVER_IMPORT_ERROR = exc
+else:
+    _SERVER_IMPORT_ERROR = None
 
 
 class BridgeResponseTransportTests(unittest.TestCase):
     def test_windows_listener_claims_exclusive_callback_port(self) -> None:
-        bridge = TTSBridge()
+        if _SERVER_IMPORT_ERROR is not None:
+            self.skipTest(f"server dependencies missing: {_SERVER_IMPORT_ERROR}")
+        bridge = server.TTSBridge()
         listener = Mock()
         bridge._listener_stop.set()
 
-        with patch("server.os.name", "nt"), patch(
-            "server.socket.socket", return_value=listener
+        with patch("tts_mcp.app.server.os.name", "nt"), patch(
+            "tts_mcp.app.server.socket.socket", return_value=listener
         ):
             bridge._listen_loop()
 
@@ -29,12 +37,16 @@ class BridgeResponseTransportTests(unittest.TestCase):
         listener.bind.assert_called_once_with((bridge.host, bridge.receive_port))
 
     def test_ai_facing_bridge_deadlines_default_to_300_seconds(self) -> None:
+        if _SERVER_IMPORT_ERROR is not None:
+            self.skipTest(f"server dependencies missing: {_SERVER_IMPORT_ERROR}")
         with patch.dict(os.environ, {}, clear=True):
-            self.assertEqual(TTSBridge().timeout, 300.0)
-            self.assertEqual(_ai_observation_bridge_timeout(), 300.0)
+            self.assertEqual(server.TTSBridge().timeout, 300.0)
+            self.assertEqual(server._ai_observation_bridge_timeout(), 300.0)
 
     def test_request_keeps_external_editor_custom_message_object_form(self) -> None:
-        bridge = TTSBridge()
+        if _SERVER_IMPORT_ERROR is not None:
+            self.skipTest(f"server dependencies missing: {_SERVER_IMPORT_ERROR}")
+        bridge = server.TTSBridge()
         sent: dict[str, object] = {}
         bridge.ensure_listener = lambda: None  # type: ignore[method-assign]
 
@@ -87,7 +99,9 @@ class BridgeResponseTransportTests(unittest.TestCase):
         self.assertNotIn("args", sent["customMessage"])  # type: ignore[arg-type]
 
     def test_loopback_bridge_response_releases_the_matching_waiter(self) -> None:
-        bridge = TTSBridge()
+        if _SERVER_IMPORT_ERROR is not None:
+            self.skipTest(f"server dependencies missing: {_SERVER_IMPORT_ERROR}")
+        bridge = server.TTSBridge()
         request_id = "response-transport-test"
         waiter: queue.Queue[dict[str, object]] = queue.Queue(maxsize=1)
         with bridge._pending_guard:

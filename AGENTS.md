@@ -35,7 +35,7 @@ MCP client / Codex
         |
         | stdio MCP
         v
-server.py
+python -m tts_mcp.app.server
         |
         | JSON over localhost:39999
         | callbacks on localhost:39998
@@ -46,7 +46,8 @@ Tabletop Simulator
 tts_mcp_global.lua
 ```
 
-`killteam_runtime.py` owns the typed Kill Team state and rules seam. Detailed
+`tts_mcp/runtime/killteam_runtime.py` owns the typed Kill Team state and rules
+seam. Detailed
 behavioral guidance for movement, model identification, LOS, setup, attack
 dice, and semantic Kill Team actions is documented in the ADR/wiki set rather
 than duplicated here. Start with:
@@ -63,6 +64,9 @@ than duplicated here. Start with:
 - `docs/wiki/observation-and-visuals.md`
 - `docs/wiki/roadmap.md`
 
+The Python implementation lives under `tts_mcp/`, Windows launchers live in
+`launchers/windows/`, and demo drawing scripts live in `scripts/demos/`.
+
 Use those documents as the source of truth for gameplay semantics, movement
 contracts, bridge boundaries, and AI behavior. Keep this file focused on
 handoff-critical repo notes, not rule duplication.
@@ -70,6 +74,10 @@ handoff-critical repo notes, not rule duplication.
 ## Development guidance
 
 - Keep the Python and Lua bridge action names synchronized.
+- Keep the placement-only Kill Team setup bridge
+  (`tts_mcp/runtime/killteam_setup_runtime.py` and
+  `tts_killteam_setup_global.lua`) separate from the full runtime bridge;
+  do not silently merge their action names or responsibilities.
 - Prefer read/inspect tools before mutating tools.
 - Identify objects by GUID rather than display name alone.
 - Preserve the existing External Editor callback protocol and request IDs.
@@ -94,9 +102,9 @@ handoff-critical repo notes, not rule duplication.
 
 Keep the repository easy to navigate and safe to hand off:
 
-- Keep production Python modules at the repository root only when they are
-  top-level application entry points or shared runtime modules. Put reusable
-  helpers in clearly named modules rather than growing one monolithic file.
+- Keep production Python modules under `tts_mcp/` and organize them by
+  purpose. Put reusable helpers in clearly named modules rather than growing
+  one monolithic file.
 - Keep the Lua bridge at the repository root unless the bridge architecture is
   deliberately reorganized. Python action names and Lua handler names must
   remain easy to find and compare.
@@ -129,7 +137,7 @@ Keep the repository easy to navigate and safe to hand off:
 Before handing off Python changes, run:
 
 ```powershell
-python -m compileall -q server.py
+python -m compileall -q tts_mcp
 ```
 
 When TTS is available, also verify that the Lua bridge responds to `tts_ping`

@@ -29,26 +29,31 @@ from PIL import ImageGrab as PILImageGrab
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp import Image as MCPImage
 
-from http_gateway import BackendConfigStore, HttpGateway
-from session_store import SessionStore
-from action_plan import expectation_failures, validate_action_plan
-from semantic_index import rank_scene_objects
-from runtime_trace import (
+from .http_gateway import BackendConfigStore, HttpGateway
+from ..support.session_store import SessionStore
+from ..support.action_plan import expectation_failures, validate_action_plan
+from ..support.semantic_index import rank_scene_objects
+from ..support.runtime_trace import (
     TRACE_ENABLED as _TRACE_ENABLED,
     TRACE_LOG_PATH as _TRACE_LOG_PATH,
     record as _record_trace,
     recent as _recent_trace,
     snapshot as _trace_value,
 )
-from save_file import apply_operations, inspect_save, resolve_save_path
-from windows_gui import load_save_via_gui
-from gameplay_runtime import checkers_capture_holding_position, should_capture_game_vision
-from killteam_runtime import (
+from ..support.save_file import apply_operations, inspect_save, resolve_save_path
+from ..support.windows_gui import load_save_via_gui
+from ..runtime.gameplay_runtime import checkers_capture_holding_position, should_capture_game_vision
+from ..runtime.killteam_runtime import (
     KillTeamConfig,
     KillTeamError,
     KillTeamRuntime,
     SAVE_131_FIXTURE_PROFILE,
     TTSKillTeamBridge,
+)
+from ..runtime.killteam_setup_runtime import (
+    KillTeamSetupError,
+    KillTeamSetupRuntime,
+    TTSKillTeamSetupBridge,
 )
 
 
@@ -64,7 +69,7 @@ class TTSCommandError(TTSBridgeError):
     """Raised when the in-game Lua bridge rejects a command."""
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 GAME_RULES_ROOT = PROJECT_ROOT / "game_rules"
 session_store = SessionStore()
 backend_config_store = BackendConfigStore()
@@ -567,6 +572,8 @@ class TTSBridge:
 bridge = TTSBridge()
 _killteam_lock = threading.RLock()
 _killteam_runtime = KillTeamRuntime(TTSKillTeamBridge(bridge.request))
+_killteam_setup_lock = threading.RLock()
+_killteam_setup_runtime = KillTeamSetupRuntime(TTSKillTeamSetupBridge(bridge.request))
 
 mcp = FastMCP(
     "tabletop-simulator",
@@ -827,6 +834,27 @@ CAPABILITY_MANIFEST: list[dict[str, Any]] = [
         "mutates": False,
         "confirmation": "explicit setup boundary; fails closed on ambiguity",
         "verification": "tagged roster, dice, roller, counters, terrain, visibility, and optional roster-card setup scaffolding are validated",
+    },
+    {
+        "name": "tts_killteam_setup_ping",
+        "category": "game-domain",
+        "mutates": False,
+        "confirmation": "none",
+        "verification": "dedicated placement-only bridge version and availability",
+    },
+    {
+        "name": "tts_killteam_setup_list_objects",
+        "category": "observation",
+        "mutates": False,
+        "confirmation": "none",
+        "verification": "bounded placement-scene object inventory with name and tag filters",
+    },
+    {
+        "name": "tts_killteam_setup_place_model",
+        "category": "game-domain",
+        "mutates": True,
+        "confirmation": "explicit placement intent and exact post-state verification",
+        "verification": "live model GUID, target position, and readback after the move settles",
     },
     {
         "name": "tts_killteam_observe",
@@ -1303,6 +1331,19 @@ def _killteam_call(method: str, *args: Any, **kwargs: Any) -> dict[str, Any]:
             raise
 
 
+def _killteam_setup_call(method: str, *args: Any, **kwargs: Any) -> dict[str, Any]:
+    """Serialize placement-only setup mutations through the dedicated bridge."""
+    with _killteam_setup_lock:
+        try:
+            return getattr(_killteam_setup_runtime, method)(*args, **kwargs)
+        except KillTeamSetupError as exc:
+            session_store.record_event(
+                "killteam_setup_action_error",
+                {"method": method, "error_type": type(exc).__name__, "error": str(exc)},
+            )
+            raise
+
+
 def _killteam_setup_sync(
     *,
     ai_team: str = "ai",
@@ -1391,6 +1432,50 @@ async def tts_killteam_setup(
         roster_container_guid=roster_container_guid,
         fixture_profile=fixture_profile,
         initiative_side=initiative_side,
+    )
+
+
+@mcp.tool()
+async def tts_killteam_setup_ping() -> dict[str, Any]:
+    """Check that the dedicated placement-only Kill Team setup bridge responds."""
+    return await asyncio.to_thread(_killteam_setup_call, "ping")
+
+
+@mcp.tool()
+async def tts_killteam_setup_list_objects(
+    name_contains: str = "",
+    tag: str = "",
+    max_results: int = 200,
+    compact: bool = True,
+) -> dict[str, Any]:
+    """List objects through the dedicated placement-only setup bridge."""
+    return await asyncio.to_thread(
+        _killteam_setup_call,
+        "list_objects",
+        name_contains=name_contains,
+        tag=tag,
+        max_results=max_results,
+        compact=compact,
+    )
+
+
+@mcp.tool()
+async def tts_killteam_setup_place_model(
+    guid: str,
+    x: float,
+    y: float,
+    z: float,
+    action_id: str = "",
+) -> dict[str, Any]:
+    """Place one live model at an exact setup coordinate and verify the readback."""
+    if not guid.strip():
+        raise ValueError("guid is required")
+    return await asyncio.to_thread(
+        _killteam_setup_call,
+        "place_model",
+        guid.strip(),
+        {"x": float(x), "y": float(y), "z": float(z)},
+        action_id=action_id.strip() or None,
     )
 
 
@@ -3188,6 +3273,15 @@ def _ai_gameplay_request(action: str, args: dict[str, Any]) -> dict[str, Any]:
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError("killteam placement requires numeric x, y, and z") from exc
         return _killteam_call("place_operative", guid, [position])
+    if action == "killteam_setup_place_model":
+        guid = str(args.get("guid", "")).strip()
+        if not guid:
+            raise ValueError("killteam setup placement requires guid")
+        try:
+            position = {axis: float(args[axis]) for axis in ("x", "y", "z")}
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("killteam setup placement requires numeric x, y, and z") from exc
+        return _killteam_setup_call("place_model", guid, position)
     if action == "killteam_deploy_test_model":
         return _killteam_call("deploy_test_model")
     if action == "killteam_plan_setup_board":
@@ -3226,6 +3320,8 @@ def _ai_observation_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
             {},
             timeout=_ai_observation_bridge_timeout(),
         )
+    if name == "tts_killteam_setup_ping":
+        return _killteam_setup_call("ping")
     if name == "tts_killteam_setup":
         return _killteam_setup_sync(
             ai_team=str(args.get("ai_team", "ai")),
@@ -3234,6 +3330,14 @@ def _ai_observation_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
             opponent_dice_count=int(args.get("opponent_dice_count", 1)),
             fixture_profile=str(args.get("fixture_profile", "")),
             initiative_side=str(args.get("initiative_side", "")),
+        )
+    if name == "tts_killteam_setup_list_objects":
+        return _killteam_setup_call(
+            "list_objects",
+            name_contains=str(args.get("name_contains", "")),
+            tag=str(args.get("tag", "")),
+            max_results=max(1, min(int(args.get("max_results", 200)), 1000)),
+            compact=bool(args.get("compact", True)),
         )
     if name == "tts_killteam_probe_collection":
         return bridge.request(

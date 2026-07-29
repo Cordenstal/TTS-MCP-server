@@ -18,6 +18,11 @@ control plane's visibility, identity, planning, approval, and verification
 gates.
 _Avoid_: alternate authority, direct bridge mutation, safety bypass
 
+**Placement-only setup bridge**:
+A narrow setup-time control path that can list objects and place a live model
+at an exact coordinate without engaging the full game runtime.
+_Avoid_: full game state machine, mixed setup/combat bridge, hidden setup macro
+
 **Generic object action**:
 A bounded, allowlisted operation on a TTS object, such as moving, rotating, locking, naming, spawning, destroying, or changing container membership.
 _Avoid_: Arbitrary Lua, unrestricted scene command

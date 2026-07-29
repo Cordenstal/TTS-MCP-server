@@ -66,7 +66,7 @@ faction-deck containers, roster model containers, `Roster List <side>` zones,
 `Deployed Zone <side>` zones, and deployment zones, then tracks initiative,
 roster locking, and deployment cadence in the typed state machine.
 The generic object scan first tries the canonical `tts_mcp:` setup tags, then
-falls back to the native blue/red scene tags when that canonical scan is empty.
+falls back to a raw compact scene scan when that canonical scan is empty.
 
 ## Observation and map model
 
@@ -79,8 +79,13 @@ identity and coordinates.
 The MCP client and in-game AI gateway share the same setup/observation seam.
 `tts_killteam_setup` creates a fresh scene epoch by discovering the tagged live
 table through bounded bridge actions. The fixture profile supplies native query
-tags and exact anchors; the Lua bridge does not hard-code this fixture and does
-not walk unrelated mod objects through generic `list_objects`.
+tags and exact anchors; the Lua bridge does not hard-code this fixture and
+falls back to a raw compact scene enumeration only when the canonical tagged
+scan is empty.
+The placement-only setup bridge is separate from that full runtime. It
+exposes `tts_killteam_setup_ping`, `tts_killteam_setup_list_objects`, and
+`tts_killteam_setup_place_model` when the workflow only needs exact model
+placement and readback instead of the broader setup state machine.
 `tts_killteam_observe` then returns the current revision, observation ID,
 visible operative records, terrain, AI dice references, counters, roller GUID,
 and an explicit truncation flag. Setup is a start-of-game operation and must
@@ -232,7 +237,9 @@ wound-state projection. Resource scoring, camera-assisted ambiguity handling,
 broader human-event reconciliation, and turn/scenario rules remain subsequent
 slices. The public MCP entry points are
 `tts_killteam_setup`, `tts_killteam_observe`,
-`tts_killteam_get_roster`, `tts_killteam_plan_objective_move`,
+`tts_killteam_setup_ping`, `tts_killteam_setup_list_objects`,
+`tts_killteam_setup_place_model`, `tts_killteam_get_roster`,
+`tts_killteam_plan_objective_move`,
 `tts_killteam_select_roster_card`,
 `tts_killteam_lock_rosters`, `tts_killteam_start_setup_deployment`,
 `tts_killteam_deploy_setup_operative`,
@@ -247,6 +254,8 @@ isolated deployment smoke test with `KILLTEAM_DEPLOY_TEST` and
 starts the fixture pipeline with `KILLTEAM_VALIDATE_SETUP[action_id]`. The
 fixture pipeline resumes only
 when authenticated Red or host chat says `Defense roll complete`.
+The placement-only setup bridge also accepts `KILLTEAM_SETUP_PLACE[guid,x,y,z]`
+for exact model placement without loading the broader setup state machine.
 
 ### Setup deployment state machine
 

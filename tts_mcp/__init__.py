@@ -1,0 +1,2 @@
+"""Tabletop Simulator MCP package."""
+

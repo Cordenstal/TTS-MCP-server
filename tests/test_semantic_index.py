@@ -1,6 +1,6 @@
 import unittest
 
-from semantic_index import rank_scene_objects, score_object_reference
+from tts_mcp.support.semantic_index import rank_scene_objects, score_object_reference
 
 
 class SemanticIndexTests(unittest.TestCase):

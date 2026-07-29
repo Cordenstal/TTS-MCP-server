@@ -1,6 +1,6 @@
 @echo off
 setlocal EnableExtensions
-title TTS MCP Server - Elevated Quick Restart
+title TTS MCP Server - Elevated Quick Start
 
 net session >nul 2>&1
 if not errorlevel 1 goto elevated
@@ -10,5 +10,6 @@ powershell.exe -NoProfile -Command "Start-Process -Verb RunAs -FilePath '%ComSpe
 exit /b
 
 :elevated
-call "%~dp0quick_restart.bat"
+cd /d "%~dp0..\.."
+call "%~dp0quick_start.bat"
 endlocal

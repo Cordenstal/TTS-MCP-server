@@ -11,11 +11,11 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from runtime_trace import record as _record_trace
+from ..support.runtime_trace import record as _record_trace
 
 
-ROOT = Path(__file__).resolve().parent
-CHILD = ROOT / "server.py"
+ROOT = Path(__file__).resolve().parents[2]
+CHILD_MODULE = "tts_mcp.app.server"
 SUPERVISOR_HOST = os.getenv("TTS_SUPERVISOR_HOST", "127.0.0.1")
 SUPERVISOR_PORT = int(os.getenv("TTS_SUPERVISOR_PORT", "8770"))
 
@@ -59,7 +59,7 @@ class ProcessSupervisor:
             return {
                 "running": running,
                 "pid": self.process.pid if self.process and running else None,
-                "server": str(CHILD),
+                "server": CHILD_MODULE,
                 "http_port": int(os.getenv("TTS_HTTP_PORT", "8765")),
                 "log": str(self.log_path),
             }
@@ -95,7 +95,7 @@ class ProcessSupervisor:
                 "process_start_requested",
                 component="mcp_server",
                 executable=sys.executable,
-                command=[sys.executable, str(CHILD)],
+                command=[sys.executable, "-m", CHILD_MODULE],
             )
             env = os.environ.copy()
             env["TTS_SUPERVISED"] = "1"
@@ -103,7 +103,7 @@ class ProcessSupervisor:
             log = self.log_path.open("ab")
             flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
             self.process = subprocess.Popen(
-                [sys.executable, str(CHILD)],
+                [sys.executable, "-m", CHILD_MODULE],
                 cwd=str(ROOT),
                 env=env,
                 stdin=subprocess.DEVNULL,

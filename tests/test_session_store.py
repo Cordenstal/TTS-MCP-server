@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from session_store import SessionStore
+from tts_mcp.support.session_store import SessionStore
 
 
 class SemanticAliasStoreTests(unittest.TestCase):

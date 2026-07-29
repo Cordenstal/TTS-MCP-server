@@ -2,8 +2,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from ai_controller import AIController
-from session_store import SessionStore
+from tts_mcp.app.ai_controller import AIController
+from tts_mcp.support.session_store import SessionStore
 
 
 class AIControllerTests(unittest.TestCase):

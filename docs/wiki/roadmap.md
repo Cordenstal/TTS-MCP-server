@@ -265,6 +265,9 @@ ranged-action slice:
     fixture. Persist detailed audit evidence, leave the resulting scene intact,
     and stop on uncertain callbacks, collider mismatch, visibility
     contradiction, or missing human acknowledgment.
+12. `[done]` Add a placement-only Kill Team setup bridge and runtime that can
+    ping, list objects, and place a live model at an exact coordinate without
+    loading the larger setup/combat runtime.
 
 ## Later implementation order
 

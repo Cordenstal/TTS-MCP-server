@@ -13,7 +13,7 @@ Codex CLI / Codex IDE
         |
         | MCP over stdio
         v
-server.py
+python -m tts_mcp.app.server
         |
         | JSON to 127.0.0.1:39999
         | callbacks on 127.0.0.1:39998
@@ -30,6 +30,9 @@ Global Lua bridge (tts_mcp_global.lua)
 
 TTS must run on the same Windows computer as this MCP server because the
 External Editor API is localhost-only.
+
+The Python implementation now lives under `tts_mcp/`, Windows launchers live
+in `launchers/windows/`, and demo drawing scripts live in `scripts/demos/`.
 
 ## Current product boundary
 
@@ -185,7 +188,9 @@ See the [Kill Team design](docs/wiki/killteam.md),
 
 The first implementation slice is now available through these semantic MCP
 tools: `tts_killteam_setup`, `tts_killteam_observe`,
-`tts_killteam_get_roster`, `tts_killteam_plan_objective_move`,
+`tts_killteam_setup_ping`, `tts_killteam_setup_list_objects`,
+`tts_killteam_setup_place_model`, `tts_killteam_get_roster`,
+`tts_killteam_plan_objective_move`,
 `tts_killteam_select_roster_card`,
 `tts_killteam_lock_rosters`, `tts_killteam_start_setup_deployment`,
 `tts_killteam_deploy_setup_operative`,
@@ -238,17 +243,22 @@ automatically reroll or change wounds. Apply damage only after the defender
 states whether each save is normal or critical.
 
 The in-game AI gateway can also call the bounded `tts_killteam_setup`,
-`tts_killteam_observe`, `tts_killteam_get_roster`,
+`tts_killteam_setup_ping`, `tts_killteam_setup_list_objects`,
+`tts_killteam_setup_place_model`, `tts_killteam_observe`, `tts_killteam_get_roster`,
 `tts_killteam_plan_objective_move`, and `tts_killteam_probe_line_of_sight`
 tools. The roster query reads the dedicated AI container, currently `e5adb7`,
 only when the live observation lacks a needed profile or model identity. The
 objective planner returns a suggested `MOVE[guid,x,y,z]` target for safe
 contesting or staging around an objective. Setup is intended once per loaded
 game; subsequent turns should use fresh observation and on-demand LOS probes.
+The placement-only setup bridge is separate from the larger Kill Team runtime
+and exists for exact model placement when the full setup state machine is not
+needed.
 For semantic roster setup, the gateway accepts `KILLTEAM_ROLL_INITIATIVE`,
 `KILLTEAM_SELECT_ROSTER[contained_guid]`,
 `KILLTEAM_LOCK_ROSTERS`, `KILLTEAM_START_DEPLOYMENT[operative_id]`,
-`MOVE[guid,x,y,z]`, `KILLTEAM_ROLLBACK_PENDING`,
+`MOVE[guid,x,y,z]`, `KILLTEAM_SETUP_PLACE[guid,x,y,z]`,
+`KILLTEAM_ROLLBACK_PENDING`,
 and `KILLTEAM_RECONCILE_SETUP[side_id]`. Use `KILLTEAM_ROLL_INITIATIVE` as
 the first semantic setup step unless initiative has already been explicitly
 overridden outside the runtime. For the initial placement test, the gateway accepts
@@ -442,11 +452,11 @@ set `TTS_TRACE_LOG` to choose another human-readable log path.
 Trace writes are asynchronous and best-effort: a locked or slow log file never
 blocks TTS chat, bridge callbacks, or the HTTP gateway.
 
-The Windows `quick_start.bat` console keeps tracing enabled by default and
-shows live TTS, AI-message, backend-request, and AI-response events. When
-running `bridge_supervisor.py`, the child server's trace stderr is mirrored to
-the supervisor console while MCP protocol output remains in
-`tts_mcp_server.log`.
+The Windows `launchers/windows/quick_start.bat` console keeps tracing enabled
+by default and shows live TTS, AI-message, backend-request, and AI-response
+events. When running `python -m tts_mcp.app.bridge_supervisor`, the child
+server's trace stderr is mirrored to the supervisor console while MCP
+protocol output remains in `tts_mcp_server.log`.
 The live console uses compact one-line summaries; full structured payloads
 remain in `.tmp/tts_mcp_trace.jsonl` for detailed debugging.
 Player chat contains only the AI response text. Bridge diagnostics and HTTP
@@ -461,7 +471,7 @@ With echo mode enabled, verify the gateway before opening TTS:
 
 ```powershell
 $env:AI_BACKEND_ECHO = "1"
-python server.py
+python -m tts_mcp.app.server
 
 Invoke-RestMethod http://127.0.0.1:8765/health
 Invoke-RestMethod http://127.0.0.1:8765/chat -Method Post `
@@ -474,14 +484,15 @@ The second request should return `text: "!ai bridge test"`. In TTS, type
 
 For a gateway-only diagnostic session, use `TTS_GATEWAY_ONLY=1`. This keeps
 the HTTP gateway running without starting the MCP stdio transport, so it can
-be tested directly from PowerShell. Normal `python server.py` startup should
-be performed by the MCP client, not by typing into an interactive terminal.
+be tested directly from PowerShell. Normal `python -m tts_mcp.app.server`
+startup should be performed by the MCP client, not by typing into an
+interactive terminal.
 
-On Windows, double-click `quick_start.bat` for the TTS-only launch in a new
-console window. Startup first stops existing listeners on ports 8765/8770 and
-older TTS MCP Python processes from this workspace, then starts one fresh
-instance. Use `quick_restart.bat` for the same clean restart. Both scripts
-prefer `.venv\Scripts\python.exe`.
+On Windows, double-click `launchers/windows/quick_start.bat` for the TTS-only
+launch in a new console window. Startup first stops existing listeners on
+ports 8765/8770 and older TTS MCP Python processes from this workspace, then
+starts one fresh instance. Use `launchers/windows/quick_restart.bat` for the
+same clean restart. Both scripts prefer `.venv\Scripts\python.exe`.
 If Hermes is installed and no `tts_mcp_backend.json` exists, quick start uses
 `hermes_tts_backend.py` automatically; otherwise configure an HTTP, command,
 or queue backend explicitly through `/admin`.
@@ -490,7 +501,7 @@ To verify queue mode without an AI runtime:
 
 ```powershell
 $env:AI_BACKEND_KIND = "queue"
-python server.py
+python -m tts_mcp.app.server
 Invoke-RestMethod http://127.0.0.1:8765/chat/next?timeout=1
 ```
 
@@ -525,18 +536,18 @@ comma-separated `TTS_ALLOWED_BACKEND_EXECUTABLES` list (for example,
 ### Full process supervisor
 
 For controls that terminate and relaunch the entire MCP server process tree,
-run the supervisor instead of launching `server.py` directly:
+run the supervisor instead of launching the server module directly:
 
 ```powershell
 cd "C:\path\to\tabletop-simulator-mcp"
-python bridge_supervisor.py
+python -m tts_mcp.app.bridge_supervisor
 ```
 
 Open `http://127.0.0.1:8770/admin`. **Stop all bridge processes** terminates
-the managed `server.py` process and its children; the supervisor remains alive
-so Start and Restart continue to work. The supervisor launches the MCP server
-on its normal ports, mirrors the live trace to the supervisor console, and
-writes child output to `tts_mcp_server.log`.
+the managed `tts_mcp.app.server` process and its children; the supervisor
+remains alive so Start and Restart continue to work. The supervisor launches
+the MCP server on its normal ports, mirrors the live trace to the supervisor
+console, and writes child output to `tts_mcp_server.log`.
 
 ## 2. Install the bridge in Tabletop Simulator
 
@@ -561,7 +572,7 @@ executable and absolute paths:
 ```powershell
 codex mcp add tabletop-simulator -- `
   "C:\path\to\tabletop-simulator-mcp\.venv\Scripts\python.exe" `
-  "C:\path\to\tabletop-simulator-mcp\server.py"
+  "-m" "tts_mcp.app.server"
 ```
 
 Or edit `%USERPROFILE%\.codex\config.toml`:
@@ -569,7 +580,7 @@ Or edit `%USERPROFILE%\.codex\config.toml`:
 ```toml
 [mcp_servers.tabletop_simulator]
 command = "C:\\path\\to\\tabletop-simulator-mcp\\.venv\\Scripts\\python.exe"
-args = ["C:\\path\\to\\tabletop-simulator-mcp\\server.py"]
+args = ["-m", "tts_mcp.app.server"]
 startup_timeout_sec = 300
 tool_timeout_sec = 300
 default_tools_approval_mode = "writes"
@@ -652,6 +663,12 @@ Test-NetConnection 127.0.0.1 -Port 39999
 
 The Python side reached TTS, but the loaded game did not answer. Reinstall
 `tts_mcp_global.lua` in the game's Global script and select **Save & Play**.
+
+### `tts_killteam_setup_ping` times out
+
+The placement-only bridge is not loaded in the active Global script. Paste
+`tts_killteam_setup_global.lua` into the game's Global script, select
+**Save & Play**, and look for the load message before retrying the ping.
 
 ### Existing mod stops handling external messages
 

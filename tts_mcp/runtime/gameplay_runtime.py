@@ -149,6 +149,13 @@ def parse_ai_commands(text: str, *, max_commands: int = 50) -> list[ParsedComman
         add("killteam_lock_rosters", {})
     for m in re.finditer(r"KILLTEAM_START_DEPLOYMENT\[([^\]]+)\]", text, re.I):
         add("killteam_start_setup_deployment", {"operative_id": m.group(1).strip()})
+    for m in re.finditer(r"KILLTEAM_SETUP_PLACE\[([^,\]]+),\s*(" + _NUMBER + r"),\s*(" + _NUMBER + r"),\s*(" + _NUMBER + r")\]", text, re.I):
+        add("killteam_setup_place_model", {
+            "guid": m.group(1).strip(),
+            "x": float(m.group(2)),
+            "y": float(m.group(3)),
+            "z": float(m.group(4)),
+        })
     for m in re.finditer(r"KILLTEAM_DEPLOY_SETUP\[([^,\]]+),\s*(" + _NUMBER + r"),\s*(" + _NUMBER + r"),\s*(" + _NUMBER + r")\]", text, re.I):
         add("killteam_deploy_setup_operative", {
             "guid": m.group(1).strip(),
@@ -203,6 +210,7 @@ def parse_ai_commands(text: str, *, max_commands: int = 50) -> list[ParsedComman
                 "killteam_select_roster_card",
                 "killteam_lock_rosters",
                 "killteam_start_setup_deployment",
+                "killteam_setup_place_model",
                 "killteam_deploy_setup_operative",
                 "killteam_rollback_pending_deployment",
                 "killteam_reconcile_setup_step",
@@ -365,7 +373,9 @@ class GamePromptBuilder:
                 "Assume the AI side has initiative unless the host explicitly overrides it outside the runtime. After tts_killteam_setup, use setup.next_action and setup.ai_plan to select the first AI model and use its recommended position. Call KILLTEAM_START_DEPLOYMENT for one model at a time, then emit exactly one MOVE using the live figurine GUID and recommended coordinates, then call KILLTEAM_RECONCILE_SETUP for the active side. Deploy only the number shown by setup.current_batch_target for the active AI pass; after the AI batch is complete, stop and wait for the player to place the active human batch. Never emit an extra AI deployment after the runtime switches current_side to the opponent. If setup.mode is roster_cards, use KILLTEAM_SELECT_ROSTER and KILLTEAM_LOCK_ROSTERS first. "
                 "Follow setup.ai_plan.deployment_order during model deployment, taking the first undeployed entry for the active stage. Use the live figurine GUID from setup.next_action or the roster/model observation when placing the model. "
                 "The runtime tracks the pending setup operative and the active side after each confirmed deployment.\n"
-                "Use MOVE[guid,target_x,target_y,target_z] for the live figurine move. The GUID must identify the figurine you are placing, not the roster-card operative ID; preserve its live y coordinate. Do not use KILLTEAM_DEPLOY_SETUP for placement."
+                "Use MOVE[guid,target_x,target_y,target_z] for the live figurine move. The GUID must identify the figurine you are placing, not the roster-card operative ID; preserve its live y coordinate. "
+                "For the dedicated placement-only setup bridge, use tts_killteam_setup_ping and tts_killteam_setup_list_objects to resolve the live model, then use "
+                "KILLTEAM_SETUP_PLACE[guid,x,y,z] for exact setup placement instead of the legacy deployment flow."
                 "\nFor the deployment smoke test, emit exactly one standalone line:\n"
                 "KILLTEAM_DEPLOY_TEST\n"
                 "This zero-argument command resolves exactly one model whose name contains Plague Marine Warrior "

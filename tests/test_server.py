@@ -6,7 +6,7 @@ from unittest.mock import patch
 from PIL import Image
 
 try:
-    import server
+    from tts_mcp.app import server
 except ModuleNotFoundError as exc:  # pragma: no cover - dependency-gated test import
     server = None
     _SERVER_IMPORT_ERROR = exc

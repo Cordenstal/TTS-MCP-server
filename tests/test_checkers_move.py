@@ -2,7 +2,13 @@ from __future__ import annotations
 
 import unittest
 
-from server import _validate_checkers_target
+try:
+    from tts_mcp.app import server
+except ModuleNotFoundError as exc:  # pragma: no cover - dependency-gated test import
+    server = None
+    _SERVER_IMPORT_ERROR = exc
+else:
+    _SERVER_IMPORT_ERROR = None
 
 
 def piece(guid: str, name: str, x: float, z: float) -> dict:
@@ -29,33 +35,41 @@ def board_pieces() -> list[dict]:
 
 class CheckersMoveValidationTests(unittest.TestCase):
     def test_accepts_black_forward_diagonal(self) -> None:
+        if _SERVER_IMPORT_ERROR is not None:
+            self.skipTest(f"server dependencies missing: {_SERVER_IMPORT_ERROR}")
         pieces = board_pieces()
-        result = _validate_checkers_target(pieces[0], pieces, -2, 4)
+        result = server._validate_checkers_target(pieces[0], pieces, -2, 4)
 
         self.assertEqual(result["target"], {"x": -2.0, "y": 1.7406, "z": 4.0})
         self.assertEqual(result["steps"], {"x": -1, "z": -1})
 
     def test_rejects_lateral_or_backward_black_man(self) -> None:
+        if _SERVER_IMPORT_ERROR is not None:
+            self.skipTest(f"server dependencies missing: {_SERVER_IMPORT_ERROR}")
         pieces = board_pieces()
 
         for target in ((2, 6), (2, 8)):
             with self.subTest(target=target), self.assertRaises(ValueError):
-                _validate_checkers_target(pieces[0], pieces, *target)
+                server._validate_checkers_target(pieces[0], pieces, *target)
 
     def test_rejects_occupied_destination(self) -> None:
+        if _SERVER_IMPORT_ERROR is not None:
+            self.skipTest(f"server dependencies missing: {_SERVER_IMPORT_ERROR}")
         pieces = board_pieces()
 
         with self.assertRaisesRegex(ValueError, "occupied"):
-            _validate_checkers_target(pieces[0], pieces, 2, 4)
+            server._validate_checkers_target(pieces[0], pieces, 2, 4)
 
     def test_capture_identifies_the_exact_jumped_red_checker(self) -> None:
+        if _SERVER_IMPORT_ERROR is not None:
+            self.skipTest(f"server dependencies missing: {_SERVER_IMPORT_ERROR}")
         pieces = [
             piece("black1", "Checker_black", 0, 6),
             piece("red1", "Checker_red", -2, 4),
             piece("other", "Checker_black", 4, 6),
         ]
 
-        result = _validate_checkers_target(pieces[0], pieces, -4, 2)
+        result = server._validate_checkers_target(pieces[0], pieces, -4, 2)
 
         self.assertEqual(result["steps"], {"x": -2, "z": -2})
         self.assertEqual(result["captured_guid"], "red1")

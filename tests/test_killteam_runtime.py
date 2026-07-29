@@ -2,7 +2,7 @@ import copy
 import copy
 import unittest
 
-from killteam_runtime import (
+from tts_mcp.runtime.killteam_runtime import (
     KillTeamConfig,
     KillTeamRuntime,
     KillTeamRuleError,
@@ -781,7 +781,7 @@ class KillTeamRuntimeTests(unittest.TestCase):
         self.assertTrue(bridge.list_calls)
         first_call = bridge.list_calls[0]
         self.assertEqual(first_call["required_guids"], [])
-        from killteam_runtime import _GENERIC_SETUP_QUERY_TAGS
+        from tts_mcp.runtime.killteam_runtime import _GENERIC_SETUP_QUERY_TAGS
 
         self.assertEqual(first_call["query_tags"], list(_GENERIC_SETUP_QUERY_TAGS))
 
@@ -1410,7 +1410,7 @@ class KillTeamRuntimeTests(unittest.TestCase):
 
         KillTeamRuntime(bridge).setup()
 
-        from killteam_runtime import _GENERIC_SETUP_QUERY_TAGS
+        from tts_mcp.runtime.killteam_runtime import _GENERIC_SETUP_QUERY_TAGS
 
         self.assertEqual(bridge.list_calls, [{
             "max_results": 1000,
@@ -1419,14 +1419,19 @@ class KillTeamRuntimeTests(unittest.TestCase):
             "query_tags": list(_GENERIC_SETUP_QUERY_TAGS),
         }])
 
-    def test_setup_retries_with_native_tags_when_the_canonical_generic_scan_is_empty(self):
-        from killteam_runtime import _GENERIC_NATIVE_SETUP_QUERY_TAGS, _GENERIC_SETUP_QUERY_TAGS
+    def test_setup_falls_back_to_a_raw_generic_scan_when_the_canonical_generic_scan_is_empty(self):
+        from tts_mcp.runtime.killteam_runtime import _GENERIC_SETUP_QUERY_TAGS
 
         class NativeFallbackBridge(FakeKillTeamBridge):
             def list_objects(self, **kwargs):
                 self.list_calls.append(dict(kwargs))
                 if kwargs.get("query_tags") == list(_GENERIC_SETUP_QUERY_TAGS):
                     return {"objects": [], "snap_points": []}
+                if kwargs.get("raw"):
+                    return {
+                        "objects": [copy.deepcopy(item) for item in self.objects.values()],
+                        "snap_points": copy.deepcopy(self.snap_points),
+                    }
                 return {
                     "objects": [copy.deepcopy(item) for item in self.objects.values()],
                     "snap_points": copy.deepcopy(self.snap_points),
@@ -1441,7 +1446,11 @@ class KillTeamRuntimeTests(unittest.TestCase):
         self.assertEqual(result["status"], "ready")
         self.assertGreaterEqual(len(bridge.list_calls), 2)
         self.assertEqual(bridge.list_calls[0]["query_tags"], list(_GENERIC_SETUP_QUERY_TAGS))
-        self.assertEqual(bridge.list_calls[1]["query_tags"], list(_GENERIC_NATIVE_SETUP_QUERY_TAGS))
+        self.assertEqual(bridge.list_calls[1], {
+            "max_results": 1000,
+            "compact": True,
+            "raw": True,
+        })
         self.assertEqual(sorted(result["setup"]["sides"].keys()), ["ai", "opponent"])
         self.assertEqual(result["roller_guid"], "roller-blue")
         self.assertEqual(observation["counters"]["cp"]["guid"], "cp")

@@ -10,7 +10,7 @@ local MCP_CHANNEL = "tts-mcp"
 -- Change this whenever the installed Global bridge has a behavior change.
 -- `tts_ping` returns it so a live TTS table can be distinguished from the
 -- source file on disk when the External Editor reports only guid=-1.
-local MCP_BRIDGE_VERSION = "2026-07-29-generic-killteam-move-v17"
+local MCP_BRIDGE_VERSION = "2026-07-29-generic-killteam-move-v18"
 local MCP_HTTP_CHAT_URL = "http://127.0.0.1:8765/chat"
 -- A private callback for bridge results. Unlike print(), this never appears
 -- in the in-game player chat or console feed.

@@ -58,6 +58,10 @@ one AI operative and returns a suggested `MOVE[guid,x,y,z]` target plus the
 candidate ranking evidence. Use it before emitting `MOVE[...]` when the goal
 is to contest or stage around an objective.
 
+The placement-only setup bridge exposes `tts_killteam_setup_ping`,
+`tts_killteam_setup_list_objects`, and `tts_killteam_setup_place_model` for
+the narrow setup-time flow that only needs exact placement and readback.
+
 ## Mutation workflow
 
 1. Call `tts_describe_capabilities` if the operation or safety class is unclear.
@@ -85,6 +89,10 @@ Use `dry_run=true` to validate a plan without changing TTS. Use
 `verify_after_each=true` when intermediate state matters. Supply a unique
 `idempotency_key` when the client may retry a request; the server replays the
 cached result instead of executing the plan twice.
+
+For the placement-only setup bridge, use `tts_killteam_setup_list_objects`
+before `tts_killteam_setup_place_model` when you need to resolve a live model
+or tagged target without involving the full Kill Team runtime.
 
 `tts_move_checkers_piece` is the game-specific movement path for the bundled
 checkers save. It resolves the live `Checker_black` pieces, infers the square
