@@ -135,6 +135,42 @@ class FakeKillTeamBridge:
         self.objects[guid]["counter_value"] = value
         return self.get_object(guid)
 
+    def spawn_builtin(
+        self,
+        *,
+        object_type,
+        position,
+        rotation=None,
+        scale=None,
+        name="",
+        locked=False,
+    ):
+        self.calls.append((
+            "spawn_builtin",
+            object_type,
+            copy.deepcopy(position),
+            copy.deepcopy(rotation),
+            copy.deepcopy(scale),
+            name,
+            locked,
+        ))
+        guid = f"{object_type.lower()}-{len(self.objects) + 1}"
+        obj = {
+            "guid": guid,
+            "name": name or object_type,
+            "type": object_type,
+            "position": dict(position),
+            "rotation": dict(rotation or {"x": 0.0, "y": 0.0, "z": 0.0}),
+            "scale": dict(scale or {"x": 1.0, "y": 1.0, "z": 1.0}),
+            "locked": bool(locked),
+        }
+        self.objects[guid] = obj
+        self.wounds[guid] = 0
+        return {
+            "guid": guid,
+            "object": copy.deepcopy(obj),
+        }
+
     def probe_line_of_sight(self, observer_guid, target_guid, *, eye_local=None, debug=False):
         self.calls.append(("probe_line_of_sight", observer_guid, target_guid, eye_local, debug))
         blockers = [
@@ -876,6 +912,8 @@ class KillTeamRuntimeTests(unittest.TestCase):
         )
         self.assertEqual(ai_plan["next_selection"]["card_guid"], "card-ai-chosen-1")
         self.assertEqual(ai_plan["next_deployment"]["model_guid"], "model-ai-chosen-1")
+        self.assertEqual(ai_plan["play_style"], "aggressive")
+        self.assertIn("pressure", ai_plan["play_style_reason"])
 
     def test_setup_prefers_safe_objective_access_in_tactical_deployment(self):
         objects, containers = setup_fixture_with_rosters()
@@ -920,10 +958,25 @@ class KillTeamRuntimeTests(unittest.TestCase):
         locked = runtime.lock_rosters()
         recommended = locked["setup"]["ai_plan"]["next_deployment"]["recommended_position"]
 
-        self.assertIn("most cover", locked["setup"]["ai_plan"]["policy"])
+        self.assertEqual(locked["setup"]["ai_plan"]["play_style"], "aggressive")
+        self.assertIn("aggressive", locked["setup"]["ai_plan"]["policy"])
         self.assertIsNotNone(recommended)
         self.assertGreater(recommended["x"], -17.5)
         self.assertGreater(recommended["z"], 7.0)
+
+    def test_setup_team_play_style_prefers_cover_for_tau_like_tags(self):
+        runtime = KillTeamRuntime(FakeKillTeamBridge(setup_fixture_with_rosters()[0]))
+
+        style, reason = runtime._setup_team_play_style([  # pylint: disable=protected-access
+            {
+                "tags": ["entity=operative", "faction_id=tau", "T'au", "Pathfinder"],
+                "faction_id": "tau",
+                "profile_id": "pathfinder",
+            }
+        ])
+
+        self.assertEqual(style, "conservative")
+        self.assertIn("cover", reason)
 
     def test_roll_initiative_is_not_needed_for_ai_first_setup(self):
         objects, containers = setup_fixture_with_rosters()
@@ -1767,6 +1820,77 @@ class KillTeamRuntimeTests(unittest.TestCase):
                 [{"x": 1.0, "y": 1.0, "z": 0.0}],
                 action_id="move-001",
             )
+
+    def test_place_marker_records_a_live_marker_and_observation(self):
+        bridge = FakeKillTeamBridge(fixture_objects())
+        runtime = KillTeamRuntime(bridge)
+        runtime.setup()
+
+        result = runtime.place_marker(
+            "conceal",
+            {"x": 2.0, "y": 1.0, "z": 3.0},
+            name="Conceal token",
+        )
+
+        self.assertEqual(result["status"], "placed")
+        self.assertEqual(result["marker"]["marker_type"], "conceal")
+        self.assertEqual(result["marker"]["name"], "Conceal token")
+        self.assertEqual(runtime.observe()["markers"][0]["marker_type"], "conceal")
+        self.assertTrue(any(call[0] == "spawn_builtin" for call in bridge.calls))
+
+    def test_score_objective_places_a_marker_and_updates_victory_points(self):
+        objects = fixture_objects()
+        objects.append({
+            "guid": "objective-1",
+            "name": "Primary Objective",
+            "tags": tag("entity=objective"),
+            "position": {"x": 4.0, "y": 1.0, "z": 0.0},
+            "bounds": {
+                "center": {"x": 4.0, "y": 1.0, "z": 0.0},
+                "size": {"x": 1.0, "y": 0.2, "z": 1.0},
+            },
+        })
+        bridge = FakeKillTeamBridge(objects)
+        runtime = KillTeamRuntime(bridge)
+        runtime.setup()
+
+        result = runtime.score_objective("objective-1", points=2)
+
+        self.assertEqual(result["status"], "scored")
+        self.assertEqual(result["counter"], "vp")
+        self.assertEqual(result["score"]["after"], 2)
+        self.assertEqual(runtime.observe()["counters"]["vp"]["value"], 2)
+        self.assertTrue(any(call == ("set_counter_value", "vp", 2) for call in bridge.calls))
+        self.assertTrue(any(call[0] == "spawn_builtin" for call in bridge.calls))
+
+    def test_turning_point_advance_resets_the_active_operative_and_grants_cp(self):
+        bridge = FakeKillTeamBridge(fixture_objects())
+        runtime = KillTeamRuntime(bridge)
+        runtime.setup()
+        runtime.activate_operative("plague-warrior-01")
+
+        result = runtime.advance_turning_point()
+
+        self.assertEqual(result["turning_point"], 2)
+        self.assertEqual(result["phase"], "command")
+        self.assertEqual(runtime.observe()["turning_point"], 2)
+        self.assertIsNone(runtime.observe()["active_operative_id"])
+        self.assertEqual(runtime.observe()["counters"]["cp"]["value"], 3)
+        self.assertTrue(any(call == ("set_counter_value", "cp", 3) for call in bridge.calls))
+
+    def test_gain_and_spend_cp_update_the_live_counter(self):
+        bridge = FakeKillTeamBridge(fixture_objects())
+        runtime = KillTeamRuntime(bridge)
+        runtime.setup()
+
+        gained = runtime.gain_cp(2)
+        spent = runtime.spend_cp(1)
+
+        self.assertEqual(gained["counter"]["after"], 4)
+        self.assertEqual(spent["counter"]["after"], 3)
+        self.assertEqual(runtime.observe()["counters"]["cp"]["value"], 3)
+        self.assertTrue(any(call == ("set_counter_value", "cp", 4) for call in bridge.calls))
+        self.assertTrue(any(call == ("set_counter_value", "cp", 3) for call in bridge.calls))
 
 
 if __name__ == "__main__":

@@ -286,9 +286,11 @@ Semantic pregame setup follows this bounded sequence:
    board context, chooses a tactical legal position, and emits exactly one
    `MOVE[guid,x,y,z]`. The gateway translates that move into the setup
    runtime's verified placement path, which validates the selected GUID and
-   coordinates, then the AI stops for that turn. Send a new
-   `KILLTEAM_AUTORUN_SETUP` request for the next placement. The human never
-   selects or moves an AI model.
+   coordinates, then the AI stops for that turn. The controller persists the
+   placed GUIDs so a later `KILLTEAM_AUTORUN_SETUP` call resumes from the last
+   finished placement instead of repeating the same model. Use `!ai start
+   fresh` to clear that setup history. The human never selects or moves an AI
+   model.
 4. Deployment then follows the configured cadence: starting with the AI-first
    `initiative_side` unless the host overrode it, each side alternates setup
    passes and places `floor(N/3)` operatives per pass, with a minimum pass of
@@ -299,7 +301,11 @@ Semantic pregame setup follows this bounded sequence:
    `tts_killteam_reconcile_setup_step` to detect and validate the human models,
    consumes the batch, and then performs one new AI placement turn.
    Reconciliation is never used to place AI models.
-6. Every AI placement is verified against live position and geometry, and each
+6. The AI setup planner derives its play style from faction tags. Teams with
+   aggressive melee or pressure tags prefer objective pressure and forward
+   lanes; ranged or precision-oriented factions prefer cover and standoff
+   positions.
+7. Every AI placement is verified against live position and geometry, and each
    deployed operative receives a starting `Conceal` order. The lower-level
    roster-card selection and lock actions remain available for tables that
    explicitly use physical roster-card lists.

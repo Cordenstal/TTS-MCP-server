@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import re
 import secrets
 import threading
@@ -24,6 +25,7 @@ class ControllerState:
     game_position: dict[str, Any] | None = None
     draw_offer_by: str = ""
     draw_agreed: bool = False
+    setup_history: dict[str, Any] = field(default_factory=dict)
 
 
 class AIController:
@@ -43,6 +45,11 @@ class AIController:
             game_position=(dict(saved_state["game_position"]) if isinstance(saved_state.get("game_position"), dict) else None),
             draw_offer_by=str(saved_state.get("draw_offer_by", "")),
             draw_agreed=bool(saved_state.get("draw_agreed", False)),
+            setup_history=(
+                copy.deepcopy(saved_state["setup_history"])
+                if isinstance(saved_state.get("setup_history"), dict)
+                else {}
+            ),
         )
         self._lock = threading.RLock()
         self.approval_executor = approval_executor
@@ -69,8 +76,46 @@ class AIController:
                 "game_position": self.state.game_position,
                 "draw_offer_by": self.state.draw_offer_by,
                 "draw_agreed": self.state.draw_agreed,
+                "setup_history": self.state.setup_history,
             }
         )
+
+    def _empty_setup_history(self) -> dict[str, Any]:
+        return {
+            "session_id": self.conversation_id(),
+            "active_game": self.state.active_game,
+            "placements": [],
+        }
+
+    def setup_history(self) -> dict[str, Any]:
+        """Return the persisted setup history for the active game session."""
+        with self._lock:
+            history = self.state.setup_history if isinstance(self.state.setup_history, dict) else {}
+            return copy.deepcopy(history) if history else self._empty_setup_history()
+
+    def clear_setup_history(self) -> None:
+        with self._lock:
+            self.state.setup_history = self._empty_setup_history()
+            self._persist()
+
+    def record_setup_placement(self, placement: dict[str, Any]) -> None:
+        with self._lock:
+            history = self.setup_history()
+            placements = history.get("placements") if isinstance(history.get("placements"), list) else []
+            placements = [copy.deepcopy(item) for item in placements if isinstance(item, dict)]
+            placements.append(copy.deepcopy(placement))
+            history["session_id"] = self.conversation_id()
+            history["active_game"] = self.state.active_game
+            history["placements"] = placements
+            history["placement_count"] = len(placements)
+            history["placed_guids"] = [
+                str(item.get("guid", "")).strip()
+                for item in placements
+                if str(item.get("guid", "")).strip()
+            ]
+            history["last_placement"] = copy.deepcopy(placements[-1]) if placements else None
+            self.state.setup_history = history
+            self._persist()
 
     def propose_approval(self, proposal: dict[str, Any]) -> str:
         """Create and persist a short manually typed host-approval ID."""
@@ -111,6 +156,7 @@ class AIController:
                 "current_turn": self.state.current_turn,
                 "pause_reason": self.state.pause_reason,
                 "conversation_id": self.conversation_id(),
+                "killteam_setup_history": self.setup_history(),
             }
 
     def game_position(self) -> dict[str, Any] | None:
@@ -220,6 +266,7 @@ class AIController:
                 self.state.game_position = None
                 self.state.draw_offer_by = ""
                 self.state.draw_agreed = False
+                self.state.setup_history = self._empty_setup_history()
                 self._persist()
                 self._audit("game_selected", {"game_name": game_name})
                 return self._public(
@@ -238,6 +285,7 @@ class AIController:
                     self.state.game_position = None
                     self.state.draw_offer_by = ""
                     self.state.draw_agreed = False
+                    self.state.setup_history = self._empty_setup_history()
                     self._audit("session_start_fresh", {})
                 else:
                     self._audit("session_resumed", {})

@@ -33,6 +33,8 @@ hash to the checked-in bridge source.
   post-placement readback.
 - The chat gateway forwards the setup request to the AI backend and consumes
   only the AI's bounded placement command.
+- The host lifecycle command `!ai start fresh` clears the controller's setup
+  history so a new setup pass starts from scratch.
 - Lower-level setup commands remain available for manual control, debugging,
   and tests, including the compatibility `setup_place_model` form.
 
@@ -40,6 +42,11 @@ hash to the checked-in bridge source.
 
 The AI owns the tactical decision at every placement while the runtime keeps
 the mutation safe and testable. Human models remain human-placed.
+
+The setup planner now persists which AI operatives were already placed during
+the current session, and it derives aggressive-versus-conservative deployment
+style from faction tags so teams like Legionary and Tau do not use the same
+slot scoring.
 
 The tradeoff is a resumable turn-by-turn AI interaction instead of a single
 deterministic runtime macro. This preserves AI agency while keeping every

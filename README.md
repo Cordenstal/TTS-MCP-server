@@ -345,7 +345,7 @@ The gateway persists conversation history in the SQLite database configured by
 automatically namespaced by the selected game (`tts-game:chess`, for example),
 so the AI retains both conversation context and the persisted `!ai start`
 lifecycle state across messages and gateway restarts. `!ai start fresh` clears
-only that game’s conversation. Use `AI_BACKEND_SYSTEM_PROMPT` for stable
+that game's conversation and setup history. Use `AI_BACKEND_SYSTEM_PROMPT` for stable
 instructions such as chess rules. A manual reset remains available:
 
 ```powershell

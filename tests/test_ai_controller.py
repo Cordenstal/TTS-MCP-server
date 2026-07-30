@@ -50,13 +50,19 @@ class AIControllerTests(unittest.TestCase):
             )
             controller.state.active_game = "checkers"
             controller.state.game_position = {"turn": "black", "ply": 0, "pieces": []}
+            controller.state.setup_history = {
+                "session_id": "tts-game:checkers",
+                "active_game": "checkers",
+                "placements": [{"guid": "piece-1", "name": "piece-1", "position": {"x": 1, "y": 0, "z": 2}}],
+            }
 
-            response = controller.handle("!ai fresh start", is_host=True)
+            response = controller.handle("!ai start fresh", is_host=True)
 
             self.assertIsNotNone(response)
             self.assertIn("started fresh", response["text"])
             self.assertEqual(controller.state.state, "running")
             self.assertIsNone(controller.state.game_position)
+            self.assertEqual(controller.setup_history()["placements"], [])
 
 
 class DrawAgreementTests(unittest.TestCase):

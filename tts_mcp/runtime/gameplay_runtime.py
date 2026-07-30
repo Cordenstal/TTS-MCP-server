@@ -330,6 +330,28 @@ class GamePromptBuilder:
                 "No rules file was found for the selected game. Do not make a move until the host provides "
                 "or installs that game's rules under game_rules/<name>/rules.md."
             )
+        if selected_game.lower() == "killteam":
+            setup_history = context.get("killteam_setup_history")
+            if isinstance(setup_history, dict):
+                placements = setup_history.get("placements")
+                if isinstance(placements, list) and placements:
+                    recent = []
+                    for placement in placements[-12:]:
+                        if not isinstance(placement, dict):
+                            continue
+                        name = str(placement.get("name") or placement.get("guid") or "unknown").strip()
+                        guid = str(placement.get("guid") or "").strip()
+                        position = placement.get("position") if isinstance(placement.get("position"), dict) else {}
+                        x = position.get("x")
+                        y = position.get("y")
+                        z = position.get("z")
+                        recent.append(f"- {name} [{guid}] at ({x}, {y}, {z})")
+                    if recent:
+                        sections.append(
+                            "Persisted Kill Team setup memory for this session. "
+                            "Clear it with !ai start fresh before starting a new setup pass:\n"
+                            + "\n".join(recent)
+                        )
         if selected_game.lower() == "checkers":
             sections.append(
                 "CHECKERS EXECUTION PROTOCOL (mandatory):\n"

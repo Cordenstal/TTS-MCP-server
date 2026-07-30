@@ -834,6 +834,7 @@ class ChatBackend:
         self.command_execution: CommandExecution | None = None
         self._game_position_provider: Callable[[], dict[str, Any] | None] | None = None
         self._game_position_saver: Callable[[dict[str, Any] | None], None] | None = None
+        self._setup_history_saver: Callable[[dict[str, Any]], None] | None = None
         self._turn_completed: Callable[[str], Any] | None = None
         self._turn_lock = threading.RLock()
         self._context_local = threading.local()
@@ -854,6 +855,7 @@ class ChatBackend:
         propose: Callable[[dict[str, Any]], str],
         game_position_provider: Callable[[], dict[str, Any] | None] | None = None,
         game_position_saver: Callable[[dict[str, Any] | None], None] | None = None,
+        setup_history_saver: Callable[[dict[str, Any]], None] | None = None,
         turn_completed: Callable[[str], Any] | None = None,
     ) -> None:
         self.controller_provider = controller_provider
@@ -864,6 +866,7 @@ class ChatBackend:
         )
         self._game_position_provider = game_position_provider
         self._game_position_saver = game_position_saver
+        self._setup_history_saver = setup_history_saver
         self._turn_completed = turn_completed
 
     def configure_observation_tools(
@@ -1080,7 +1083,7 @@ class ChatBackend:
         intent = classify_intent(message)
         # Ordinary chat starts context-light. Live scene evidence is acquired
         # only through the bounded read-only tool loop below.
-        context: dict[str, Any] = {}
+        context = self.controller_provider() if self.controller_provider else {}
         controller = self.controller_provider() if self.controller_provider else {}
         game = str(controller.get("active_game", ""))
         prompt = self.prompt_builder.build(game=game, intent=intent, context=context)
@@ -1842,6 +1845,20 @@ class ChatBackend:
                     for item in execution.get("executed", [])
                     if isinstance(item, dict)
                 )
+                if (
+                    setup_turn
+                    and self._setup_history_saver is not None
+                    and verified_actions
+                ):
+                    for item in execution.get("executed", []):
+                        if not isinstance(item, dict):
+                            continue
+                        if item.get("status") != "executed" or item.get("action") != "killteam_setup_place_model":
+                            continue
+                        placement = item.get("result")
+                        if isinstance(placement, dict):
+                            self._setup_history_saver(placement)
+                        break
                 if execution.get("executed") or execution.get("approval_required"):
                     _record_trace("ai_commands_processed", commands=result["parsed_commands"], execution=execution)
                 if str(controller.get("state", "")) == "running" and (verified_actions or execution.get("approval_required")):
@@ -2675,6 +2692,7 @@ class HttpGateway:
             propose=controller.propose_approval,
             game_position_provider=controller.game_position,
             game_position_saver=controller.set_game_position,
+            setup_history_saver=controller.record_setup_placement,
             turn_completed=controller.advance_turn,
         )
         controller.set_approval_executor(

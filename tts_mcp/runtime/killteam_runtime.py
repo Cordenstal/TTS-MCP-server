@@ -91,6 +91,19 @@ class KillTeamBridge(Protocol):
 
     def set_object_lock(self, guid: str, locked: bool) -> dict[str, Any]: ...
 
+    def set_counter_value(self, guid: str, value: int) -> dict[str, Any]: ...
+
+    def spawn_builtin(
+        self,
+        *,
+        object_type: str,
+        position: dict[str, float],
+        rotation: dict[str, float] | None = None,
+        scale: dict[str, float] | None = None,
+        name: str = "",
+        locked: bool = False,
+    ) -> dict[str, Any]: ...
+
     def observe_defense_roll(
         self,
         *,
@@ -270,6 +283,32 @@ class TTSKillTeamBridge:
 
     def set_object_lock(self, guid: str, locked: bool) -> dict[str, Any]:
         return self._request("set_object_lock", {"guid": guid, "locked": bool(locked)})
+
+    def set_counter_value(self, guid: str, value: int) -> dict[str, Any]:
+        return self._request("set_counter_value", {"guid": guid, "value": int(value)})
+
+    def spawn_builtin(
+        self,
+        *,
+        object_type: str,
+        position: dict[str, float],
+        rotation: dict[str, float] | None = None,
+        scale: dict[str, float] | None = None,
+        name: str = "",
+        locked: bool = False,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "object_type": object_type,
+            "position": copy.deepcopy(position),
+            "locked": bool(locked),
+        }
+        if rotation is not None:
+            payload["rotation"] = copy.deepcopy(rotation)
+        if scale is not None:
+            payload["scale"] = copy.deepcopy(scale)
+        if name:
+            payload["name"] = name
+        return self._request("spawn_builtin", payload)
 
     def observe_defense_roll(
         self,
@@ -1843,12 +1882,62 @@ class KillTeamRuntime:
             str(record.get("operative_id", "")),
         )
 
+    def _setup_team_play_style(self, records: list[dict[str, Any]]) -> tuple[str, str]:
+        tags = {
+            _norm(tag)
+            for record in records
+            for tag in (record.get("tags", []) if isinstance(record.get("tags"), list) else [])
+            if _norm(tag)
+        }
+        faction_ids = {
+            _norm(record.get("faction_id"))
+            for record in records
+            if _norm(record.get("faction_id"))
+        }
+        profile_ids = {
+            _norm(record.get("profile_id"))
+            for record in records
+            if _norm(record.get("profile_id"))
+        }
+        haystack = " ".join(sorted({*tags, *faction_ids, *profile_ids}))
+        aggressive_markers = (
+            "legionary",
+            "chaos",
+            "plague",
+            "nurgle",
+            "khorne",
+            "world eater",
+            "worldeater",
+            "ork",
+            "tyranid",
+            "genestealer",
+        )
+        conservative_markers = (
+            "tau",
+            "t'au",
+            "t au",
+            "pathfinder",
+            "breacher",
+            "stealth",
+            "kroot",
+            "vior",
+            "fire caste",
+            "battlesuit",
+            "crisis",
+        )
+        if any(marker in haystack for marker in aggressive_markers):
+            return "aggressive", "faction tags favor pressure, resilience, or melee trading"
+        if any(marker in haystack for marker in conservative_markers):
+            return "conservative", "faction tags favor cover, range, or skirmishing"
+        return "balanced", "faction tags do not strongly bias the team toward aggression or caution"
+
     def _setup_recommended_position(
         self,
         side: dict[str, Any],
         model_item: dict[str, Any],
         *,
         clearance: float = 0.25,
+        play_style: str = "balanced",
     ) -> dict[str, float] | None:
         """Return a tactical legal slot without moving the model."""
         deployment_bounds = self._setup_zone_bounds(side["deployment_zone_guid"])
@@ -1957,15 +2046,37 @@ class KillTeamRuntime:
                     else:
                         lane_distance = 0.0
                     path_distance = math.hypot(x - zone_position["x"], z - zone_position["z"])
-                    score = (
-                        exposure,
-                        -cover_score,
-                        objective_distance,
-                        lane_distance,
-                        path_distance,
-                        x,
-                        z,
-                    )
+                    style = _norm(play_style)
+                    if style == "aggressive":
+                        score = (
+                            objective_distance,
+                            lane_distance,
+                            -cover_score,
+                            exposure,
+                            path_distance,
+                            x,
+                            z,
+                        )
+                    elif style == "conservative":
+                        score = (
+                            exposure,
+                            -cover_score,
+                            objective_distance,
+                            lane_distance,
+                            path_distance,
+                            x,
+                            z,
+                        )
+                    else:
+                        score = (
+                            objective_distance,
+                            -cover_score,
+                            lane_distance,
+                            exposure,
+                            path_distance,
+                            x,
+                            z,
+                        )
                     candidates.append(
                         (
                             score,
@@ -2050,6 +2161,7 @@ class KillTeamRuntime:
         ]
         if not deployment_candidates:
             deployment_candidates = sorted(models_by_id.values(), key=self._setup_ai_order_key)
+        play_style, play_style_reason = self._setup_team_play_style(deployment_candidates or list(models_by_id.values()))
         deployment_ids = [record["operative_id"] for record in deployment_candidates]
         selection_order = []
         deployment_order = []
@@ -2090,7 +2202,11 @@ class KillTeamRuntime:
             }
             try:
                 model_item = self._setup_operative_model_item(side, operative_id)
-                entry["recommended_position"] = self._setup_recommended_position(side, model_item)
+                entry["recommended_position"] = self._setup_recommended_position(
+                    side,
+                    model_item,
+                    play_style=play_style,
+                )
             except (KillTeamSetupError, KillTeamRuleError):
                 entry["recommended_position"] = None
             deployment_order.append(entry)
@@ -2098,10 +2214,17 @@ class KillTeamRuntime:
                 next_deployment = copy.deepcopy(entry)
 
         return {
+            "play_style": play_style,
+            "play_style_reason": play_style_reason,
             "policy": (
                 "Use the listed AI selection order for roster cards and the listed AI deployment order for models. "
-                "For each deployment, prefer the safest legal slot with the most cover, then the best objective access, "
-                "then the strongest future attack lane."
+                + (
+                    "This team style is aggressive: prefer objective pressure and attack lanes first, then cover and spacing."
+                    if play_style == "aggressive"
+                    else "This team style is conservative: prefer cover and ranged engagement first, then objective access."
+                    if play_style == "conservative"
+                    else "This team style is balanced: prefer safe legal slots, then objective access, then attack lanes."
+                )
             ),
             "selection_order": selection_order,
             "deployment_order": deployment_order,
@@ -2331,6 +2454,7 @@ class KillTeamRuntime:
             "observation_id": 0,
             "map_revision": 0,
             "phase": "setup",
+            "turning_point": 1,
             "active_operative_id": None,
             "operatives": operatives,
             "terrain": terrain,
@@ -2348,6 +2472,7 @@ class KillTeamRuntime:
             "units_per_inch": units_per_inch,
             "events": self._events,
             "setup": setup_state,
+            "markers": [],
         }
         if setup_state is not None and auto_start:
             self._setup_start_from_roster_models(setup_state)
@@ -2400,6 +2525,7 @@ class KillTeamRuntime:
             "observation_id": state["observation_id"],
             "map_revision": state["map_revision"],
             "phase": state["phase"],
+            "turning_point": state.get("turning_point", 1),
             "active_operative_id": state["active_operative_id"],
             "operatives": visible,
             "terrain": terrain[:200],
@@ -2408,6 +2534,7 @@ class KillTeamRuntime:
             "roller_guid": state["roller_guid"],
             "defense_station_guid": state.get("defense_station_guid"),
             "start_test_spot": copy.deepcopy(state.get("start_test_spot")),
+            "markers": copy.deepcopy(state.get("markers", [])),
             "truncated": self._listing_truncated or terrain_truncated,
         }
         setup_snapshot = self._setup_snapshot(state)
@@ -3903,3 +4030,309 @@ class KillTeamRuntime:
             "revision": state["revision"],
         }
         return self._recorded_result(action_id, result)
+
+    def _counter_guid(self, counter_name: str) -> str:
+        state = self._require_state()
+        name = _norm(counter_name)
+        guid = str(state["counter_guids"].get(name, "")).strip()
+        if not guid:
+            raise KillTeamRuleError(f"counter {counter_name} is not available")
+        return guid
+
+    def _counter_object(self, counter_name: str) -> tuple[str, dict[str, Any]]:
+        guid = self._counter_guid(counter_name)
+        obj = self._objects.get(guid)
+        if obj is None:
+            raise KillTeamRuleError(f"counter {counter_name} is missing from the live scene")
+        return guid, obj
+
+    def _apply_counter_delta(self, counter_name: str, delta: int) -> dict[str, Any]:
+        guid, obj = self._counter_object(counter_name)
+        current = obj.get("counter_value", 0)
+        try:
+            current_value = int(current)
+        except (TypeError, ValueError) as exc:
+            raise KillTeamRuleError(f"counter {counter_name} returned an invalid value") from exc
+        updated = max(0, current_value + int(delta))
+        try:
+            projected = self.bridge.set_counter_value(guid, updated)
+        except Exception as exc:
+            raise KillTeamRuleError(f"counter {counter_name} could not be updated") from exc
+        if not isinstance(projected, dict) or str(projected.get("guid", "")).strip() != guid:
+            raise KillTeamRuleError(f"counter {counter_name} did not verify")
+        obj["counter_value"] = updated
+        return {
+            "guid": guid,
+            "name": str(obj.get("name") or counter_name),
+            "before": current_value,
+            "after": updated,
+        }
+
+    def _score_counter_name(self, counter_name: str) -> str:
+        state = self._require_state()
+        requested = _norm(counter_name)
+        if requested in state["counter_guids"]:
+            return requested
+        if requested in {"", "objective", "vp", "victory_point", "victory_points"}:
+            for candidate in ("vp", "kill_vp", "tac_vp", "crit_vp"):
+                if candidate in state["counter_guids"]:
+                    return candidate
+        raise KillTeamRuleError(f"score counter {counter_name} is not available")
+
+    def _objective_object(self, objective_id: str) -> dict[str, Any]:
+        candidate = str(objective_id or "").strip()
+        if not candidate:
+            raise KillTeamRuleError("objective_id is required")
+        matches: list[dict[str, Any]] = []
+        for obj in self._objects.values():
+            if _norm(_metadata(obj).get("entity")) != "objective":
+                continue
+            if str(obj.get("guid", "")).strip() == candidate:
+                return obj
+            if _norm(obj.get("name")) == _norm(candidate):
+                matches.append(obj)
+        if len(matches) == 1:
+            return matches[0]
+        if not matches:
+            raise KillTeamRuleError(f"unknown objective {objective_id}")
+        raise KillTeamRuleError(f"objective {objective_id} is ambiguous")
+
+    def _spawn_marker(
+        self,
+        marker_type: str,
+        position: dict[str, float],
+        *,
+        name: str = "",
+        object_type: str = "BlockSquare",
+        locked: bool = True,
+    ) -> dict[str, Any]:
+        marker_label = str(marker_type or "").strip()
+        if not marker_label:
+            raise KillTeamRuleError("marker_type is required")
+        spawn_name = str(name or marker_label).strip() or marker_label
+        spawn_position = {axis: _number(position.get(axis, 0), f"position.{axis}") for axis in ("x", "y", "z")}
+        try:
+            spawned = self.bridge.spawn_builtin(
+                object_type=object_type,
+                position=spawn_position,
+                rotation={"x": 0.0, "y": 0.0, "z": 0.0},
+                scale={"x": 0.6, "y": 0.2, "z": 0.6},
+                name=spawn_name,
+                locked=locked,
+            )
+        except Exception as exc:
+            raise KillTeamRuleError("marker spawn failed") from exc
+        if not isinstance(spawned, dict):
+            raise KillTeamRuleError("marker spawn returned an invalid result")
+        spawned_object = spawned.get("object") if isinstance(spawned.get("object"), dict) else None
+        marker_guid = _live_object_guid(
+            spawned_object.get("guid") if spawned_object is not None else spawned.get("guid")
+        )
+        if not marker_guid:
+            raise KillTeamUncertainCommit("marker spawn did not return a stable GUID")
+        try:
+            projected = self.bridge.get_object(marker_guid)
+        except Exception as exc:
+            self._mark_uncertain(None)
+            raise KillTeamUncertainCommit("marker spawn committed but the readback failed") from exc
+        projected_position = _position(projected)
+        for axis in ("x", "y", "z"):
+            if not math.isclose(projected_position[axis], spawn_position[axis], abs_tol=0.05):
+                self._mark_uncertain(None)
+                raise KillTeamUncertainCommit("marker spawn did not verify at the requested position")
+        actual_name = str(projected.get("name") or "").strip()
+        if spawn_name and actual_name != spawn_name:
+            self._mark_uncertain(None)
+            raise KillTeamUncertainCommit("marker spawn did not verify its name")
+        return {
+            "guid": marker_guid,
+            "marker_type": marker_label,
+            "name": actual_name or spawn_name,
+            "position": projected_position,
+            "object_type": str(projected.get("type") or object_type),
+            "locked": bool(projected.get("locked", locked)),
+        }
+
+    def end_activation(self, *, action_id: str | None = None) -> dict[str, Any]:
+        replay = self._replay_or_reject(action_id)
+        if replay is not None:
+            return replay
+        state = self._require_state()
+        active_id = state.get("active_operative_id")
+        if active_id is None:
+            raise KillTeamRuleError("no operative is currently active")
+        state["active_operative_id"] = None
+        state["phase"] = "firefight"
+        state["revision"] += 1
+        event = {"active_operative_id": active_id}
+        self._record("activation.ended", event)
+        return self._recorded_result(action_id, {
+            "status": "ended",
+            "active_operative_id": active_id,
+            "revision": state["revision"],
+        })
+
+    def advance_turning_point(self, *, cp_gain: int = 1, action_id: str | None = None) -> dict[str, Any]:
+        replay = self._replay_or_reject(action_id)
+        if replay is not None:
+            return replay
+        state = self._require_state()
+        if state.get("pending_validation") is not None:
+            raise KillTeamRuleError("cannot advance the turning point while setup validation is pending")
+        state["turning_point"] = int(state.get("turning_point", 1)) + 1
+        state["active_operative_id"] = None
+        state["phase"] = "command"
+        cp_result: dict[str, Any] | None = None
+        if int(cp_gain) != 0:
+            cp_result = self._apply_counter_delta("cp", int(cp_gain))
+        state["revision"] += 1
+        event = {
+            "turning_point": state["turning_point"],
+            "cp_gain": int(cp_gain),
+            "cp_result": copy.deepcopy(cp_result) if cp_result is not None else None,
+        }
+        self._record("turning_point.advanced", event)
+        result = {
+            "status": "advanced",
+            "turning_point": state["turning_point"],
+            "phase": state["phase"],
+            "cp_gain": int(cp_gain),
+            "revision": state["revision"],
+        }
+        if cp_result is not None:
+            result["cp"] = cp_result
+        return self._recorded_result(action_id, result)
+
+    def gain_cp(self, amount: int = 1, *, action_id: str | None = None) -> dict[str, Any]:
+        replay = self._replay_or_reject(action_id)
+        if replay is not None:
+            return replay
+        if int(amount) <= 0:
+            raise KillTeamRuleError("gain_cp requires a positive amount")
+        state = self._require_state()
+        cp_result = self._apply_counter_delta("cp", int(amount))
+        state["revision"] += 1
+        self._record("resource.cp_gained", {
+            "amount": int(amount),
+            "counter": copy.deepcopy(cp_result),
+        })
+        return self._recorded_result(action_id, {
+            "status": "updated",
+            "resource": "cp",
+            "amount": int(amount),
+            "counter": cp_result,
+            "revision": state["revision"],
+        })
+
+    def spend_cp(self, amount: int = 1, *, action_id: str | None = None) -> dict[str, Any]:
+        replay = self._replay_or_reject(action_id)
+        if replay is not None:
+            return replay
+        if int(amount) <= 0:
+            raise KillTeamRuleError("spend_cp requires a positive amount")
+        state = self._require_state()
+        _, obj = self._counter_object("cp")
+        current = int(obj.get("counter_value", 0))
+        if current < int(amount):
+            raise KillTeamRuleError("insufficient CP")
+        cp_result = self._apply_counter_delta("cp", -int(amount))
+        state["revision"] += 1
+        self._record("resource.cp_spent", {
+            "amount": int(amount),
+            "counter": copy.deepcopy(cp_result),
+        })
+        return self._recorded_result(action_id, {
+            "status": "updated",
+            "resource": "cp",
+            "amount": int(amount),
+            "counter": cp_result,
+            "revision": state["revision"],
+        })
+
+    def place_marker(
+        self,
+        marker_type: str,
+        position: dict[str, float],
+        *,
+        name: str = "",
+        object_type: str = "BlockSquare",
+        locked: bool = True,
+        action_id: str | None = None,
+    ) -> dict[str, Any]:
+        replay = self._replay_or_reject(action_id)
+        if replay is not None:
+            return replay
+        state = self._require_state()
+        marker = self._spawn_marker(
+            marker_type,
+            position,
+            name=name,
+            object_type=object_type,
+            locked=locked,
+        )
+        markers = state.setdefault("markers", [])
+        if not isinstance(markers, list):
+            raise KillTeamRuleError("marker ledger is corrupted")
+        markers.append(copy.deepcopy(marker))
+        state["revision"] += 1
+        self._record("marker.placed", copy.deepcopy(marker))
+        return self._recorded_result(action_id, {
+            "status": "placed",
+            "marker": marker,
+            "revision": state["revision"],
+        })
+
+    def score_objective(
+        self,
+        objective_id: str,
+        *,
+        points: int = 1,
+        counter: str = "vp",
+        marker_type: str = "objective",
+        marker_name: str = "",
+        action_id: str | None = None,
+    ) -> dict[str, Any]:
+        replay = self._replay_or_reject(action_id)
+        if replay is not None:
+            return replay
+        if int(points) <= 0:
+            raise KillTeamRuleError("score_objective requires a positive point value")
+        state = self._require_state()
+        objective = self._objective_object(objective_id)
+        position = _position(objective)
+        marker = self._spawn_marker(
+            marker_type,
+            position,
+            name=marker_name or str(objective.get("name") or marker_type),
+            object_type="BlockSquare",
+            locked=True,
+        )
+        score_counter = self._score_counter_name(counter)
+        score_result = self._apply_counter_delta(score_counter, int(points))
+        markers = state.setdefault("markers", [])
+        if not isinstance(markers, list):
+            raise KillTeamRuleError("marker ledger is corrupted")
+        markers.append(copy.deepcopy(marker))
+        state["revision"] += 1
+        event = {
+            "objective_id": str(objective.get("guid") or objective_id),
+            "objective_name": str(objective.get("name") or ""),
+            "marker": copy.deepcopy(marker),
+            "counter": score_counter,
+            "points": int(points),
+            "score": copy.deepcopy(score_result),
+        }
+        self._record("objective.scored", event)
+        return self._recorded_result(action_id, {
+            "status": "scored",
+            "objective": {
+                "guid": str(objective.get("guid") or ""),
+                "name": str(objective.get("name") or ""),
+                "position": position,
+            },
+            "counter": score_counter,
+            "points": int(points),
+            "score": score_result,
+            "marker": marker,
+            "revision": state["revision"],
+        })

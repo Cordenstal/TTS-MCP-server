@@ -184,7 +184,8 @@ The first high-level game adapter targets the `Kill Team 3.0 Quick and Easy`
 variant and the canonical `TS_Save_131.json` fixture. The complete design is
 recorded in [the Kill Team wiki page](killteam.md),
 [ADR-0009](../adr/0009-killteam-semantic-opponent.md), and
-[ADR-0010](../adr/0010-native-killteam-fixture-profiles.md).
+[ADR-0010](../adr/0010-native-killteam-fixture-profiles.md). The execution
+backlog is tracked in [Kill Team opponent tickets](killteam-tickets.md).
 
 - `[done]` Implement the agreed AI-opponent role, hidden-information boundary, and
   host-adjudication policy.
@@ -213,6 +214,9 @@ recorded in [the Kill Team wiki page](killteam.md),
 - `[partial]` The native `TS_Save_131.json` fixture profile and opt-in
   setup-validation pipeline are implemented and covered by deterministic
   bridge/runtime tests. A fresh-save live TTS run remains.
+- `[planned]` Replace the current keyword-based deployment style heuristic with
+  an explicit faction heuristics tag map so team play style can be configured
+  from tags instead of inferred ad hoc from names and profiles.
 
 ### Kill Team vertical-slice update plan
 
