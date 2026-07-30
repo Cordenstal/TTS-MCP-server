@@ -147,6 +147,8 @@ def parse_ai_commands(text: str, *, max_commands: int = 50) -> list[ParsedComman
         add("killteam_select_roster_card", {"contained_guid": m.group(1).strip()})
     for _ in re.finditer(r"^\s*KILLTEAM_LOCK_ROSTERS\s*$", text, re.I | re.M):
         add("killteam_lock_rosters", {})
+    for _ in re.finditer(r"^\s*KILLTEAM_AUTORUN_SETUP\s*$", text, re.I | re.M):
+        add("killteam_autorun_setup", {})
     for m in re.finditer(r"KILLTEAM_START_DEPLOYMENT\[([^\]]+)\]", text, re.I):
         add("killteam_start_setup_deployment", {"operative_id": m.group(1).strip()})
     for m in re.finditer(r"KILLTEAM_SETUP_PLACE\[([^,\]]+),\s*(" + _NUMBER + r"),\s*(" + _NUMBER + r"),\s*(" + _NUMBER + r")\]", text, re.I):
@@ -209,6 +211,7 @@ def parse_ai_commands(text: str, *, max_commands: int = 50) -> list[ParsedComman
                 "killteam_roll_initiative",
                 "killteam_select_roster_card",
                 "killteam_lock_rosters",
+                "killteam_autorun_setup",
                 "killteam_start_setup_deployment",
                 "killteam_setup_place_model",
                 "killteam_deploy_setup_operative",
@@ -364,18 +367,20 @@ class GamePromptBuilder:
                 "bounds, and line-of-sight probe; stop if any identity or position is unclear."
                 "\nFor semantic pregame roster setup, use these setup commands before the firefight phase:\n"
                 "KILLTEAM_ROLL_INITIATIVE\n"
-                "KILLTEAM_SELECT_ROSTER[contained_guid]\n"
-                "KILLTEAM_LOCK_ROSTERS\n"
-                "KILLTEAM_START_DEPLOYMENT[operative_id]\n"
-                "MOVE[guid,target_x,target_y,target_z]\n"
+                "KILLTEAM_AUTORUN_SETUP (AI-owned setup request)\n"
                 "KILLTEAM_ROLLBACK_PENDING\n"
                 "KILLTEAM_RECONCILE_SETUP[side_id]\n"
-                "Assume the AI side has initiative unless the host explicitly overrides it outside the runtime. After tts_killteam_setup, use setup.next_action and setup.ai_plan to select the first AI model and use its recommended position. Call KILLTEAM_START_DEPLOYMENT for one model at a time, then emit exactly one MOVE using the live figurine GUID and recommended coordinates, then call KILLTEAM_RECONCILE_SETUP for the active side. Deploy only the number shown by setup.current_batch_target for the active AI pass; after the AI batch is complete, stop and wait for the player to place the active human batch. Never emit an extra AI deployment after the runtime switches current_side to the opponent. If setup.mode is roster_cards, use KILLTEAM_SELECT_ROSTER and KILLTEAM_LOCK_ROSTERS first. "
-                "Follow setup.ai_plan.deployment_order during model deployment, taking the first undeployed entry for the active stage. Use the live figurine GUID from setup.next_action or the roster/model observation when placing the model. "
-                "The runtime tracks the pending setup operative and the active side after each confirmed deployment.\n"
+                "When the player asks for AI-owned setup, do not execute a runtime placement macro. Call "
+                "tts_killteam_setup_list_objects and inspect the returned live model, terrain, deployment-zone, "
+                "and objective tags. Ignore bags, decks, cards, and other containers; choose only a live "
+                "figurine with the Operative tag. Use your own tactical reasoning and role priority to choose "
+                "exactly one AI model and one legal position for this setup turn, then emit exactly one standalone line: "
+                "MOVE[guid,x,y,z]. Never select or place a human model. Stop after that verified "
+                "placement; if more AI models remain, wait for a new KILLTEAM_AUTORUN_SETUP request. The runtime "
+                "only validates and executes your selected GUID and coordinates.\n"
                 "Use MOVE[guid,target_x,target_y,target_z] for the live figurine move. The GUID must identify the figurine you are placing, not the roster-card operative ID; preserve its live y coordinate. "
                 "For the dedicated placement-only setup bridge, use tts_killteam_setup_ping and tts_killteam_setup_list_objects to resolve the live model, then use "
-                "KILLTEAM_SETUP_PLACE[guid,x,y,z] for exact setup placement instead of the legacy deployment flow."
+                "MOVE[guid,x,y,z] for exact setup placement."
                 "\nFor the deployment smoke test, emit exactly one standalone line:\n"
                 "KILLTEAM_DEPLOY_TEST\n"
                 "This zero-argument command resolves exactly one model whose name contains Plague Marine Warrior "
@@ -439,6 +444,52 @@ class CommandExecution:
         results: list[dict[str, Any]] = []
         proposals: list[dict[str, Any]] = []
         for command in commands:
+            if command.action == "killteam_autorun_setup":
+                if active_game.strip().lower() != "killteam":
+                    results.append({
+                        "action": command.action,
+                        "status": "blocked",
+                        "reason": "the autonomous setup macro is only available during Kill Team play",
+                        "args": command.args,
+                    })
+                    return {
+                        "executed": results,
+                        "approval_required": proposals,
+                        "stopped": True,
+                        "stop_reason": "action was blocked; waiting for player instructions",
+                    }
+                try:
+                    result = self._killteam_autorun_setup()
+                except Exception as exc:  # pragma: no cover - defensive boundary
+                    results.append({"action": command.action, "status": "failed", "error": str(exc), "args": command.args})
+                    return {
+                        "executed": results,
+                        "approval_required": proposals,
+                        "stopped": True,
+                        "stop_reason": "action failed; waiting for player instructions",
+                    }
+                if not isinstance(result, dict) or result.get("stopped") is True:
+                    results.append({
+                        "action": command.action,
+                        "status": "failed",
+                        "result": result,
+                    })
+                    return {
+                        "executed": results,
+                        "approval_required": proposals,
+                        "stopped": True,
+                        "stop_reason": (
+                            result.get("stop_reason", "action failed; waiting for player instructions")
+                            if isinstance(result, dict)
+                            else "action failed; waiting for player instructions"
+                        ),
+                    }
+                results.append({
+                    "action": command.action,
+                    "status": "executed",
+                    "result": result,
+                })
+                continue
             if command.destructive:
                 proposal = {"action": command.action, "args": command.args, "source": "ai_command"}
                 proposals.append({"action_id": self.propose(proposal), **proposal})
@@ -747,6 +798,242 @@ class CommandExecution:
                     "stop_reason": "action failed; waiting for player instructions",
                 }
         return {"executed": results, "approval_required": proposals, "stopped": False}
+
+    @staticmethod
+    def _killteam_setup_snapshot(payload: dict[str, Any] | None) -> dict[str, Any]:
+        if not isinstance(payload, dict):
+            return {}
+        setup = payload.get("setup")
+        if isinstance(setup, dict):
+            return setup
+        if {
+            "stage",
+            "current_side",
+            "sides",
+        }.issubset(payload.keys()):
+            return payload
+        return {}
+
+    @staticmethod
+    def _killteam_setup_public_state(snapshot: dict[str, Any]) -> dict[str, Any]:
+        next_action = snapshot.get("next_action") if isinstance(snapshot, dict) else None
+        public_next_action: dict[str, Any] | None = None
+        if isinstance(next_action, dict):
+            public_next_action = {
+                "type": next_action.get("type"),
+                "card_guid": next_action.get("card_guid"),
+                "operative_id": next_action.get("operative_id"),
+                "model_guid": next_action.get("model_guid"),
+            }
+            recommended_position = next_action.get("recommended_position")
+            if isinstance(recommended_position, dict):
+                public_next_action["recommended_position"] = {
+                    axis: recommended_position.get(axis)
+                    for axis in ("x", "y", "z")
+                }
+        return {
+            "stage": snapshot.get("stage"),
+            "current_side": snapshot.get("current_side"),
+            "current_batch_target": snapshot.get("current_batch_target"),
+            "current_batch_progress": snapshot.get("current_batch_progress"),
+            "next_action": public_next_action,
+        }
+
+    def _killteam_autorun_setup(self) -> dict[str, Any]:
+        steps: list[dict[str, Any]] = []
+
+        def record(action: str, result: dict[str, Any], *, summary: dict[str, Any] | None = None) -> None:
+            entry: dict[str, Any] = {"action": action, "status": "executed"}
+            if summary is not None:
+                entry["summary"] = summary
+            else:
+                snapshot = self._killteam_setup_snapshot(result)
+                if snapshot:
+                    entry["summary"] = self._killteam_setup_public_state(snapshot)
+            steps.append(entry)
+
+        def failure(reason: str, *, failed_action: str | None = None) -> dict[str, Any]:
+            entry: dict[str, Any] = {
+                "action": "killteam_autorun_setup",
+                "status": "failed",
+                "reason": reason,
+            }
+            if failed_action is not None:
+                entry["failed_action"] = failed_action
+            if steps:
+                entry["steps"] = steps
+            return {
+                "executed": [entry],
+                "approval_required": [],
+                "stopped": True,
+                "stop_reason": "action failed; waiting for player instructions",
+            }
+
+        try:
+            observed = None
+            try:
+                observed = self.request("tts_killteam_observe", {})
+            except Exception:
+                observed = None
+            snapshot = self._killteam_setup_snapshot(observed)
+            if snapshot:
+                record("tts_killteam_observe", observed or {}, summary=self._killteam_setup_public_state(snapshot))
+            if not snapshot:
+                setup_result = self.request("tts_killteam_setup", {})
+                record("tts_killteam_setup", setup_result)
+                snapshot = self._killteam_setup_snapshot(setup_result)
+                if not snapshot:
+                    observed = self.request("tts_killteam_observe", {})
+                    record("tts_killteam_observe", observed)
+                    snapshot = self._killteam_setup_snapshot(observed)
+            if not snapshot:
+                return failure("Kill Team setup could not be observed", failed_action="tts_killteam_setup")
+
+            max_steps = 40
+            while len(steps) < max_steps:
+                stage = str(snapshot.get("stage") or "").strip().lower()
+                current_side = str(snapshot.get("current_side") or "").strip().lower()
+                next_action = snapshot.get("next_action") if isinstance(snapshot.get("next_action"), dict) else None
+
+                if stage == "complete":
+                    break
+
+                if stage == "roster_selection":
+                    if isinstance(next_action, dict) and str(next_action.get("type") or "").strip().lower() == "select_roster_card":
+                        card_guid = str(
+                            next_action.get("card_guid")
+                            or next_action.get("contained_guid")
+                            or next_action.get("guid")
+                            or ""
+                        ).strip()
+                        if not card_guid:
+                            return failure("Kill Team setup did not provide a roster card GUID", failed_action="tts_killteam_observe")
+                        select_result = self.request("tts_killteam_select_roster_card", {"contained_guid": card_guid})
+                        record("tts_killteam_select_roster_card", select_result, summary={
+                            "card_guid": card_guid,
+                            "selected_count": select_result.get("selected_count"),
+                        })
+                        observed = self.request("tts_killteam_observe", {})
+                        record("tts_killteam_observe", observed)
+                        snapshot = self._killteam_setup_snapshot(observed)
+                        if not snapshot:
+                            return failure("Kill Team setup state disappeared after roster selection", failed_action="tts_killteam_observe")
+                        continue
+
+                    lock_result = self.request("tts_killteam_lock_rosters", {})
+                    record("tts_killteam_lock_rosters", lock_result)
+                    snapshot = self._killteam_setup_snapshot(lock_result)
+                    if not snapshot:
+                        observed = self.request("tts_killteam_observe", {})
+                        record("tts_killteam_observe", observed)
+                        snapshot = self._killteam_setup_snapshot(observed)
+                    if not snapshot:
+                        return failure("Kill Team setup state disappeared after roster locking", failed_action="tts_killteam_lock_rosters")
+                    continue
+
+                if stage == "deployment":
+                    next_action_type = str(next_action.get("type") or "").strip().lower() if next_action else ""
+                    if next_action_type != "deploy_ai_operative":
+                        reconcile_result = self.request(
+                            "tts_killteam_reconcile_setup_step",
+                            {"side_id": current_side},
+                        )
+                        record("tts_killteam_reconcile_setup_step", reconcile_result)
+                        observed = self.request("tts_killteam_observe", {})
+                        record("tts_killteam_observe", observed)
+                        snapshot = self._killteam_setup_snapshot(observed)
+                        if not snapshot:
+                            return failure(
+                                "Kill Team setup state disappeared after human reconciliation",
+                                failed_action="tts_killteam_observe",
+                            )
+                        # No human model has been placed yet, or the current
+                        # human batch is incomplete. Pause without attempting
+                        # to place a human model or skipping the AI handoff.
+                        next_snapshot_action = snapshot.get("next_action")
+                        next_snapshot_type = (
+                            str(next_snapshot_action.get("type") or "").strip().lower()
+                            if isinstance(next_snapshot_action, dict)
+                            else ""
+                        )
+                        if str(snapshot.get("stage") or "").strip().lower() == "deployment" and next_snapshot_type != "deploy_ai_operative":
+                            break
+                        continue
+                    if not isinstance(next_action, dict) or str(next_action.get("type") or "").strip().lower() != "deploy_ai_operative":
+                        return failure(
+                            "Kill Team deployment state did not provide the next AI operative",
+                            failed_action="tts_killteam_observe",
+                        )
+                    operative_id = str(next_action.get("operative_id") or "").strip()
+                    model_guid = str(next_action.get("model_guid") or next_action.get("guid") or "").strip()
+                    recommended_position = next_action.get("recommended_position")
+                    if not operative_id or not model_guid or not isinstance(recommended_position, dict):
+                        return failure(
+                            "Kill Team deployment state was missing the operative, model, or recommended position",
+                            failed_action="tts_killteam_observe",
+                        )
+                    start_result = self.request("tts_killteam_start_setup_deployment", {"operative_id": operative_id})
+                    record("tts_killteam_start_setup_deployment", start_result, summary={
+                        "operative_id": operative_id,
+                        "model_guid": str(start_result.get("model_guid") or start_result.get("guid") or model_guid),
+                    })
+                    recommended_position = start_result.get("recommended_position") if isinstance(start_result, dict) and isinstance(start_result.get("recommended_position"), dict) else recommended_position
+                    model_guid = str(start_result.get("model_guid") or start_result.get("guid") or model_guid).strip()
+                    deploy_result = self.request(
+                        "tts_killteam_deploy_setup_operative",
+                        {
+                            "guid": model_guid,
+                            "x": float(recommended_position["x"]),
+                            "y": float(recommended_position["y"]),
+                            "z": float(recommended_position["z"]),
+                        },
+                    )
+                    record("tts_killteam_deploy_setup_operative", deploy_result, summary={
+                        "model_guid": model_guid,
+                        "position": {
+                            "x": float(recommended_position["x"]),
+                            "y": float(recommended_position["y"]),
+                            "z": float(recommended_position["z"]),
+                        },
+                    })
+                    observed = self.request("tts_killteam_observe", {})
+                    record("tts_killteam_observe", observed)
+                    snapshot = self._killteam_setup_snapshot(observed)
+                    if not snapshot:
+                        return failure("Kill Team setup state disappeared after deployment", failed_action="tts_killteam_observe")
+                    continue
+
+                return failure(f"Kill Team setup is in unsupported stage {stage!r}", failed_action="tts_killteam_observe")
+
+            if len(steps) >= max_steps and str(snapshot.get("stage") or "").strip().lower() != "complete":
+                return failure("Kill Team autonomous setup hit its safety step cap", failed_action="tts_killteam_observe")
+
+            final_state = self._killteam_setup_public_state(snapshot)
+            final_action = final_state.get("next_action") if isinstance(final_state.get("next_action"), dict) else {}
+            if steps and final_state.get("stage") == "deployment" and str(final_action.get("type") or "").strip().lower() != "deploy_ai_operative":
+                final_state["paused_for_side"] = final_state.get("current_side")
+            return {
+                "executed": [{
+                    "action": "killteam_autorun_setup",
+                    "status": "executed",
+                    "result": {
+                        "final_state": final_state,
+                        "steps": steps,
+                    },
+                }],
+                "approval_required": [],
+                "stopped": False,
+            }
+        except Exception as exc:  # pragma: no cover - defensive boundary
+            reason = str(exc)
+            if "Unknown placement MCP action" in reason:
+                reason = (
+                    "The placement-only Kill Team bridge is loaded. "
+                    "KILLTEAM_AUTORUN_SETUP requires the full runtime Lua bridge; "
+                    "use the full runtime bridge or issue KILLTEAM_SETUP_PLACE with "
+                    "a live model GUID and exact coordinates."
+                )
+            return failure(reason)
 
     @staticmethod
     def _checkers_piece_identity(piece: dict[str, Any]) -> str:

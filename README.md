@@ -253,18 +253,28 @@ contesting or staging around an objective. Setup is intended once per loaded
 game; subsequent turns should use fresh observation and on-demand LOS probes.
 The placement-only setup bridge is separate from the larger Kill Team runtime
 and exists for exact model placement when the full setup state machine is not
-needed.
-For semantic roster setup, the gateway accepts `KILLTEAM_ROLL_INITIATIVE`,
-`KILLTEAM_SELECT_ROSTER[contained_guid]`,
-`KILLTEAM_LOCK_ROSTERS`, `KILLTEAM_START_DEPLOYMENT[operative_id]`,
-`MOVE[guid,x,y,z]`, `KILLTEAM_SETUP_PLACE[guid,x,y,z]`,
-`KILLTEAM_ROLLBACK_PENDING`,
-and `KILLTEAM_RECONCILE_SETUP[side_id]`. Use `KILLTEAM_ROLL_INITIATIVE` as
-the first semantic setup step unless initiative has already been explicitly
-overridden outside the runtime. For the initial placement test, the gateway accepts
-`MOVE[guid,x,y,z]` after observing the AI roster; the runtime uses the live
-figurine GUID at the move step and verifies the placement. The isolated
-deployment smoke test uses
+needed. For chat-driven setup, the AI performs the tactical model selection and
+one-at-a-time placement reasoning from the live placement-bridge observation.
+The runtime validates and executes only the AI's selected GUID and coordinates.
+For the AI-owned Kill Team setup pass, the gateway accepts `KILLTEAM_AUTORUN_SETUP`.
+The message is forwarded to the AI as a setup request. The AI owns every
+AI-side model selection and placement; the human only places human models. The
+AI observes the live models and terrain, selects one model and one tactical
+position, emits `MOVE[guid,x,y,z]`, and the setup runtime routes that move
+through the placement bridge's verified move alias before the turn ends. The
+lower-level
+`KILLTEAM_SELECT_ROSTER[contained_guid]`, `KILLTEAM_LOCK_ROSTERS`,
+`KILLTEAM_START_DEPLOYMENT[operative_id]`, and
+`KILLTEAM_DEPLOY_SETUP[guid,x,y,z]` commands remain available for manual control,
+debugging, and lower-level tests. `KILLTEAM_ROLLBACK_PENDING` and
+`KILLTEAM_RECONCILE_SETUP[side_id]` remain the recovery hooks for interrupted
+setup turns. Use `KILLTEAM_ROLL_INITIATIVE` as the first semantic setup step
+unless initiative has already been explicitly overridden outside the runtime.
+`KILLTEAM_AUTORUN_SETUP` is a chat-level AI setup request, not a runtime Lua
+macro; the gateway stops after one verified placement and waits for the next
+request. For the initial placement test, the gateway accepts `MOVE[guid,x,y,z]`
+after observing the AI roster; the runtime uses the live figurine GUID at the
+move step and verifies the placement. The isolated deployment smoke test uses
 the standalone zero-argument command `KILLTEAM_DEPLOY_TEST`; it bypasses setup
 and moves only the uniquely named test model to the uniquely tagged zone.
 The agreed vertical-slice run uses
@@ -631,7 +641,9 @@ be changed with `TTS_TRACE_JSON_LOG`.
 The shared runtime trace records server,
 gateway, and supervisor startup/shutdown, AI backend requests and responses,
 HTTP gateway traffic, and both directions of the TTS External Editor protocol.
-Chat text is retained for debugging; credentials are redacted and
+Every non-empty player chat message is recorded as a `tts_chat_event` when it
+arrives from TTS and as an `ai_message_received` event when it reaches the HTTP
+gateway. Chat text is retained for debugging; credentials are redacted and
 scripts/images are represented by bounded metadata rather than raw blobs.
 
 Chat messages are forwarded from TTS through `onChat` and can be read with

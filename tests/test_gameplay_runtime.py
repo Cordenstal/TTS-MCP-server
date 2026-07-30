@@ -365,6 +365,14 @@ def test_parser_supports_dedicated_killteam_setup_placement() -> None:
     }
 
 
+def test_parser_supports_autonomous_killteam_setup_macro() -> None:
+    commands = parse_ai_commands("KILLTEAM_AUTORUN_SETUP")
+
+    assert len(commands) == 1
+    assert commands[0].action == "killteam_autorun_setup"
+    assert commands[0].args == {}
+
+
 def test_command_execution_dispatches_dedicated_killteam_setup_placement() -> None:
     calls = []
 
@@ -388,6 +396,262 @@ def test_command_execution_dispatches_dedicated_killteam_setup_placement() -> No
             "z": 3.5,
         }),
     ]
+
+
+def test_command_execution_runs_autonomous_killteam_setup_macro() -> None:
+    calls: list[tuple[str, dict]] = []
+    state = {"setup_active": False, "step": 0}
+
+    def snapshot() -> dict:
+        step = state["step"]
+        if step == 0:
+            return {
+                "stage": "roster_selection",
+                "current_side": "ai",
+                "current_batch_target": 0,
+                "current_batch_progress": 0,
+                "next_action": {
+                    "type": "select_roster_card",
+                    "card_guid": "card-ai-chosen-1",
+                },
+                "sides": {
+                    "ai": {"selected_count": 0, "deployed_count": 0, "remaining_count": 2, "batch_size": 2},
+                    "opponent": {"selected_count": 2, "deployed_count": 0, "remaining_count": 2, "batch_size": 2},
+                },
+            }
+        if step == 1:
+            return {
+                "stage": "roster_selection",
+                "current_side": "ai",
+                "current_batch_target": 0,
+                "current_batch_progress": 0,
+                "next_action": {
+                    "type": "select_roster_card",
+                    "card_guid": "card-ai-warrior-1",
+                },
+                "sides": {
+                    "ai": {"selected_count": 1, "deployed_count": 0, "remaining_count": 1, "batch_size": 2},
+                    "opponent": {"selected_count": 2, "deployed_count": 0, "remaining_count": 2, "batch_size": 2},
+                },
+            }
+        if step == 2:
+            return {
+                "stage": "roster_selection",
+                "current_side": "ai",
+                "current_batch_target": 0,
+                "current_batch_progress": 0,
+                "sides": {
+                    "ai": {"selected_count": 2, "deployed_count": 0, "remaining_count": 0, "batch_size": 2},
+                    "opponent": {"selected_count": 2, "deployed_count": 0, "remaining_count": 2, "batch_size": 2},
+                },
+            }
+        if step == 3:
+            return {
+                "stage": "deployment",
+                "current_side": "ai",
+                "current_batch_target": 2,
+                "current_batch_progress": 0,
+                "next_action": {
+                    "type": "deploy_ai_operative",
+                    "operative_id": "chosen#1",
+                    "model_guid": "model-ai-chosen-1",
+                    "recommended_position": {"x": -16.5, "y": 1.0, "z": 8.0},
+                },
+                "sides": {
+                    "ai": {"selected_count": 2, "deployed_count": 0, "remaining_count": 2, "batch_size": 2},
+                    "opponent": {"selected_count": 2, "deployed_count": 0, "remaining_count": 2, "batch_size": 2},
+                },
+            }
+        if step == 4:
+            return {
+                "stage": "deployment",
+                "current_side": "ai",
+                "current_batch_target": 2,
+                "current_batch_progress": 1,
+                "next_action": {
+                    "type": "deploy_ai_operative",
+                    "operative_id": "warrior#1",
+                    "model_guid": "model-ai-warrior-1",
+                    "recommended_position": {"x": -15.5, "y": 1.0, "z": 8.5},
+                },
+                "sides": {
+                    "ai": {"selected_count": 2, "deployed_count": 1, "remaining_count": 1, "batch_size": 2},
+                    "opponent": {"selected_count": 2, "deployed_count": 0, "remaining_count": 2, "batch_size": 2},
+                },
+            }
+        return {
+            "stage": "deployment",
+            "current_side": "opponent",
+            "current_batch_target": 2,
+            "current_batch_progress": 2,
+            "next_action": {
+                "type": "await_human_deployment",
+                "operative_id": None,
+            },
+            "sides": {
+                "ai": {"selected_count": 2, "deployed_count": 2, "remaining_count": 0, "batch_size": 2},
+                "opponent": {"selected_count": 2, "deployed_count": 0, "remaining_count": 2, "batch_size": 2},
+            },
+        }
+
+    def request(action, args):
+        calls.append((action, args))
+        if action == "tts_killteam_observe":
+            if not state["setup_active"]:
+                raise RuntimeError("setup is not active")
+            return {"setup": snapshot()}
+        if action == "tts_killteam_setup":
+            state["setup_active"] = True
+            state["step"] = 0
+            return {"status": "ready", "setup": snapshot()}
+        if action == "tts_killteam_select_roster_card":
+            if args["contained_guid"] == "card-ai-chosen-1":
+                state["step"] = 1
+            elif args["contained_guid"] == "card-ai-warrior-1":
+                state["step"] = 2
+            else:
+                raise AssertionError(f"unexpected roster card {args['contained_guid']}")
+            return {"status": "selected", "guid": args["contained_guid"], "selected_count": state["step"]}
+        if action == "tts_killteam_lock_rosters":
+            state["step"] = 3
+            return {"status": "locked", "setup": snapshot()}
+        if action == "tts_killteam_start_setup_deployment":
+            if args["operative_id"] == "chosen#1":
+                return {
+                    "status": "pending_model",
+                    "operative_id": "chosen#1",
+                    "model_guid": "model-ai-chosen-1",
+                    "recommended_position": {"x": -16.5, "y": 1.0, "z": 8.0},
+                }
+            if args["operative_id"] == "warrior#1":
+                return {
+                    "status": "pending_model",
+                    "operative_id": "warrior#1",
+                    "model_guid": "model-ai-warrior-1",
+                    "recommended_position": {"x": -15.5, "y": 1.0, "z": 8.5},
+                }
+            raise AssertionError(f"unexpected operative {args['operative_id']}")
+        if action == "tts_killteam_deploy_setup_operative":
+            if args["guid"] == "model-ai-chosen-1":
+                state["step"] = 4
+                return {"status": "deployed", "guid": args["guid"], "position": dict(args)}
+            if args["guid"] == "model-ai-warrior-1":
+                state["step"] = 5
+                return {"status": "deployed", "guid": args["guid"], "position": dict(args)}
+            raise AssertionError(f"unexpected model {args['guid']}")
+        if action == "tts_killteam_reconcile_setup_step":
+            assert args == {"side_id": "opponent"}
+            return {
+                "status": "waiting_for_model",
+                "side_id": "opponent",
+                "batch_target": 2,
+                "batch_progress": 2,
+            }
+        raise AssertionError(f"unexpected action {action}")
+
+    executor = CommandExecution(request, lambda _: "unused")
+    result = executor.execute(
+        parse_ai_commands("KILLTEAM_AUTORUN_SETUP"),
+        running=False,
+        active_game="killteam",
+    )
+
+    assert result["executed"][0]["status"] == "executed"
+    assert result["executed"][0]["result"]["final_state"]["current_side"] == "opponent"
+    assert [action for action, _ in calls] == [
+        "tts_killteam_observe",
+        "tts_killteam_setup",
+        "tts_killteam_select_roster_card",
+        "tts_killteam_observe",
+        "tts_killteam_select_roster_card",
+        "tts_killteam_observe",
+        "tts_killteam_lock_rosters",
+        "tts_killteam_start_setup_deployment",
+        "tts_killteam_deploy_setup_operative",
+        "tts_killteam_observe",
+        "tts_killteam_start_setup_deployment",
+        "tts_killteam_deploy_setup_operative",
+        "tts_killteam_observe",
+        "tts_killteam_reconcile_setup_step",
+        "tts_killteam_observe",
+    ]
+
+
+def test_autonomous_killteam_setup_reconciles_human_batch_then_resumes_ai() -> None:
+    calls: list[tuple[str, dict]] = []
+    state = {"step": 0}
+
+    def snapshot() -> dict:
+        if state["step"] == 0:
+            return {
+                "stage": "deployment",
+                "current_side": "opponent",
+                "current_batch_target": 2,
+                "current_batch_progress": 0,
+                "next_action": {"type": "await_human_deployment", "side_id": "opponent"},
+            }
+        if state["step"] == 1:
+            return {
+                "stage": "deployment",
+                "current_side": "ai",
+                "current_batch_target": 1,
+                "current_batch_progress": 0,
+                "next_action": {
+                    "type": "deploy_ai_operative",
+                    "operative_id": "warrior#1",
+                    "model_guid": "model-ai-warrior-1",
+                    "recommended_position": {"x": -16.0, "y": 1.0, "z": 8.0},
+                },
+            }
+        return {"stage": "complete", "current_side": None, "current_batch_target": 0, "current_batch_progress": 0}
+
+    def request(action: str, args: dict) -> dict:
+        calls.append((action, args))
+        if action == "tts_killteam_observe":
+            return {"setup": snapshot()}
+        if action == "tts_killteam_reconcile_setup_step":
+            assert args == {"side_id": "opponent"}
+            state["step"] = 1
+            return {"status": "deployed", "side_id": "opponent", "deployed_count": 2, "batch_complete": True}
+        if action == "tts_killteam_start_setup_deployment":
+            return {"status": "pending_model", "operative_id": "warrior#1", "model_guid": "model-ai-warrior-1"}
+        if action == "tts_killteam_deploy_setup_operative":
+            assert args == {"guid": "model-ai-warrior-1", "x": -16.0, "y": 1.0, "z": 8.0}
+            state["step"] = 2
+            return {"status": "deployed", "guid": args["guid"]}
+        raise AssertionError(f"unexpected action {action}")
+
+    result = CommandExecution(request, lambda _: "unused").execute(
+        parse_ai_commands("KILLTEAM_AUTORUN_SETUP"),
+        running=False,
+        active_game="killteam",
+    )
+
+    final_state = result["executed"][0]["result"]["final_state"]
+    assert final_state["stage"] == "complete"
+    assert [action for action, _ in calls] == [
+        "tts_killteam_observe",
+        "tts_killteam_reconcile_setup_step",
+        "tts_killteam_observe",
+        "tts_killteam_start_setup_deployment",
+        "tts_killteam_deploy_setup_operative",
+        "tts_killteam_observe",
+    ]
+
+
+def test_autonomous_killteam_setup_propagates_runtime_failure() -> None:
+    def request(action: str, args: dict) -> dict:
+        raise RuntimeError(f"Unknown placement MCP action: {action}")
+
+    result = CommandExecution(request, lambda _: "unused").execute(
+        parse_ai_commands("KILLTEAM_AUTORUN_SETUP"),
+        running=False,
+        active_game="killteam",
+    )
+
+    assert result["stopped"] is True
+    assert result["executed"][0]["status"] == "failed"
+    assert result["executed"][0]["result"]["stopped"] is True
 
 
 def test_parser_supports_guid_based_killteam_deployment() -> None:
@@ -687,13 +951,18 @@ class KillTeamCommandProtocolTests(unittest.TestCase):
             context={},
         )
         self.assertIn("tts_killteam_observe", prompt)
-        self.assertIn("setup.ai_plan", prompt)
-        self.assertIn("KILLTEAM_LOCK_ROSTERS", prompt)
+        self.assertIn("KILLTEAM_AUTORUN_SETUP", prompt)
+        self.assertNotIn("setup.ai_plan", prompt)
+        self.assertNotIn("KILLTEAM_LOCK_ROSTERS", prompt)
         self.assertIn("tts_killteam_plan_objective_move", prompt)
         self.assertIn("MOVE[guid,x,y,z]", prompt)
         self.assertNotIn("tts_list_objects", prompt)
         self.assertIn("MOVE[guid,target_x,target_y,target_z]", prompt)
-        self.assertIn("KILLTEAM_SETUP_PLACE[guid,x,y,z]", prompt)
+        self.assertIn("MOVE[guid,x,y,z]", prompt)
+        self.assertIn("Ignore bags, decks, cards, and other containers", prompt)
+        self.assertIn("choose only a live figurine with the Operative tag", prompt)
+        self.assertIn("Stop after that verified placement", prompt)
+        self.assertIn("wait for a new KILLTEAM_AUTORUN_SETUP request", prompt)
         self.assertNotIn("KILLTEAM_DEPLOY_SETUP[guid,target_x,target_y,target_z]", prompt)
         self.assertNotIn("KILLTEAM_PLACE[operative_id,target_x,target_y,target_z]", prompt)
         self.assertIn("\nKILLTEAM_DEPLOY_TEST\n", prompt)

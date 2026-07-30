@@ -3,7 +3,8 @@
 -- runtime is unavailable or too large for the current workflow.
 
 local MCP_CHANNEL = "tts-mcp"
-local MCP_BRIDGE_VERSION = "2026-07-29-setup-placement-v1"
+local MCP_BRIDGE_VERSION = "2026-07-29-setup-placement-v2-chat"
+local MCP_HTTP_CHAT_URL = "http://127.0.0.1:8765/chat"
 
 local function mcp_try(fn)
     local ok, value = pcall(fn)
@@ -54,6 +55,87 @@ local function mcp_trim(value)
         return ""
     end
     return string.sub(text, first, last)
+end
+
+local function mcp_public_chat_text(value)
+    local text = mcp_trim(value)
+    if text == "" then
+        return ""
+    end
+    -- Gateway responses are already sanitized. Keep this final Lua boundary
+    -- from displaying a raw JSON object if a backend is misconfigured.
+    local first = string.sub(text, 1, 1)
+    if first == "{" or first == "[" then
+        return ""
+    end
+    return text
+end
+
+-- Keep this placement-only bridge observable without taking ownership of the
+-- full gameplay chat/AI flow. The Python listener records this event in the
+-- runtime trace and exposes it through tts_recent_chat/tts_wait_for_chat.
+local function mcp_forward_chat(message, sender)
+    local text = mcp_trim(message)
+    if text == "" then
+        return
+    end
+    local event = {
+        channel = MCP_CHANNEL,
+        event = "chat_message",
+        message = text,
+        player_color = sender and tostring(sender.color or "") or "",
+        player_name = sender and tostring(sender.steam_name or sender.name or "") or "",
+    }
+    Wait.frames(function()
+        pcall(function()
+            sendExternalMessage(event)
+        end)
+    end, 1)
+end
+
+function onChat(message, sender)
+    mcp_forward_chat(message, sender)
+
+    local raw_message = mcp_trim(message)
+    if raw_message == "" then
+        return nil
+    end
+
+    WebRequest.custom(
+        MCP_HTTP_CHAT_URL,
+        "POST",
+        true,
+        JSON.encode({
+            message = raw_message,
+            player = {
+                color = sender and tostring(sender.color or "") or "",
+                steam_name = sender and tostring(sender.steam_name or "") or "",
+                steam_id = sender and tostring(sender.steam_id or "") or "",
+                host = sender and sender.host == true or false,
+            },
+        }),
+        { ["Content-Type"] = "application/json", ["Accept"] = "application/json" },
+        function(request)
+            if request.is_error then
+                print("[tts-killteam-setup] chat HTTP error: " .. tostring(request.error))
+                return
+            end
+            if request.response_code < 200 or request.response_code >= 300 then
+                print("[tts-killteam-setup] chat HTTP status: " .. tostring(request.response_code))
+                return
+            end
+
+            local ok, response = pcall(function() return JSON.decode(request.text or "") end)
+            if not ok or type(response) ~= "table" then
+                print("[tts-killteam-setup] chat response was not valid JSON")
+                return
+            end
+            local text = mcp_public_chat_text(response.text or "")
+            if text ~= "" then
+                printToAll(text, { r = 1, g = 1, b = 1, a = 1 })
+            end
+        end
+    )
 end
 
 local function mcp_json_safe(value)
@@ -165,6 +247,120 @@ local function mcp_matches_filters(obj, args)
     return false
 end
 
+local function mcp_object_type(obj)
+    return tostring(mcp_try(function() return obj.type end) or mcp_try(function() return obj.tag end) or "")
+end
+
+local function mcp_object_tags(obj)
+    return mcp_try(function() return obj.getTags() end) or {}
+end
+
+local function mcp_is_operative_figurine(obj)
+    if string.lower(mcp_object_type(obj)) ~= "figurine" then
+        return false
+    end
+    local tags = mcp_object_tags(obj)
+    for _, tag in ipairs(tags) do
+        if string.lower(tostring(tag)) == "operative" then
+            return true
+        end
+    end
+    return false
+end
+
+local function mcp_type_name(value)
+    local value_type = type(value)
+    if value_type == "table" then
+        local parts = { "table" }
+        for _, axis in ipairs({ "x", "y", "z" }) do
+            local axis_value = mcp_try(function() return value[axis] end)
+            if axis_value ~= nil then
+                table.insert(parts, axis .. ":" .. type(axis_value))
+            end
+        end
+        return table.concat(parts, ",")
+    end
+    return value_type
+end
+
+local function mcp_type_field(args, field)
+    return mcp_type_name(mcp_try(function() return args[field] end))
+end
+
+local function mcp_setup_request_summary(args, request_id, action, stage)
+    local position = mcp_try(function() return args.position end)
+    local parts = {
+        "request_id=" .. tostring(request_id or ""),
+        "action=" .. tostring(action or ""),
+        "stage=" .. tostring(stage or ""),
+        "args=" .. mcp_type_name(args),
+        "position=" .. mcp_type_name(position),
+        "guid=" .. mcp_type_field(args, "guid"),
+        "x=" .. mcp_type_field(args, "x"),
+        "y=" .. mcp_type_field(args, "y"),
+        "z=" .. mcp_type_field(args, "z"),
+        "smooth=" .. mcp_type_field(args, "smooth"),
+        "collide=" .. mcp_type_field(args, "collide"),
+        "fast=" .. mcp_type_field(args, "fast"),
+    }
+    if type(position) == "table" then
+        table.insert(parts, "position.x=" .. mcp_type_field(position, "x"))
+        table.insert(parts, "position.y=" .. mcp_type_field(position, "y"))
+        table.insert(parts, "position.z=" .. mcp_type_field(position, "z"))
+    end
+    return "[tts-killteam-setup] " .. table.concat(parts, " ")
+end
+
+local function mcp_setup_position_table(args)
+    local requested = args.position
+    requested = mcp_json_safe(requested)
+    if type(requested) ~= "table" then
+        requested = args
+    end
+    if type(requested) ~= "table" then
+        requested = {}
+    end
+    return requested
+end
+
+local function mcp_setup_coordinate_value(source, field, index)
+    if type(source) ~= "table" then
+        return nil
+    end
+    local value = mcp_try(function() return source[field] end)
+    local number = tonumber(value)
+    if number ~= nil then
+        return number
+    end
+    if index ~= nil then
+        value = mcp_try(function() return source[index] end)
+        number = tonumber(value)
+        if number ~= nil then
+            return number
+        end
+    end
+    return nil
+end
+
+local function mcp_setup_requested_position(args)
+    local requested = mcp_setup_position_table(args)
+    local x = mcp_setup_coordinate_value(requested, "x", 1)
+    local y = mcp_setup_coordinate_value(requested, "y", 2)
+    local z = mcp_setup_coordinate_value(requested, "z", 3)
+    if x ~= nil and y ~= nil and z ~= nil then
+        return { x = x, y = y, z = z }, "position"
+    end
+
+    x = mcp_setup_coordinate_value(args, "x", 1)
+    y = mcp_setup_coordinate_value(args, "y", 2)
+    z = mcp_setup_coordinate_value(args, "z", 3)
+    if x ~= nil and y ~= nil and z ~= nil then
+        return { x = x, y = y, z = z }, "args"
+    end
+
+    return nil, "missing"
+end
+
 local MCP_HANDLERS = {}
 
 function onLoad()
@@ -174,6 +370,7 @@ function onLoad()
 end
 
 MCP_HANDLERS.setup_ping = function(args, request_id)
+    args = mcp_json_safe(args)
     local object_count = mcp_try(function() return #getObjects() end)
     mcp_try(function()
         printToAll("Kill Team setup placement bridge is active.", { r = 0.9, g = 0.95, b = 1, a = 1 })
@@ -187,6 +384,7 @@ MCP_HANDLERS.setup_ping = function(args, request_id)
 end
 
 MCP_HANDLERS.setup_list_objects = function(args, request_id)
+    args = mcp_json_safe(args)
     local max_results = math.max(1, math.min(tonumber(args.max_results) or 200, 1000))
     local compact = args.compact ~= false
     local results = {}
@@ -201,6 +399,9 @@ MCP_HANDLERS.setup_list_objects = function(args, request_id)
     for _, obj in ipairs(objects_or_error) do
         local live_guid = mcp_try(function() return obj.getGUID() end)
         if live_guid ~= nil and tostring(live_guid) ~= "" and tostring(live_guid) ~= "-1" and mcp_matches_filters(obj, args) then
+            if string.lower(tostring(args.tag or "")) == "operative" and not mcp_is_operative_figurine(obj) then
+                goto continue
+            end
             total_matching = total_matching + 1
             local summary = compact and mcp_object_summary(obj) or {
                 guid = mcp_try(function() return obj.getGUID() end),
@@ -216,6 +417,7 @@ MCP_HANDLERS.setup_list_objects = function(args, request_id)
                 table.insert(results, summary)
             end
         end
+        ::continue::
     end
     return {
         count = #results,
@@ -225,21 +427,26 @@ MCP_HANDLERS.setup_list_objects = function(args, request_id)
     }
 end
 
-MCP_HANDLERS.setup_place_model = function(args, request_id)
+local function mcp_setup_place_model(args, request_id, action)
+    print(mcp_setup_request_summary(args, request_id, action, "pre"))
+    args = mcp_json_safe(args)
+    print(mcp_setup_request_summary(args, request_id, action, "post"))
     local obj = mcp_require_object(args.guid)
-    local requested = args.position
-    if type(requested) ~= "table" then
-        error("position must be a table containing x, y, and z.")
+    if not mcp_is_operative_figurine(obj) then
+        error(
+            "setup placement requires an Operative figurine; got "
+            .. mcp_object_type(obj)
+            .. " tags="
+            .. table.concat(mcp_object_tags(obj), ",")
+            .. "; "
+            .. mcp_setup_request_summary(args, request_id, action, "reject")
+        )
+    end
+    local position, position_source = mcp_setup_requested_position(args)
+    if position == nil then
+        error("position must contain numeric x, y, and z values; " .. mcp_setup_request_summary(args, request_id, action, "error"))
     end
 
-    local x = tonumber(requested.x or requested[1])
-    local y = tonumber(requested.y or requested[2])
-    local z = tonumber(requested.z or requested[3])
-    if x == nil or y == nil or z == nil then
-        error("position must contain numeric x, y, and z values.")
-    end
-
-    local position = { x = x, y = y, z = z }
     if args.smooth == true then
         obj.setPositionSmooth(position, args.collide == true, args.fast ~= false)
     else
@@ -255,14 +462,23 @@ MCP_HANDLERS.setup_place_model = function(args, request_id)
             guid = guid,
             name = moved and moved.getName() or mcp_try(function() return obj.getName() end),
             tags = moved and moved.getTags() or mcp_try(function() return obj.getTags() end) or {},
+            source = position_source,
             position = {
-                x = tonumber(actual.x) or x,
-                y = tonumber(actual.y) or y,
-                z = tonumber(actual.z) or z,
+                x = tonumber(actual.x) or position.x,
+                y = tonumber(actual.y) or position.y,
+                z = tonumber(actual.z) or position.z,
             },
         })
-    end, 20)
+        end, 20)
     return nil, true
+end
+
+MCP_HANDLERS.setup_place_model = function(args, request_id)
+    return mcp_setup_place_model(args, request_id, "setup_place_model")
+end
+
+MCP_HANDLERS.move_object = function(args, request_id)
+    return mcp_setup_place_model(args, request_id, "move_object")
 end
 
 function mcp_handleExternalMessage(data)
@@ -281,7 +497,7 @@ function mcp_handleExternalMessage(data)
 
     local args = {}
     local nested_args = mcp_try(function() return data.args end)
-    for _, field in ipairs({ "guid", "name_contains", "tag", "max_results", "compact", "smooth", "collide", "fast", "position" }) do
+    for _, field in ipairs({ "guid", "name_contains", "tag", "max_results", "compact", "smooth", "collide", "fast", "x", "y", "z", "position" }) do
         local value = mcp_try(function() return data[field] end)
         if value == nil and nested_args ~= nil then
             value = mcp_try(function() return nested_args[field] end)

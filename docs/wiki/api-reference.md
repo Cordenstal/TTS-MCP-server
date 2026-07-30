@@ -60,7 +60,13 @@ is to contest or stage around an objective.
 
 The placement-only setup bridge exposes `tts_killteam_setup_ping`,
 `tts_killteam_setup_list_objects`, and `tts_killteam_setup_place_model` for
-the narrow setup-time flow that only needs exact placement and readback.
+manual/debug compatibility, and the same bridge now accepts the move alias
+used by the AI-owned setup turn. `tts_killteam_setup_ping` also proves the
+loaded Global Lua script matches `tts_killteam_setup_global.lua` on disk by
+returning the bridge version, disk hash, loaded hash, and verification result.
+Each AI setup turn resolves one live model, emits one `MOVE[guid,x,y,z]`, and
+the gateway translates that move into the setup runtime's verified placement
+path before stopping until a new `KILLTEAM_AUTORUN_SETUP` request arrives.
 
 ## Mutation workflow
 
@@ -91,8 +97,9 @@ Use `dry_run=true` to validate a plan without changing TTS. Use
 cached result instead of executing the plan twice.
 
 For the placement-only setup bridge, use `tts_killteam_setup_list_objects`
-before `tts_killteam_setup_place_model` when you need to resolve a live model
-or tagged target without involving the full Kill Team runtime.
+before `tts_killteam_setup_place_model` when you need manual/debug placement
+compatibility. The AI-owned setup flow uses `MOVE[guid,x,y,z]` and the setup
+runtime routes it through the bridge's move alias and readback verification.
 
 `tts_move_checkers_piece` is the game-specific movement path for the bundled
 checkers save. It resolves the live `Checker_black` pieces, infers the square

@@ -31,6 +31,10 @@ _Avoid_: Arbitrary Lua, unrestricted scene command
 The AI's selection and sequencing of generic object actions to carry out an intended game operation.
 _Avoid_: Direct game-rule enforcement, arbitrary automation
 
+**Autonomous setup command**:
+A single chat-level Kill Team setup macro that drives the runtime's AI-side roster selection and tactical deployment loop from the live setup state.
+_Avoid_: manually expanded setup script, hidden multi-step chat macro
+
 **Game rules**:
 The active game's authority for deciding which state transitions and action sequences are legal.
 _Avoid_: Bridge policy, object API behavior

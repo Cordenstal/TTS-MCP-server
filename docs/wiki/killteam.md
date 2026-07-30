@@ -84,8 +84,14 @@ falls back to a raw compact scene enumeration only when the canonical tagged
 scan is empty.
 The placement-only setup bridge is separate from that full runtime. It
 exposes `tts_killteam_setup_ping`, `tts_killteam_setup_list_objects`, and
-`tts_killteam_setup_place_model` when the workflow only needs exact model
-placement and readback instead of the broader setup state machine.
+`tts_killteam_setup_place_model` for manual or debug compatibility, and the
+same bridge accepts the move alias used by the AI-owned setup turn.
+`tts_killteam_setup_ping` now verifies that the loaded Global script matches
+the checked-in `tts_killteam_setup_global.lua` before any placement command
+runs.
+`KILLTEAM_AUTORUN_SETUP` is a chat-level AI setup request, not a runtime Lua
+macro; the gateway turns it into one bounded AI placement turn through the
+placement bridge and then stops for that turn.
 `tts_killteam_observe` then returns the current revision, observation ID,
 visible operative records, terrain, AI dice references, counters, roller GUID,
 and an explicit truncation flag. Setup is a start-of-game operation and must
@@ -256,6 +262,11 @@ fixture pipeline resumes only
 when authenticated Red or host chat says `Defense roll complete`.
 The placement-only setup bridge also accepts `KILLTEAM_SETUP_PLACE[guid,x,y,z]`
 for exact model placement without loading the broader setup state machine.
+The chat gateway also accepts `KILLTEAM_AUTORUN_SETUP` for the AI-owned setup
+pass when the full runtime Lua bridge is loaded. With the placement-only
+bridge, use `MOVE[guid,x,y,z]` after resolving the live object through
+`tts_killteam_setup_list_objects`. The bridge-level `KILLTEAM_SETUP_PLACE`
+form remains available for manual or lower-level debugging paths.
 
 ### Setup deployment state machine
 
@@ -270,19 +281,24 @@ Semantic pregame setup follows this bounded sequence:
    selection can begin immediately. Use `tts_killteam_roll_initiative` only
    when the host explicitly overrides that default and wants a physical
    initiative roll instead.
-3. The AI receives `setup.next_action` and `setup.ai_plan`, which identify its
-   first model and a legal recommended position. It calls
-   `tts_killteam_start_setup_deployment`, then
-   `tts_killteam_deploy_setup_operative` for that model. The position is
-   revalidated against the live model bounds before the move is committed.
+3. `KILLTEAM_AUTORUN_SETUP` starts an AI-owned setup pass. The AI observes the
+   live placement objects, selects exactly one AI model by role priority and
+   board context, chooses a tactical legal position, and emits exactly one
+   `MOVE[guid,x,y,z]`. The gateway translates that move into the setup
+   runtime's verified placement path, which validates the selected GUID and
+   coordinates, then the AI stops for that turn. Send a new
+   `KILLTEAM_AUTORUN_SETUP` request for the next placement. The human never
+   selects or moves an AI model.
 4. Deployment then follows the configured cadence: starting with the AI-first
    `initiative_side` unless the host overrode it, each side alternates setup
    passes and places `floor(N/3)` operatives per pass, with a minimum pass of
    one operative and a smaller final remainder when fewer remain.
-5. The human side places its current batch directly into its deployment zone.
-   `tts_killteam_reconcile_setup_step` detects those live models, validates
-   whole-zone containment and non-overlap, consumes the batch, and advances the
-   turn. The AI then selects and places the next model or batch.
+5. The human side places only its own current batch directly into its deployment
+   zone. After the human reports that batch placed, the AI sends another
+   `KILLTEAM_AUTORUN_SETUP` request; the gateway calls
+   `tts_killteam_reconcile_setup_step` to detect and validate the human models,
+   consumes the batch, and then performs one new AI placement turn.
+   Reconciliation is never used to place AI models.
 6. Every AI placement is verified against live position and geometry, and each
    deployed operative receives a starting `Conceal` order. The lower-level
    roster-card selection and lock actions remain available for tables that
@@ -299,9 +315,8 @@ the destination tagged `_deployment_zone_blue`, derives their current GUIDs
 only for the TTS bridge calls, copies the zone's x/z coordinates while preserving
 the model's current y coordinate, and verifies the final model x/z position is
 within `0.25` TTS world units of the zone position. It does not inspect full
-Kill Team setup, rosters, snap points, dice, or game rules. This is a test seam for later tactical
-model selection and deployment; it is not yet a tactical deployment
-planner.
+Kill Team setup, rosters, snap points, dice, or game rules. This is the test
+seam for the tactical one-by-one deployment planner.
 
 The AI plans within a bounded horizon, announces its intended plan publicly,
 re-observes after each action, and replans when state changes. Its objective

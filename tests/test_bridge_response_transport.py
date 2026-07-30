@@ -98,6 +98,32 @@ class BridgeResponseTransportTests(unittest.TestCase):
         )
         self.assertNotIn("args", sent["customMessage"])  # type: ignore[arg-type]
 
+    def test_external_editor_chat_is_recorded_in_runtime_trace(self) -> None:
+        if _SERVER_IMPORT_ERROR is not None:
+            self.skipTest(f"server dependencies missing: {_SERVER_IMPORT_ERROR}")
+        bridge = server.TTSBridge()
+        with patch("tts_mcp.app.server.session_store.record_event"), patch(
+            "tts_mcp.app.server._record_trace"
+        ) as record_trace:
+            bridge._handle_message({
+                "messageID": "4",
+                "customMessage": {
+                    "channel": "tts-mcp",
+                    "event": "chat_message",
+                    "message": "Place the models tactically.",
+                    "player_color": "Blue",
+                    "player_name": "Player One",
+                },
+            })
+
+        chat_events = [
+            call for call in record_trace.call_args_list
+            if call.args and call.args[0] == "tts_chat_event"
+        ]
+        self.assertEqual(len(chat_events), 1)
+        self.assertEqual(chat_events[0].kwargs["message"], "Place the models tactically.")
+        self.assertEqual(chat_events[0].kwargs["player_color"], "Blue")
+
     def test_loopback_bridge_response_releases_the_matching_waiter(self) -> None:
         if _SERVER_IMPORT_ERROR is not None:
             self.skipTest(f"server dependencies missing: {_SERVER_IMPORT_ERROR}")

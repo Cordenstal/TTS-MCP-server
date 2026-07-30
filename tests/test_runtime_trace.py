@@ -55,6 +55,18 @@ class RuntimeTraceTests(unittest.TestCase):
         self.assertNotIn("payload", rendered)
         self.assertNotIn("{", rendered)
 
+    def test_console_event_shows_tts_chat_event_text(self):
+        rendered = console_event({
+            "at_unix": 1700000000,
+            "kind": "tts_chat_event",
+            "trace_id": "chat123",
+            "message": "Place my operatives tactically.",
+            "player_color": "Blue",
+            "player_name": "Player One",
+        })
+
+        self.assertIn('RECEIVED "Place my operatives tactically." from Blue', rendered)
+
     def test_console_event_shows_verbose_ai_summary_without_raw_json(self):
         rendered = console_event({
             "at_unix": 1700000000,
@@ -106,6 +118,30 @@ class RuntimeTraceTests(unittest.TestCase):
         self.assertIn("args=guid=abc", rendered)
         self.assertIn("position=(1,2,3)", rendered)
         self.assertNotIn("{'", rendered)
+
+    def test_console_event_shows_setup_translation_when_dispatch_differs(self):
+        rendered = console_event({
+            "at_unix": 1700000000,
+            "kind": "ai_commands_processed",
+            "trace_id": "abc123",
+            "commands": [{
+                "action": "move_object",
+                "args": {"guid": "362d46", "x": -18.08, "y": 1.3, "z": -8.59},
+                "destructive": False,
+            }],
+            "execution": {
+                "executed": [{
+                    "action": "killteam_setup_place_model",
+                    "status": "executed",
+                    "result": {"status": "verified"},
+                }],
+                "approval_required": [],
+                "blocked": [],
+            },
+        })
+
+        self.assertIn("first=move_object", rendered)
+        self.assertIn("dispatched=killteam_setup_place_model", rendered)
 
     def test_console_event_preserves_full_tts_print_and_lua_error_text(self):
         printed = "system text " + ("x" * 300)

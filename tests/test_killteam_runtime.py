@@ -831,6 +831,9 @@ class KillTeamRuntimeTests(unittest.TestCase):
         self.assertEqual(human_batch["deployed_count"], 2)
         self.assertEqual(runtime.observe()["setup"]["current_side"], "ai")
 
+        with self.assertRaisesRegex(KillTeamRuleError, "AI models must be deployed"):
+            runtime.reconcile_setup_step("ai")
+
     def test_setup_exposes_ai_selection_and_deployment_order(self):
         runtime, _bridge = self._runtime_with_roster_setup()
         runtime.setup()
@@ -873,6 +876,54 @@ class KillTeamRuntimeTests(unittest.TestCase):
         )
         self.assertEqual(ai_plan["next_selection"]["card_guid"], "card-ai-chosen-1")
         self.assertEqual(ai_plan["next_deployment"]["model_guid"], "model-ai-chosen-1")
+
+    def test_setup_prefers_safe_objective_access_in_tactical_deployment(self):
+        objects, containers = setup_fixture_with_rosters()
+        objects.append(mission_objective("objective-1", name="Primary Objective", x=-14.0, z=9.0, size=1.0))
+        bridge = FakeKillTeamBridge(objects, containers=containers, rolls=[[6], [2]])
+        runtime = KillTeamRuntime(
+            bridge,
+            KillTeamConfig(
+                ai_team="ai",
+                ai_dice_count=1,
+                opponent_dice_count=1,
+            ),
+        )
+
+        runtime.setup()
+        for contained_guid in (
+            "card-ai-chosen-1",
+            "card-ai-warrior-1",
+            "card-ai-warrior-2",
+            "card-ai-butcher-1",
+            "card-ai-balefire-1",
+            "card-ai-icon-1",
+        ):
+            runtime.select_roster_card(contained_guid)
+        for index, contained_guid in enumerate((
+            "card-op-chosen-1",
+            "card-op-warrior-1",
+            "card-op-warrior-2",
+            "card-op-butcher-1",
+            "card-op-balefire-1",
+            "card-op-icon-1",
+        )):
+            bridge.objects[contained_guid] = live_card(
+                next(item for item in bridge.containers["deck-op"]["items"] if item["guid"] == contained_guid),
+                x=18.0 + (index % 3),
+                z=-12.0 + (index // 3),
+            )
+            bridge.containers["deck-op"]["items"] = [
+                item for item in bridge.containers["deck-op"]["items"] if item["guid"] != contained_guid
+            ]
+
+        locked = runtime.lock_rosters()
+        recommended = locked["setup"]["ai_plan"]["next_deployment"]["recommended_position"]
+
+        self.assertIn("most cover", locked["setup"]["ai_plan"]["policy"])
+        self.assertIsNotNone(recommended)
+        self.assertGreater(recommended["x"], -17.5)
+        self.assertGreater(recommended["z"], 7.0)
 
     def test_roll_initiative_is_not_needed_for_ai_first_setup(self):
         objects, containers = setup_fixture_with_rosters()

@@ -1850,7 +1850,7 @@ class KillTeamRuntime:
         *,
         clearance: float = 0.25,
     ) -> dict[str, float] | None:
-        """Return a conservative legal slot without moving the model."""
+        """Return a tactical legal slot without moving the model."""
         deployment_bounds = self._setup_zone_bounds(side["deployment_zone_guid"])
         raw_model = model_item.get("object") if isinstance(model_item.get("object"), dict) else model_item
         raw_bounds = raw_model.get("bounds") if isinstance(raw_model, dict) else None
@@ -1871,6 +1871,26 @@ class KillTeamRuntime:
             if candidate_zone is not None:
                 opponent_centers.append(_position(candidate_zone))
         opponent_center = opponent_centers[0] if opponent_centers else None
+
+        objectives = [
+            {
+                "guid": guid,
+                "position": _position(obj),
+                "bounds": bounds,
+            }
+            for guid, obj in self._objects.items()
+            if _norm(_metadata(obj).get("entity")) == "objective"
+            for bounds in [_bounds(obj)]
+            if bounds is not None
+        ]
+        visible_enemies = [
+            {
+                "guid": record["guid"],
+                "position": copy.deepcopy(record["position"]),
+            }
+            for record in self._visible_operatives().values()
+            if _norm(record["team"]) != _norm(self.config.ai_team) and int(record.get("wounds", 0)) > 0
+        ]
 
         blockers: list[tuple[float, float, float, float]] = []
         for guid, obj in self._objects.items():
@@ -1893,7 +1913,7 @@ class KillTeamRuntime:
 
         step_x = max(0.25, size_x + 2 * clearance)
         step_z = max(0.25, size_z + 2 * clearance)
-        candidates: list[tuple[tuple[float, float, float], dict[str, float], tuple[float, float, float, float]]] = []
+        candidates: list[tuple[tuple[float, float, float, float, float, float, float], dict[str, float]]] = []
         x = deployment_bounds[0] + size_x / 2 + clearance
         while x <= deployment_bounds[1] - size_x / 2 - clearance + 1e-6:
             z = deployment_bounds[2] + size_z / 2 + clearance
@@ -1908,20 +1928,55 @@ class KillTeamRuntime:
                 if _rect_contains_rect(deployment_bounds, inflated) and not any(
                     _rects_overlap(inflated, blocker) for blocker in [*blockers, *assigned]
                 ):
-                    distance = (
-                        math.hypot(x - opponent_center["x"], z - opponent_center["z"])
-                        if opponent_center is not None
-                        else 0.0
+                    exposure = 0
+                    cover_score = 0
+                    for enemy in visible_enemies:
+                        blocked_by = 0
+                        for blocker in blockers:
+                            if _segment_intersects_rect({"x": x, "y": zone_position["y"], "z": z}, enemy["position"], blocker):
+                                blocked_by += 1
+                        if blocked_by == 0:
+                            exposure += 1
+                        cover_score += blocked_by
+                    if objectives:
+                        objective_distance = min(
+                            math.hypot(x - objective["position"]["x"], z - objective["position"]["z"])
+                            for objective in objectives
+                        )
+                    elif opponent_center is not None:
+                        objective_distance = math.hypot(x - opponent_center["x"], z - opponent_center["z"])
+                    else:
+                        objective_distance = 0.0
+                    if visible_enemies:
+                        lane_distance = min(
+                            math.hypot(x - enemy["position"]["x"], z - enemy["position"]["z"])
+                            for enemy in visible_enemies
+                        )
+                    elif opponent_center is not None:
+                        lane_distance = math.hypot(x - opponent_center["x"], z - opponent_center["z"])
+                    else:
+                        lane_distance = 0.0
+                    path_distance = math.hypot(x - zone_position["x"], z - zone_position["z"])
+                    score = (
+                        exposure,
+                        -cover_score,
+                        objective_distance,
+                        lane_distance,
+                        path_distance,
+                        x,
+                        z,
                     )
-                    # Prefer distance from the opposing deployment zone, then
-                    # use stable coordinates to keep repeated plans identical.
-                    score = (distance, -x, -z)
-                    candidates.append((score, {"x": round(x, 6), "y": zone_position["y"], "z": round(z, 6)}, rect))
+                    candidates.append(
+                        (
+                            score,
+                            {"x": round(x, 6), "y": zone_position["y"], "z": round(z, 6)},
+                        )
+                    )
                 z += step_z
             x += step_x
         if not candidates:
             return None
-        candidates.sort(key=lambda item: item[0], reverse=True)
+        candidates.sort(key=lambda item: item[0])
         return candidates[0][1]
 
     def _setup_ai_plan(self, state: dict[str, Any]) -> dict[str, Any] | None:
@@ -2045,7 +2100,8 @@ class KillTeamRuntime:
         return {
             "policy": (
                 "Use the listed AI selection order for roster cards and the listed AI deployment order for models. "
-                "Take the first outstanding entry in each list for the active stage."
+                "For each deployment, prefer the safest legal slot with the most cover, then the best objective access, "
+                "then the strongest future attack lane."
             ),
             "selection_order": selection_order,
             "deployment_order": deployment_order,
@@ -2941,6 +2997,13 @@ class KillTeamRuntime:
             raise KillTeamRuleError("setup deployment is not active")
         if setup_state["current_side"] != side_id:
             raise KillTeamRuleError(f"it is not {side_id}'s deployment pass")
+        if (
+            setup_state.get("mode") == "model_deployment"
+            and side_id == self.config.ai_team
+        ):
+            raise KillTeamRuleError(
+                "AI models must be deployed through the AI setup deployment action, not reconciliation"
+            )
         side = self._setup_side_state(side_id)
         if not side["locked"]:
             raise KillTeamRuleError(f"side {side_id} does not have a locked roster list")

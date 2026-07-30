@@ -156,13 +156,20 @@ class BackendConfigStore:
             try:
                 value = json.loads(self.path.read_text(encoding="utf-8"))
             except (FileNotFoundError, json.JSONDecodeError):
-                # Keep the checked-in JSON as a non-secret starter template;
-                # all saved credentials/configuration go to the ignored file.
-                template = self.path.with_name("tts_mcp_backend.json")
-                try:
-                    value = json.loads(template.read_text(encoding="utf-8"))
-                except (FileNotFoundError, json.JSONDecodeError):
-                    return {}
+                # Keep saved settings local, but accept the repository-root
+                # starter config used by the launchers and documentation.
+                templates = [
+                    self.path.with_name("tts_mcp_backend.json"),
+                    Path(__file__).resolve().parents[2] / "tts_mcp_backend.json",
+                ]
+                value = {}
+                for template in templates:
+                    try:
+                        value = json.loads(template.read_text(encoding="utf-8"))
+                    except (FileNotFoundError, json.JSONDecodeError):
+                        continue
+                    if isinstance(value, dict):
+                        break
         return value if isinstance(value, dict) else {}
 
     def save(self, value: dict[str, Any]) -> None:
@@ -220,6 +227,25 @@ def _response_was_truncated(payload: Any) -> bool:
     if isinstance(choices, list) and choices and isinstance(choices[0], dict):
         reasons.append(choices[0].get("finish_reason"))
     return any(str(reason or "").strip().lower() in {"length", "max_tokens", "max_token", "length_limit"} for reason in reasons)
+
+
+def _is_killteam_autorun_setup_message(message: Any) -> bool:
+    return bool(re.fullmatch(r"KILLTEAM_AUTORUN_SETUP", str(message or "").strip(), re.I))
+
+
+def _setup_command_summary(text: str) -> tuple[list[Any], list[Any], bool]:
+    commands = parse_ai_commands(text or "")
+    move_commands = [command for command in commands if command.action == "move_object"]
+    has_autorun = any(command.action == "killteam_autorun_setup" for command in commands)
+    return commands, move_commands, has_autorun
+
+
+def _setup_repair_prompt() -> str:
+    return (
+        "Previous response did not call a tool. For this setup turn, call exactly one tool now: "
+        "tts_killteam_setup_ping. Do not write prose, JSON, or any command text. After the tool result, "
+        "continue with tts_killteam_setup_list_objects and then exactly one MOVE[guid,x,y,z] command if the evidence is sufficient."
+    )
 
 
 def _public_ai_text(text: str) -> str:
@@ -903,17 +929,41 @@ class ChatBackend:
         if str(controller.get("active_game", "")).strip().casefold() != "killteam":
             return None
         text = str(message or "").strip()
+        def trace_processed(action: str, args: dict[str, Any], execution: dict[str, Any]) -> None:
+            _record_trace(
+                "ai_commands_processed",
+                commands=[{"action": action, "args": args, "destructive": False}],
+                execution=execution,
+            )
+        if re.fullmatch(r"KILLTEAM_AUTORUN_SETUP", text, re.I):
+            # This is an AI-owned setup request, not a runtime macro. Let the
+            # model inspect the live placement bridge, choose one model and
+            # one position, then emit KILLTEAM_SETUP_PLACE for that decision.
+            # The runtime macro remains available to lower-level callers, but
+            # must not silently replace the AI's tactical reasoning in chat.
+            return None
         match = re.fullmatch(r"KILLTEAM_SETUP_PLACE\[([^,\]]+),\s*(-?[0-9]+(?:\.[0-9]+)?),\s*(-?[0-9]+(?:\.[0-9]+)?),\s*(-?[0-9]+(?:\.[0-9]+)?)\]", text, re.I)
         if match:
             if self.command_execution is None:
                 raise RuntimeError("Kill Team gameplay execution is not configured")
+            args = {
+                "guid": match.group(1).strip(),
+                "x": float(match.group(2)),
+                "y": float(match.group(3)),
+                "z": float(match.group(4)),
+            }
             result = self.command_execution.request(
                 "killteam_setup_place_model",
+                args,
+            )
+            trace_processed(
+                "killteam_setup_place_model",
+                args,
                 {
-                    "guid": match.group(1).strip(),
-                    "x": float(match.group(2)),
-                    "y": float(match.group(3)),
-                    "z": float(match.group(4)),
+                    "executed": [{"action": "killteam_setup_place_model", "status": "executed", "result": result}],
+                    "approval_required": [],
+                    "blocked": [],
+                    "stopped": False,
                 },
             )
             position = result.get("position", {}) if isinstance(result, dict) else {}
@@ -934,6 +984,16 @@ class ChatBackend:
             if self.command_execution is None:
                 raise RuntimeError("Kill Team gameplay execution is not configured")
             result = self.command_execution.request("killteam_deploy_test_model", {})
+            trace_processed(
+                "killteam_deploy_test_model",
+                {},
+                {
+                    "executed": [{"action": "killteam_deploy_test_model", "status": "executed", "result": result}],
+                    "approval_required": [],
+                    "blocked": [],
+                    "stopped": False,
+                },
+            )
             if str(result.get("status", "")).strip().lower() == "verified":
                 text_result = (
                     f"Placement test complete: {result.get('model_name')} moved to "
@@ -953,9 +1013,17 @@ class ChatBackend:
                 raise RuntimeError("Kill Team gameplay execution is not configured")
             match = re.fullmatch(r"KILLTEAM_PLAN_SETUP(?:\s+([0-9]+(?:\.[0-9]+)?))?", text, re.I)
             clearance = float(match.group(1)) if match and match.group(1) else 0.25
-            result = self.command_execution.request(
+            args = {"clearance": clearance}
+            result = self.command_execution.request("killteam_plan_setup_board", args)
+            trace_processed(
                 "killteam_plan_setup_board",
-                {"clearance": clearance},
+                args,
+                {
+                    "executed": [{"action": "killteam_plan_setup_board", "status": "executed", "result": result}],
+                    "approval_required": [],
+                    "blocked": [],
+                    "stopped": False,
+                },
             )
             return {
                 "text": (
@@ -976,9 +1044,17 @@ class ChatBackend:
             }
         if self.command_execution is None:
             raise RuntimeError("Kill Team gameplay execution is not configured")
-        result = self.command_execution.request(
+        args = {"plan_id": match.group(1)}
+        result = self.command_execution.request("killteam_execute_setup_board", args)
+        trace_processed(
             "killteam_execute_setup_board",
-            {"plan_id": match.group(1)},
+            args,
+            {
+                "executed": [{"action": "killteam_execute_setup_board", "status": "executed", "result": result}],
+                "approval_required": [],
+                "blocked": [],
+                "stopped": False,
+            },
         )
         status = str(result.get("status", "unknown"))
         if status == "executed":
@@ -1023,25 +1099,25 @@ class ChatBackend:
             "visual review. Never guess a GUID, coordinate, or visual fact. Screenshots do not prove exact "
             "transforms. If any action or verification fails, stop issuing actions and wait for player "
             "instructions. "
-            "For Kill Team, do not use tts_list_objects. Call tts_killteam_setup once at the start of the loaded "
-            "game. In the normal model-deployment mode, use setup.next_action and setup.ai_plan to take the first "
-            "AI model and its recommended position, then call tts_killteam_start_setup_deployment followed by "
-            "tts_killteam_deploy_setup_operative for one model at a time. Honor setup.current_batch_target, then "
-            "stop while the human places the active batch. If setup.mode is roster_cards, select the outstanding "
-            "AI roster cards and call tts_killteam_lock_rosters before deployment. After locking, follow "
-            "setup.ai_plan.deployment_order, taking the first undeployed entry for the active stage. Use "
-            "tts_killteam_observe only when you need fresh live state outside that scripted flow. The observation returns exact operative IDs and live GUIDs; use the "
-            "GUID from that observation directly in "
+            "For Kill Team, do not use tts_list_objects. For AI-owned setup placement, use the dedicated "
+            "placement bridge: call tts_killteam_setup_ping, then tts_killteam_setup_list_objects. The AI owns "
+            "every AI-side model selection and placement. Ignore bags, decks, cards, and other containers; use "
+            "only live figurines with the Operative tag. Use the live returned model GUIDs, deployment-zone "
+            "bounds, terrain, objectives, and role priority to choose exactly one AI model and one legal tactical "
+            "position for this setup turn. Emit exactly one standalone line in this form: "
+            "MOVE[guid,x,y,z]. Never select or place a human model. Stop after that verified "
+            "placement; if more AI models remain, wait for a new KILLTEAM_AUTORUN_SETUP request. "
+            "KILLTEAM_AUTORUN_SETUP is only an incoming setup request and must not be emitted as the response to "
+            "that request. Use tts_killteam_observe only for the larger runtime after setup. The observation returns "
+            "exact operative IDs and live GUIDs; use the GUID from that observation directly in "
             "MOVE[guid,x,y,z] when repositioning an AI operative. Do not use KILLTEAM_PLACE for ordinary movement. "
-            "If you are only performing setup placement through the dedicated placement-only bridge, use "
-            "tts_killteam_setup_ping, tts_killteam_setup_list_objects, and tts_killteam_setup_place_model; "
-            "this bridge is separate from the larger Kill Team runtime. "
             "For setup deployment, use the live figurine GUID rather than an operative_id when calling "
             "tts_killteam_deploy_setup_operative or the semantic KILLTEAM_DEPLOY_SETUP command. "
             "When objective control is the goal, call tts_killteam_plan_objective_move with the operative_id "
             "before emitting MOVE and use the returned target position instead of inventing coordinates. "
-            "After the AI completes current_batch_target deployments, stop and wait for the human side to place "
-            "its current batch. Never issue another AI deployment after current_side changes to the opponent. "
+            "Continue the placement-only loop one model at a time until all AI models are placed. Do not issue an "
+            "AI placement for a human model, and do not use the larger runtime's batch or reconciliation commands "
+            "for this placement-only setup flow. "
             "If a model profile or roster identity is missing, call tts_killteam_get_roster; it reads only the "
             "dedicated AI roster container. Do not inspect arbitrary containers. "
             "For Kill Team, use tts_killteam_probe_line_of_sight on a visible target before entering an exposed "
@@ -1644,7 +1720,48 @@ class ChatBackend:
         # the same board between observation and post-action verification.
         with self._turn_lock:
             text = str(result.get("text", ""))
-            commands = parse_ai_commands(text)
+            raw_commands = parse_ai_commands(text)
+            setup_turn = _is_killteam_autorun_setup_message(payload.get("message"))
+            # The chat-level setup request is a prompt for AI reasoning, not
+            # an executable runtime macro. Only the AI's resulting placement
+            # commands may mutate the board.
+            setup_move_commands = [command for command in raw_commands if command.action == "move_object"]
+            has_autorun = any(command.action == "killteam_autorun_setup" for command in raw_commands)
+            if setup_turn and (has_autorun or len(setup_move_commands) != 1 or len(raw_commands) != 1):
+                result["parsed_commands"] = [
+                    {"action": item.action, "args": item.args, "destructive": item.destructive}
+                    for item in raw_commands
+                ]
+                result["execution"] = {
+                    "executed": [],
+                    "approval_required": [],
+                    "blocked": [{
+                        "action": "move_object",
+                        "status": "blocked",
+                        "reason": "setup responses must contain exactly one MOVE command and no KILLTEAM_AUTORUN_SETUP echo",
+                        "args": setup_move_commands[0].args if setup_move_commands else {},
+                    }],
+                    "stopped": True,
+                    "stop_reason": "setup response was rejected; waiting for player instructions",
+                }
+                result["text"] = "I rejected that Kill Team setup response because it was not a single MOVE command."
+                _record_trace(
+                    "ai_setup_response_rejected",
+                    reason="setup response contained multiple commands, a non-MOVE command, or echoed KILLTEAM_AUTORUN_SETUP",
+                    commands=result["parsed_commands"],
+                )
+                return result
+            commands = [
+                ParsedCommand(
+                    "killteam_setup_place_model",
+                    dict(command.args),
+                    command.destructive,
+                )
+                if setup_turn and command.action == "move_object"
+                else command
+                for command in raw_commands
+                if command.action != "killteam_autorun_setup"
+            ]
             controller = self.controller_provider() if self.controller_provider else {}
             active_checkers = str(controller.get("active_game", "")).strip().lower() == "checkers"
             corrections: list[dict[str, Any]] = []
@@ -1690,7 +1807,7 @@ class ChatBackend:
                         blocked.append({"action": command.action, "status": "blocked", "reason": "required catalog container is not present in the live TTS scene", "args": command.args})
                         continue
                 dispatchable.append(command)
-            result["parsed_commands"] = [{"action": item.action, "args": item.args, "destructive": item.destructive} for item in commands]
+            result["parsed_commands"] = [{"action": item.action, "args": item.args, "destructive": item.destructive} for item in raw_commands]
             if self.command_execution is not None and blocked:
                 # A rejected action is itself a failure. Do not allow another
                 # parsed action from the same model response to continue.
@@ -2077,12 +2194,28 @@ class ChatBackend:
         checkers_legal_moves: list[dict[str, Any]] = []
         checkers_mandatory_capture = False
         current = list(messages)
+        setup_turn = _is_killteam_autorun_setup_message(payload.get("message"))
+        setup_retry_applied = False
         response: Any = None
         while True:
             response = self._http_request(payload, current, include_tools=tool_count < self.observation_max_calls)
             calls = self._extract_tool_calls(response)
             if not calls:
                 text = _extract_text(response)
+                commands, placement_commands, has_autorun = _setup_command_summary(text)
+                if setup_turn and not setup_retry_applied and not commands:
+                    _record_trace(
+                        "ai_setup_retry_requested",
+                        reason="backend returned prose without tool calls",
+                        response=response,
+                    )
+                    current.append(self._assistant_tool_message(response))
+                    current.append({
+                        "role": "system",
+                        "content": _setup_repair_prompt(),
+                    })
+                    setup_retry_applied = True
+                    continue
                 if observation_failures and not observation_successes:
                     text = self._observation_failure_report(observation_failures)
                 elif not text.strip() and _response_was_truncated(response):
@@ -2090,6 +2223,22 @@ class ChatBackend:
                         "I reached my response limit before I could finish analyzing the board, so I stopped. "
                         "Please provide further instructions."
                     )
+                if setup_turn and setup_retry_applied and not commands:
+                    _record_trace(
+                        "ai_setup_retry_failed",
+                        reason="backend still did not emit a placement command",
+                        response=response,
+                    )
+                    return {
+                        "text": (
+                            "I could not get a valid setup placement command from the AI. "
+                            "Please retry the setup request."
+                        ),
+                        "commands": [],
+                        "backend_response": response,
+                        "observation_failures": observation_failures,
+                        "observation_successes": observation_successes,
+                    }
                 return {
                     "text": text,
                     "commands": [],
@@ -2150,7 +2299,11 @@ class ChatBackend:
         payload.setdefault("message", message)
         controller = self.controller_provider() if self.controller_provider else {}
         direct_commands = parse_ai_commands(message)
-        if direct_commands and not _public_ai_text(message).strip():
+        direct_runtime_commands = [
+            command for command in direct_commands
+            if command.action != "killteam_autorun_setup"
+        ]
+        if direct_runtime_commands and not _public_ai_text(message).strip():
             if self.command_execution is None:
                 raise RuntimeError("AI command execution is not configured")
             result = self._finalize_result({"text": f"Executing command.\n{message}", "commands": []}, payload)

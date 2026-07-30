@@ -1,10 +1,19 @@
 from __future__ import annotations
 
+import asyncio
 import unittest
 from unittest.mock import patch
 import json
 
 from tts_mcp.app.http_gateway import ChatBackend, _public_ai_text
+
+
+def _load_tts_server():
+    try:
+        from tts_mcp.app import server as tts_server
+    except ModuleNotFoundError as exc:
+        raise unittest.SkipTest("mcp dependency unavailable in this test environment") from exc
+    return tts_server
 
 
 class PublicAITextTests(unittest.TestCase):
@@ -1228,6 +1237,214 @@ class KillTeamDefenseAcknowledgmentTests(unittest.TestCase):
 
 
 class KillTeamSetupBoardCommandTests(unittest.TestCase):
+    def test_autorun_setup_is_forwarded_for_ai_reasoning(self) -> None:
+        backend = ChatBackend()
+        backend.controller_provider = lambda: {"active_game": "killteam", "state": "running"}
+
+        result = backend.handle_killteam_setup_board_command(
+            "KILLTEAM_AUTORUN_SETUP",
+            is_host=False,
+        )
+
+        self.assertIsNone(result)
+
+    def test_backend_autorun_macro_is_not_executed(self) -> None:
+        backend = ChatBackend()
+        backend.controller_provider = lambda: {"active_game": "killteam", "state": "running"}
+        calls: list[tuple[str, dict]] = []
+        backend.command_execution = type(
+            "Executor",
+            (),
+            {"execute": lambda _self, commands, **_kwargs: calls.append(("execute", {}))},
+        )()
+
+        result = backend._finalize_result(
+            {"text": "KILLTEAM_AUTORUN_SETUP"},
+            {"message": "KILLTEAM_AUTORUN_SETUP"},
+        )
+
+        self.assertEqual(calls, [])
+        self.assertEqual(result["parsed_commands"], [
+            {"action": "killteam_autorun_setup", "args": {}, "destructive": False},
+        ])
+        self.assertIn("blocked", result["execution"])
+        self.assertIn("rejected", result["text"].lower())
+
+    def test_backend_rejects_multiple_setup_placements(self) -> None:
+        backend = ChatBackend()
+        backend.controller_provider = lambda: {"active_game": "killteam", "state": "running"}
+        calls: list[tuple[str, dict]] = []
+        backend.command_execution = type(
+            "Executor",
+            (),
+            {"execute": lambda _self, commands, **_kwargs: calls.append(("execute", {}))},
+        )()
+
+        result = backend._finalize_result(
+            {
+                "text": (
+                    "MOVE[362d46, 1, 2, 3]\n"
+                    "MOVE[a1b2c3, 4, 5, 6]"
+                )
+            },
+            {"message": "KILLTEAM_AUTORUN_SETUP"},
+        )
+
+        self.assertEqual(calls, [])
+        self.assertIn("blocked", result["execution"])
+        self.assertEqual(len(result["parsed_commands"]), 2)
+        self.assertIn("rejected", result["text"].lower())
+
+    def test_setup_ping_returns_reload_verification_payload(self) -> None:
+        tts_server = _load_tts_server()
+        traces: list[tuple[str, dict]] = []
+        with (
+            patch.object(tts_server, "_killteam_setup_call", return_value={
+                "bridge_version": "2026-07-29-setup-placement-v1",
+                "object_count": 226,
+            }),
+            patch.object(tts_server, "verify_killteam_setup_bridge_source", return_value={
+                "bridge_version": "2026-07-29-setup-placement-v1",
+                "disk_hash": "disk-hash",
+                "loaded_hash": "disk-hash",
+                "loaded_script_identity": "Global",
+                "reload_verified": True,
+                "script_state_count": 1,
+                "verification_error": "",
+                "verification_source": "fresh",
+            }),
+            patch.object(tts_server, "_record_trace", side_effect=lambda kind, **payload: traces.append((kind, payload))),
+        ):
+            result = asyncio.run(tts_server.tts_killteam_setup_ping())
+
+        self.assertTrue(result["reload_verified"])
+        self.assertEqual(result["loaded_hash"], "disk-hash")
+        self.assertEqual(result["disk_hash"], "disk-hash")
+        self.assertEqual(result["verification_source"], "fresh")
+        self.assertEqual(result["loaded_script_identity"], "Global")
+        self.assertEqual(result["bridge_version"], "2026-07-29-setup-placement-v1")
+        self.assertEqual(traces[0][0], "killteam_setup_reload_check")
+        self.assertTrue(traces[0][1]["reload_verified"])
+
+    def test_setup_ping_fails_closed_on_reload_mismatch_and_traces_reason(self) -> None:
+        tts_server = _load_tts_server()
+        traces: list[tuple[str, dict]] = []
+        with (
+            patch.object(tts_server, "_killteam_setup_call", return_value={
+                "bridge_version": "2026-07-29-setup-placement-v1",
+                "object_count": 226,
+            }),
+            patch.object(tts_server, "verify_killteam_setup_bridge_source", return_value={
+                "bridge_version": "2026-07-29-setup-placement-v1",
+                "disk_hash": "disk-hash",
+                "loaded_hash": "loaded-hash",
+                "loaded_script_identity": "Global",
+                "reload_verified": False,
+                "script_state_count": 1,
+                "verification_error": "Global script body does not match the on-disk setup bridge",
+                "verification_source": "fresh",
+            }),
+            patch.object(tts_server, "_record_trace", side_effect=lambda kind, **payload: traces.append((kind, payload))),
+        ):
+            with self.assertRaises(RuntimeError):
+                asyncio.run(tts_server.tts_killteam_setup_ping())
+
+        self.assertEqual(traces[0][0], "killteam_setup_reload_check")
+        self.assertFalse(traces[0][1]["reload_verified"])
+        self.assertIn("does not match", traces[0][1]["verification_error"])
+
+    def test_setup_prose_reply_is_retried_before_placement(self) -> None:
+        backend = ChatBackend()
+        backend.enabled = True
+        backend.kind = "http"
+        backend.format = "ollama"
+        backend.url = "http://127.0.0.1:11434/api/chat"
+        backend.model = "gemma4:12b"
+        backend.observation_max_calls = 4
+        backend.observation_timeout = 30.0
+        backend.controller_provider = lambda: {"active_game": "killteam", "state": "running"}
+
+        observation_calls: list[tuple[str, dict]] = []
+
+        backend.configure_observation_tools({
+            "tts_killteam_setup_ping": lambda args: observation_calls.append(("ping", dict(args))) or {
+                "bridge_version": "2026-07-29-setup-placement-v1",
+            },
+            "tts_killteam_setup_list_objects": lambda args: observation_calls.append(("list", dict(args))) or {
+                "objects": [{
+                    "guid": "model-1",
+                    "name": "Plague Marine Warrior",
+                    "tags": ["Operative"],
+                    "position": {"x": -1.0, "y": 1.0, "z": 3.0},
+                }],
+            },
+        })
+
+        class Executor:
+            def __init__(self) -> None:
+                self.calls: list[tuple[list, dict]] = []
+
+            def execute(self, commands, **kwargs):
+                self.calls.append((list(commands), dict(kwargs)))
+                command = commands[0]
+                return {
+                    "executed": [{
+                        "action": command.action,
+                        "status": "executed",
+                        "result": {
+                            "status": "verified",
+                            "guid": command.args["guid"],
+                            "position": {
+                                "x": float(command.args["x"]),
+                                "y": float(command.args["y"]),
+                                "z": float(command.args["z"]),
+                            },
+                        },
+                    }],
+                    "approval_required": [],
+                    "blocked": [],
+                    "stopped": False,
+                }
+
+        backend.command_execution = Executor()
+        traces: list[str] = []
+        responses = [
+            {"message": {"role": "assistant", "content": "I will check the bridge first."}},
+            {"message": {"role": "assistant", "tool_calls": [
+                {
+                    "id": "ping-1",
+                    "function": {
+                        "name": "tts_killteam_setup_ping",
+                        "arguments": "{}",
+                    },
+                },
+                {
+                    "id": "list-1",
+                    "function": {
+                        "name": "tts_killteam_setup_list_objects",
+                        "arguments": "{\"max_results\":5,\"compact\":true}",
+                    },
+                },
+            ]}},
+            {"message": {"role": "assistant", "content": "MOVE[362d46, 1, 1, 3]"}},
+        ]
+
+        with (
+            patch("tts_mcp.app.http_gateway._record_trace", side_effect=lambda kind, **payload: traces.append(kind)),
+            patch.object(backend, "_http_request", side_effect=responses),
+        ):
+            result = backend.complete({"message": "KILLTEAM_AUTORUN_SETUP"})
+
+        self.assertEqual([name for name, _args in observation_calls], ["ping", "list"])
+        self.assertIn("ai_setup_retry_requested", traces)
+        self.assertIn("ai_commands_processed", traces)
+        self.assertEqual(result["parsed_commands"], [
+            {"action": "move_object", "args": {"guid": "362d46", "x": 1.0, "y": 1.0, "z": 3.0}, "destructive": False},
+        ])
+        self.assertEqual(result["execution"]["executed"][0]["status"], "executed")
+        self.assertEqual(result["execution"]["executed"][0]["action"], "killteam_setup_place_model")
+        self.assertEqual(backend.command_execution.calls[0][0][0].action, "killteam_setup_place_model")
+
     def test_plan_command_requests_runtime_plan(self) -> None:
         calls = []
         backend = ChatBackend()

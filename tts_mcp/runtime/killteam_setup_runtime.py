@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 from dataclasses import dataclass
+from pathlib import Path
+from threading import Lock
 from typing import Any, Protocol
 
 
@@ -21,6 +24,8 @@ class KillTeamSetupBridge(Protocol):
     def ping(self) -> dict[str, Any]: ...
 
     def list_objects(self, **kwargs: Any) -> dict[str, Any]: ...
+
+    def move_object(self, guid: str, position: dict[str, float]) -> dict[str, Any]: ...
 
     def place_model(self, guid: str, position: dict[str, float]) -> dict[str, Any]: ...
 
@@ -45,18 +50,148 @@ class TTSKillTeamSetupBridge:
             payload["tag"] = str(kwargs.get("tag", ""))
         return self._request("setup_list_objects", payload)
 
-    def place_model(self, guid: str, position: dict[str, float]) -> dict[str, Any]:
-        return self._request(
-            "setup_place_model",
-            {
-                "guid": str(guid),
-                "position": {
-                    "x": float(position["x"]),
-                    "y": float(position["y"]),
-                    "z": float(position["z"]),
-                },
+    @staticmethod
+    def _placement_payload(guid: str, position: dict[str, float]) -> dict[str, Any]:
+        x = float(position["x"])
+        y = float(position["y"])
+        z = float(position["z"])
+        return {
+            "guid": str(guid),
+            "x": x,
+            "y": y,
+            "z": z,
+            "position": {
+                "x": x,
+                "y": y,
+                "z": z,
             },
+        }
+
+    def move_object(self, guid: str, position: dict[str, float]) -> dict[str, Any]:
+        return self._request("move_object", self._placement_payload(guid, position))
+
+    def place_model(self, guid: str, position: dict[str, float]) -> dict[str, Any]:
+        return self._request("setup_place_model", self._placement_payload(guid, position))
+
+
+_SCRIPT_BODY_KEYS = ("script", "LuaScript", "luaScript", "source", "text", "content")
+_SETUP_BRIDGE_VERIFICATION_CACHE: dict[tuple[str, str], dict[str, Any]] = {}
+_SETUP_BRIDGE_VERIFICATION_CACHE_LOCK = Lock()
+
+
+def _normalize_lua_source(source: str) -> str:
+    return source.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _hash_lua_source(source: str) -> str:
+    normalized = _normalize_lua_source(source)
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def _script_state_list(raw: Any) -> list[dict[str, Any]]:
+    if isinstance(raw, dict):
+        states = raw.get("script_states")
+        if not isinstance(states, list):
+            states = raw.get("scriptStates")
+    elif isinstance(raw, list):
+        states = raw
+    else:
+        states = []
+    return [state for state in states if isinstance(state, dict)]
+
+
+def _script_identity(state: dict[str, Any]) -> str:
+    for key in ("name", "scriptName", "label", "type"):
+        value = state.get(key)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return "Global"
+
+
+def _script_body(state: dict[str, Any]) -> str | None:
+    for key in _SCRIPT_BODY_KEYS:
+        value = state.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    return None
+
+
+def verify_killteam_setup_bridge_source(
+    *,
+    bridge_get_scripts: Any,
+    bridge_version: str,
+    disk_path: Path,
+) -> dict[str, Any]:
+    bridge_version_text = str(bridge_version or "").strip() or "unknown"
+    disk_source = disk_path.read_text(encoding="utf-8")
+    disk_hash = _hash_lua_source(disk_source)
+    cache_key = (bridge_version_text, disk_hash)
+
+    with _SETUP_BRIDGE_VERIFICATION_CACHE_LOCK:
+        cached = _SETUP_BRIDGE_VERIFICATION_CACHE.get(cache_key)
+    if cached is not None:
+        result = copy.deepcopy(cached)
+        result["verification_source"] = "cache"
+        return result
+
+    try:
+        raw_states = bridge_get_scripts()
+    except Exception as exc:
+        return {
+            "bridge_version": bridge_version_text,
+            "disk_hash": disk_hash,
+            "loaded_hash": "",
+            "loaded_script_identity": "Global",
+            "reload_verified": False,
+            "script_state_count": 0,
+            "verification_error": f"Could not read the live Global script state: {exc}",
+            "verification_source": "fresh",
+        }
+
+    script_states = _script_state_list(raw_states)
+    result: dict[str, Any] = {
+        "bridge_version": bridge_version_text,
+        "disk_hash": disk_hash,
+        "loaded_hash": "",
+        "loaded_script_identity": "Global",
+        "reload_verified": False,
+        "script_state_count": len(script_states),
+        "verification_error": "",
+        "verification_source": "fresh",
+    }
+
+    if not script_states:
+        result["verification_error"] = "TTS returned no script states"
+        return result
+
+    global_state = next(
+        (state for state in script_states if str(state.get("name") or "").strip().lower() == "global"),
+        None,
+    )
+    if global_state is None:
+        result["verification_error"] = "Global script state was not found in TTS scriptStates"
+        return result
+
+    result["loaded_script_identity"] = _script_identity(global_state)
+    loaded_source = _script_body(global_state)
+    if loaded_source is None:
+        result["verification_error"] = (
+            f"{result['loaded_script_identity']} script state does not expose a readable script body"
         )
+        return result
+
+    loaded_hash = _hash_lua_source(loaded_source)
+    result["loaded_hash"] = loaded_hash
+    if loaded_hash != disk_hash:
+        result["verification_error"] = (
+            f"{result['loaded_script_identity']} script body does not match the on-disk setup bridge"
+        )
+        return result
+
+    result["reload_verified"] = True
+    with _SETUP_BRIDGE_VERIFICATION_CACHE_LOCK:
+        _SETUP_BRIDGE_VERIFICATION_CACHE[cache_key] = copy.deepcopy(result)
+    return result
 
 
 @dataclass(frozen=True)
@@ -213,7 +348,7 @@ class KillTeamSetupRuntime:
             for axis in ("x", "y", "z")
         }
         try:
-            raw = self.bridge.place_model(live_guid, target)
+            raw = self.bridge.move_object(live_guid, target)
         except Exception as exc:
             self._mark_uncertain(action_id)
             raise KillTeamSetupUncertainCommit("setup placement commit is uncertain") from exc

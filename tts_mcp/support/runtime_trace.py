@@ -102,8 +102,14 @@ def console_event(event: dict[str, Any]) -> str:
         "%Y-%m-%d %H:%M:%S.%f"
     )[:-3]
 
-    if kind == "ai_message_received":
-        detail = f'RECEIVED "{_clip_console(event.get("message", ""))}" from {_console_player(event.get("player", {}))}'
+    if kind in {"ai_message_received", "tts_chat_event"}:
+        player = event.get("player", {})
+        if kind == "tts_chat_event" and not player:
+            player = {
+                "color": event.get("player_color", ""),
+                "name": event.get("player_name", ""),
+            }
+        detail = f'RECEIVED "{_clip_console(event.get("message", ""))}" from {_console_player(player)}'
     elif kind == "ai_message_response":
         commands = event.get("commands", [])
         command_count = len(commands) if isinstance(commands, list) else 0
@@ -228,11 +234,40 @@ def console_event(event: dict[str, Any]) -> str:
         commands = event.get("commands", [])
         execution = event.get("execution", {})
         detail = f"AI commands processed count={len(commands) if isinstance(commands, list) else 0}"
+        if isinstance(commands, list) and commands and isinstance(commands[0], dict):
+            first = commands[0]
+            detail += f' first={_clip_console(first.get("action", ""), 60)}'
+            args = first.get("args")
+            if isinstance(args, dict):
+                if args.get("guid"):
+                    detail += f' guid={_clip_console(args["guid"], 80)}'
+                if all(axis in args for axis in ("x", "y", "z")):
+                    detail += (
+                        f' position=({_console_detail(args["x"], 24)},'
+                        f'{_console_detail(args["y"], 24)},{_console_detail(args["z"], 24)})'
+                    )
         if isinstance(execution, dict):
+            executed = execution.get("executed")
+            if isinstance(executed, list) and executed and isinstance(executed[0], dict):
+                dispatched = executed[0].get("action")
+                if dispatched and (not isinstance(commands, list) or not commands or dispatched != commands[0].get("action")):
+                    detail += f' dispatched={_clip_console(dispatched, 60)}'
             for key in ("executed", "blocked", "approval_required"):
                 value = execution.get(key)
                 if isinstance(value, list):
                     detail += f" {key}={len(value)}"
+    elif kind == "ai_setup_retry_requested":
+        detail = "Kill Team setup retry requested"
+        if event.get("reason"):
+            detail += f': {_clip_console(event["reason"], 160)}'
+    elif kind == "ai_setup_retry_failed":
+        detail = "Kill Team setup retry failed"
+        if event.get("reason"):
+            detail += f': {_clip_console(event["reason"], 160)}'
+    elif kind == "ai_setup_response_rejected":
+        detail = "Kill Team setup response rejected"
+        if event.get("reason"):
+            detail += f': {_clip_console(event["reason"], 160)}'
     elif kind == "ai_scene_objects":
         detail = f"AI scene context objects={_console_detail(event.get('count', 0), 40)}"
         if event.get("game"):

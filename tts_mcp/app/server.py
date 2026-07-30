@@ -54,6 +54,7 @@ from ..runtime.killteam_setup_runtime import (
     KillTeamSetupError,
     KillTeamSetupRuntime,
     TTSKillTeamSetupBridge,
+    verify_killteam_setup_bridge_source,
 )
 
 
@@ -71,6 +72,7 @@ class TTSCommandError(TTSBridgeError):
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 GAME_RULES_ROOT = PROJECT_ROOT / "game_rules"
+KILLTEAM_SETUP_GLOBAL_LUA = PROJECT_ROOT / "tts_killteam_setup_global.lua"
 session_store = SessionStore()
 backend_config_store = BackendConfigStore()
 
@@ -296,6 +298,9 @@ class TTSBridge:
                         direction="tts_to_python",
                         message_id=message_id,
                         message=str(custom.get("message") or "")[:12000],
+                        player_color=str(custom.get("player_color") or ""),
+                        player_name=str(custom.get("player_name") or ""),
+                        source="external_editor_chat_event",
                     )
                     with self._events_guard:
                         self._chat_events.append(custom)
@@ -348,6 +353,16 @@ class TTSBridge:
                 except json.JSONDecodeError:
                     chat = None
                 if isinstance(chat, dict):
+                    _record_trace(
+                        "tts_chat_event",
+                        direction="tts_to_python",
+                        message_id=message_id,
+                        message=str(chat.get("message") or "")[:12000],
+                        player=chat.get("player", {}),
+                        player_color=str(chat.get("player_color") or ""),
+                        player_name=str(chat.get("player_name") or ""),
+                        source="legacy_print_chat_event",
+                    )
                     with self._events_guard:
                         self._chat_events.append(chat)
                     try:
@@ -1438,7 +1453,31 @@ async def tts_killteam_setup(
 @mcp.tool()
 async def tts_killteam_setup_ping() -> dict[str, Any]:
     """Check that the dedicated placement-only Kill Team setup bridge responds."""
-    return await asyncio.to_thread(_killteam_setup_call, "ping")
+    ping_result = await asyncio.to_thread(_killteam_setup_call, "ping")
+    verification = await asyncio.to_thread(
+        verify_killteam_setup_bridge_source,
+        bridge_get_scripts=bridge.get_scripts,
+        bridge_version=str(ping_result.get("bridge_version", "")),
+        disk_path=KILLTEAM_SETUP_GLOBAL_LUA,
+    )
+    result = {**ping_result, **verification}
+    _record_trace(
+        "killteam_setup_reload_check",
+        bridge_version=result.get("bridge_version", ""),
+        disk_hash=result.get("disk_hash", ""),
+        loaded_hash=result.get("loaded_hash", ""),
+        loaded_script_identity=result.get("loaded_script_identity", ""),
+        reload_verified=bool(result.get("reload_verified")),
+        script_state_count=result.get("script_state_count", 0),
+        verification_source=result.get("verification_source", ""),
+        verification_error=result.get("verification_error", ""),
+    )
+    if not result.get("reload_verified"):
+        raise RuntimeError(
+            "Kill Team setup bridge reload verification failed: "
+            f"{result.get('verification_error', 'unknown error')}"
+        )
+    return result
 
 
 @mcp.tool()
@@ -3816,6 +3855,17 @@ if __name__ == "__main__":
             lambda response: bridge.deliver_response(response, transport="http")
         )
         http_gateway.start()
+        # Player chat is unsolicited External Editor traffic. Start the
+        # callback listener before MCP waits for its first tool call so chat
+        # from the placement-only bridge cannot be missed.
+        try:
+            bridge.ensure_listener()
+        except TTSConnectionError as exc:
+            _record_trace(
+                "tts_listener_error",
+                component="tts_callback_listener",
+                error=str(exc),
+            )
         if os.getenv("TTS_GATEWAY_ONLY", "").strip().lower() in {"1", "true", "yes", "on"}:
             # Useful for checking TTS -> backend connectivity without feeding
             # interactive terminal input into the MCP stdio JSON-RPC stream.

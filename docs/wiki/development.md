@@ -30,12 +30,13 @@ When TTS is available:
 
 1. Install `tts_mcp_global.lua` in the Global script for the full runtime.
 2. Install `tts_killteam_setup_global.lua` in the Global script when you want the placement-only setup bridge.
-2. Call `tts_ping`.
-3. Call `tts_get_scene_summary` and `tts_get_object` for a known GUID.
-4. Move or rotate a disposable object and verify returned post-state.
-5. Test a screenshot with the intended monitor rectangle.
-6. Confirm a rejected destructive action and an explicitly approved one.
-7. Inspect `tts_recent_events` for errors and callback timing.
+3. After the server starts, type a non-empty player chat message and confirm a `tts_chat_event` appears in `.tmp/tts_mcp_trace.log`.
+4. Call `tts_ping`.
+5. Call `tts_get_scene_summary` and `tts_get_object` for a known GUID.
+6. Move or rotate a disposable object and verify returned post-state.
+7. Test a screenshot with the intended monitor rectangle.
+8. Confirm a rejected destructive action and an explicitly approved one.
+9. Inspect `tts_recent_events` for errors and callback timing.
 
 ## Updating the roadmap
 
