@@ -7,6 +7,26 @@ from tts_mcp.support.session_store import SessionStore
 
 
 class AIControllerTests(unittest.TestCase):
+    def test_setup_history_deduplicates_legacy_records_by_guid(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SessionStore(Path(directory) / "state.sqlite3")
+            controller = AIController(Path(directory) / "rules", store)
+            controller.state.setup_history = {
+                "placements": [
+                    {"guid": "96fe20", "position": {"x": 1, "y": 1.5, "z": 1}, "batch_size": 2},
+                    {"guid": "96fe20", "position": {"x": 2, "y": 4.25, "z": 2}, "batch_size": 2},
+                    {"model_guid": "0e43c7", "position": {"x": 3, "y": 1.5, "z": 3}, "batch_size": 2},
+                ],
+                "placed_guids": ["96fe20", "96fe20"],
+            }
+
+            history = controller.setup_history()
+
+            self.assertEqual([item["guid"] for item in history["placements"]], ["96fe20", "0e43c7"])
+            self.assertEqual(history["placed_guids"], ["96fe20", "0e43c7"])
+            self.assertEqual(history["placement_count"], 2)
+            self.assertEqual(history["batch_progress"], 0)
+
     def test_explicit_ai_question_is_forwarded_to_backend(self):
         with tempfile.TemporaryDirectory() as directory:
             controller = AIController(
@@ -62,6 +82,25 @@ class AIControllerTests(unittest.TestCase):
             self.assertIn("started fresh", response["text"])
             self.assertEqual(controller.state.state, "running")
             self.assertIsNone(controller.state.game_position)
+            self.assertEqual(controller.setup_history()["placements"], [])
+
+    def test_fresh_start_can_select_killteam_and_request_autorun_setup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            rules_root = Path(directory) / "rules"
+            (rules_root / "killteam").mkdir(parents=True)
+            controller = AIController(
+                rules_root,
+                SessionStore(Path(directory) / "state.sqlite3"),
+            )
+
+            response = controller.handle("!ai start fresh killteam", is_host=True)
+
+            self.assertIsNotNone(response)
+            self.assertIn("started fresh", response["text"])
+            self.assertEqual(response["selected_game"], "killteam")
+            self.assertTrue(response["autostart_setup"])
+            self.assertEqual(controller.state.active_game, "killteam")
+            self.assertEqual(controller.state.state, "running")
             self.assertEqual(controller.setup_history()["placements"], [])
 
 

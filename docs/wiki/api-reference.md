@@ -58,15 +58,81 @@ one AI operative and returns a suggested `MOVE[guid,x,y,z]` target plus the
 candidate ranking evidence. Use it before emitting `MOVE[...]` when the goal
 is to contest or stage around an objective.
 
+During live Kill Team play, the chat gateway also recognizes natural-language
+initiative-pass prompts such as `Your turn` and `pass initiative` while
+`active_game=killteam`. It routes those prompts to the bounded tactical-turn
+request, which claims the initiative token for the AI side, executes one
+legal tactical action, ends activation, and passes initiative onward before
+the next prompt is accepted.
+
 The placement-only setup bridge exposes `tts_killteam_setup_ping`,
-`tts_killteam_setup_list_objects`, and `tts_killteam_setup_place_model` for
-manual/debug compatibility, and the same bridge now accepts the move alias
-used by the AI-owned setup turn. `tts_killteam_setup_ping` also proves the
+`tts_killteam_setup_context`, `tts_killteam_setup_list_objects`, and
+`tts_killteam_setup_place_model` for
+manual/debug compatibility. The AI-owned setup turn uses the dedicated
+placement action; the legacy move alias remains available for compatibility.
+`tts_killteam_setup_ping` also proves the
 loaded Global Lua script matches `tts_killteam_setup_global.lua` on disk by
 returning the bridge version, disk hash, loaded hash, and verification result.
-Each AI setup turn resolves one live model, emits one `MOVE[guid,x,y,z]`, and
-the gateway translates that move into the setup runtime's verified placement
-path before stopping until a new `KILLTEAM_AUTORUN_SETUP` request arrives.
+The setup listing returns bounded live objects for operatives, terrain,
+deployment zones, and objectives so the AI can inspect the footprint before
+choosing a position. The placement bridge recomputes a terrain-adjusted
+placement height instead of trusting the AI's raw `y` value, and returns the
+support height and support GUIDs used for that adjustment. A candidate whose
+footprint intersects an existing operative or objective is rejected before
+mutation.
+The context places the compact `setup_plan` before duplicated inventories and
+assigns each candidate a stable ID, source position, target position, and
+footprint. The gateway requires a setup MOVE's GUID and target to match the
+same candidate from `recommended_batch`, normalizes the candidate's terrain-adjusted `y`, and rejects
+cross-paired or no-op targets before dispatch. Deployment `LayoutZone` and
+`ScriptingTrigger` objects use their scale as horizontal bounds when TTS
+reports zero-size bounds.
+The gateway also recognizes clear natural-language resume requests, such as
+"place your next model", as setup turns. Only standalone `SETUP_MOVE[...]`
+lines count as commands; prose examples do not. If the model emits a raw GUID
+or an invalid token, the gateway may resolve it only to an unused candidate in
+the current recommended batch.
+Each AI setup turn resolves a fixed `ceil(N/3)` batch of live models, emits one
+  `SETUP_MOVE[candidate_id]` per distinct candidate, and the gateway translates those moves
+  sequentially into the setup runtime's verified placement path before stopping
+  until a new `KILLTEAM_AUTORUN_SETUP` request arrives.
+The setup path also supports `KILLTEAM_SELECT_SETUP[card_guid]` for bounded
+non-operative setup-card selection when the AI is choosing equipment, ploys,
+or tactical-op cards before deployment.
+For a brand-new Kill Team game, `!ai start fresh killteam` clears the controller
+state, selects Kill Team if needed, and immediately triggers that autorun
+setup path. If Kill Team is already the active game, `!ai start fresh` performs
+the same fresh-start reset.
+The gateway filters persisted placed GUIDs from each live context and refills
+an undersized `recommended_batch` from the bridge-provided candidate pool,
+preserving distinct models and non-overlapping footprints. The final turn uses
+the remaining-model count when fewer than the fixed batch size remain.
+The gateway also supplies persisted placed GUIDs to the context collector so
+the primary planner excludes those models from its next move batch while
+retaining all live AI and human operatives as placement blockers.
+When a backend response contains fewer commands than `batch_target`, the
+gateway supplies the missing commands from the fresh ordered
+`recommended_batch`. It records `ai_setup_batch_completed` with the model and
+gateway-supplied candidate IDs, then validates and dispatches the complete
+batch normally. This fallback is unavailable without an exact fresh batch.
+If the observation budget is exhausted before the model answers with a
+placement, the gateway follows up with a setup-command-only completion prompt instead
+of asking for more tools.
+If the model does not emit the required number of distinct setup commands
+  commands, the gateway rejects the turn and does not invoke the full setup
+  planner as a fallback. A failure in a later command preserves earlier
+  successful placements and resumes from persisted batch progress.
+The runtime projects the placement `y` onto terrain support so elevated
+deployment pieces are landed on rather than clipped into. It reconciles the
+bridge's final support height before verification. If another model or
+objective already occupies the footprint, the slot is rejected instead of
+forcing the model through it.
+
+The setup slice is implemented, but the contract is still staged. KT-016
+through KT-020 finish the remaining decisions around board-context geometry,
+support height, slot scoring, pass advancement, recovery, and regression
+validation. Treat the current setup bridge as the execution surface, not the
+final specification.
 
 ## Mutation workflow
 
@@ -96,10 +162,18 @@ Use `dry_run=true` to validate a plan without changing TTS. Use
 `idempotency_key` when the client may retry a request; the server replays the
 cached result instead of executing the plan twice.
 
-For the placement-only setup bridge, use `tts_killteam_setup_list_objects`
-before `tts_killteam_setup_place_model` when you need manual/debug placement
-compatibility. The AI-owned setup flow uses `MOVE[guid,x,y,z]` and the setup
-runtime routes it through the bridge's move alias and readback verification.
+For the placement-only setup bridge, use `tts_killteam_setup_context` before
+`tts_killteam_setup_place_model` when you need the compact AI placement context;
+use `tts_killteam_setup_list_objects` for manual/debug inspection. The AI-owned
+setup flow uses `SETUP_MOVE[candidate_id]` and the setup runtime resolves the
+candidate through the dedicated placement action and readback verification.
+Legacy `MOVE[guid,x,y,z]` remains available for compatibility when it matches a
+single candidate exactly. Pending placements are reconciled from live positions
+before the next batch is selected.
+For Kill Team setup planning, `tts_killteam_plan_objective_move` is a tactical
+placement helper, not the full deployment-policy contract. The remaining
+setup-policy decisions live in KT-016 through KT-020. The live setup plan also
+returns `recommended_position_evidence` for ranked deployment slots.
 
 `tts_move_checkers_piece` is the game-specific movement path for the bundled
 checkers save. It resolves the live `Checker_black` pieces, infers the square

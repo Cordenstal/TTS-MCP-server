@@ -3,7 +3,7 @@
 -- runtime is unavailable or too large for the current workflow.
 
 local MCP_CHANNEL = "tts-mcp"
-local MCP_BRIDGE_VERSION = "2026-07-29-setup-placement-v2-chat"
+local MCP_BRIDGE_VERSION = "2026-08-01-setup-placement-v6-pivot-reconcile"
 local MCP_HTTP_CHAT_URL = "http://127.0.0.1:8765/chat"
 
 local function mcp_try(fn)
@@ -218,12 +218,35 @@ local function mcp_require_object(guid)
 end
 
 local function mcp_object_summary(obj)
+    local bounds = mcp_try(function() return obj.getBounds() end)
+    local safe_bounds = nil
+    if type(bounds) == "table" then
+        local center = mcp_try(function() return bounds.center end)
+        local size = mcp_try(function() return bounds.size end)
+        if type(center) == "table" and type(size) == "table" then
+            safe_bounds = {
+                center = {
+                    x = tonumber(mcp_try(function() return center.x end)) or 0,
+                    y = tonumber(mcp_try(function() return center.y end)) or 0,
+                    z = tonumber(mcp_try(function() return center.z end)) or 0,
+                },
+                size = {
+                    x = tonumber(mcp_try(function() return size.x end)) or 0,
+                    y = tonumber(mcp_try(function() return size.y end)) or 0,
+                    z = tonumber(mcp_try(function() return size.z end)) or 0,
+                },
+            }
+        end
+    end
+    local safe_scale = mcp_try(function() return obj.getScale() end)
     return {
         guid = mcp_try(function() return obj.getGUID() end),
         name = mcp_try(function() return obj.getName() end),
         type = mcp_try(function() return obj.type end) or mcp_try(function() return obj.tag end),
         tags = mcp_try(function() return obj.getTags() end) or {},
         position = mcp_try(function() return obj.getPosition() end),
+        scale = safe_scale,
+        bounds = safe_bounds,
         locked = mcp_try(function() return obj.getLock() end),
     }
 end
@@ -255,6 +278,10 @@ local function mcp_object_tags(obj)
     return mcp_try(function() return obj.getTags() end) or {}
 end
 
+local function mcp_norm(value)
+    return string.lower(tostring(value or ""))
+end
+
 local function mcp_is_operative_figurine(obj)
     if string.lower(mcp_object_type(obj)) ~= "figurine" then
         return false
@@ -262,6 +289,174 @@ local function mcp_is_operative_figurine(obj)
     local tags = mcp_object_tags(obj)
     for _, tag in ipairs(tags) do
         if string.lower(tostring(tag)) == "operative" then
+            return true
+        end
+    end
+    return false
+end
+
+local function mcp_bounds_box(obj)
+    local bounds = mcp_try(function() return obj.getBounds() end)
+    if type(bounds) ~= "table" then
+        return nil
+    end
+    local center = mcp_try(function() return bounds.center end)
+    local size = mcp_try(function() return bounds.size end)
+    if type(center) ~= "table" or type(size) ~= "table" then
+        return nil
+    end
+    local center_x = tonumber(mcp_try(function() return center.x end)) or 0
+    local center_y = tonumber(mcp_try(function() return center.y end)) or 0
+    local center_z = tonumber(mcp_try(function() return center.z end)) or 0
+    local size_x = math.abs(tonumber(mcp_try(function() return size.x end)) or 0)
+    local size_y = math.abs(tonumber(mcp_try(function() return size.y end)) or 0)
+    local size_z = math.abs(tonumber(mcp_try(function() return size.z end)) or 0)
+    -- LayoutZone and ScriptingTrigger objects can report zero-size bounds even
+    -- though their scale is the authoritative horizontal zone geometry.
+    if size_x <= 0 or size_z <= 0 then
+        local object_type = mcp_norm(mcp_object_type(obj))
+        if object_type == "layout" or object_type == "layoutzone" or object_type == "scriptingtrigger" then
+            local scale = mcp_try(function() return obj.getScale() end)
+            local position = mcp_try(function() return obj.getPosition() end)
+            if type(scale) == "table" then
+                size_x = math.abs(tonumber(mcp_try(function() return scale.x end)) or 0)
+                size_y = math.abs(tonumber(mcp_try(function() return scale.y end)) or size_y)
+                size_z = math.abs(tonumber(mcp_try(function() return scale.z end)) or 0)
+            end
+            if type(position) == "table" then
+                center_x = tonumber(mcp_try(function() return position.x end)) or center_x
+                center_y = tonumber(mcp_try(function() return position.y end)) or center_y
+                center_z = tonumber(mcp_try(function() return position.z end)) or center_z
+            end
+        end
+    end
+    return {
+        center = {
+            x = center_x,
+            y = center_y,
+            z = center_z,
+        },
+        size = {
+            x = size_x,
+            y = size_y,
+            z = size_z,
+        },
+        rect = {
+            center_x - size_x / 2,
+            center_x + size_x / 2,
+            center_z - size_z / 2,
+            center_z + size_z / 2,
+        },
+        min_y = center_y - size_y / 2,
+        max_y = center_y + size_y / 2,
+    }
+end
+
+local function mcp_rects_overlap(a, b)
+    return a[1] <= b[2] and a[2] >= b[1] and a[3] <= b[4] and a[4] >= b[3]
+end
+
+local function mcp_is_setup_anchor(obj)
+    local object_type = mcp_norm(mcp_object_type(obj))
+    local name = mcp_norm(mcp_try(function() return obj.getName() end))
+    for _, tag in ipairs(mcp_object_tags(obj)) do
+        local normalized = mcp_norm(tag)
+        if
+            normalized == "entity=terrain"
+            or normalized == "kt_mission_terrain"
+            or normalized == "blocks_los=true"
+            or normalized == "kt_mission_objective"
+            or normalized == "_deployment_zone_blue"
+            or normalized == "_deployment_zone_red"
+        then
+            return true
+        end
+    end
+    if string.find(name, "terrain", 1, true) ~= nil then
+        return true
+    end
+    if string.find(name, "objective", 1, true) ~= nil then
+        return true
+    end
+    if string.find(name, "deployment zone", 1, true) ~= nil then
+        return true
+    end
+    if string.find(name, "deployed zone", 1, true) ~= nil then
+        return true
+    end
+    return object_type == "layout" or object_type == "block"
+end
+
+local function mcp_is_setup_relevant_object(obj)
+    if mcp_is_operative_figurine(obj) then
+        return true
+    end
+    local object_type = mcp_norm(mcp_object_type(obj))
+    if
+        object_type == "card"
+        or object_type == "deck"
+        or object_type == "counter"
+        or object_type == "3d text"
+        or object_type == "dice"
+        or object_type == "bag"
+    then
+        return false
+    end
+    return mcp_bounds_box(obj) ~= nil
+end
+
+local function mcp_is_setup_support_surface(obj)
+    if mcp_is_operative_figurine(obj) then
+        return false
+    end
+    local explicit_terrain = false
+    for _, tag in ipairs(mcp_object_tags(obj)) do
+        local normalized = mcp_norm(tag)
+        if
+            normalized == "_deployment_zone_blue"
+            or normalized == "_deployment_zone_red"
+            or normalized == "kt_mission_objective"
+            or normalized == "entity=objective"
+            or normalized == "entity=deployment"
+        then
+            return false
+        end
+        if
+            normalized == "entity=terrain"
+            or normalized == "kt_mission_terrain"
+            or normalized == "blocks_los=true"
+        then
+            explicit_terrain = true
+        end
+    end
+    return explicit_terrain and mcp_bounds_box(obj) ~= nil
+end
+
+local function mcp_is_setup_objective(obj)
+    for _, tag in ipairs(mcp_object_tags(obj)) do
+        local normalized = mcp_norm(tag)
+        if normalized == "objective" or normalized == "kt_mission_objective" or normalized == "entity=objective" then
+            return true
+        end
+    end
+    return false
+end
+
+local function mcp_setup_matches_filters(obj, args)
+    local name_filter = string.lower(tostring(args.name_contains or ""))
+    local object_name = string.lower(tostring(mcp_try(function() return obj.getName() end) or ""))
+    if name_filter ~= "" and string.find(object_name, name_filter, 1, true) == nil then
+        return false
+    end
+
+    local tag_filter = string.lower(tostring(args.tag or ""))
+    if tag_filter == "" or tag_filter == "operative" then
+        return mcp_is_setup_relevant_object(obj)
+    end
+
+    local tags = mcp_try(function() return obj.getTags() end) or {}
+    for _, actual in ipairs(tags) do
+        if mcp_norm(actual) == tag_filter then
             return true
         end
     end
@@ -398,12 +593,10 @@ MCP_HANDLERS.setup_list_objects = function(args, request_id)
     end
     for _, obj in ipairs(objects_or_error) do
         local live_guid = mcp_try(function() return obj.getGUID() end)
-        if live_guid ~= nil and tostring(live_guid) ~= "" and tostring(live_guid) ~= "-1" and mcp_matches_filters(obj, args) then
-            if string.lower(tostring(args.tag or "")) == "operative" and not mcp_is_operative_figurine(obj) then
-                goto continue
-            end
+        if live_guid ~= nil and tostring(live_guid) ~= "" and tostring(live_guid) ~= "-1" and mcp_setup_matches_filters(obj, args) then
             total_matching = total_matching + 1
-            local summary = compact and mcp_object_summary(obj) or {
+            local summary_data = mcp_object_summary(obj)
+            local summary = compact and summary_data or {
                 guid = mcp_try(function() return obj.getGUID() end),
                 name = mcp_try(function() return obj.getName() end),
                 description = mcp_try(function() return obj.getDescription() end),
@@ -411,13 +604,14 @@ MCP_HANDLERS.setup_list_objects = function(args, request_id)
                 tags = mcp_try(function() return obj.getTags() end) or {},
                 position = mcp_try(function() return obj.getPosition() end),
                 rotation = mcp_try(function() return obj.getRotation() end),
+                scale = summary_data.scale,
+                bounds = summary_data.bounds,
                 locked = mcp_try(function() return obj.getLock() end),
             }
             if #results < max_results then
                 table.insert(results, summary)
             end
         end
-        ::continue::
     end
     return {
         count = #results,
@@ -425,6 +619,12 @@ MCP_HANDLERS.setup_list_objects = function(args, request_id)
         truncated = total_matching > #results,
         objects = results,
     }
+end
+
+MCP_HANDLERS.killteam_save_131_setup_objects = function(args, request_id)
+    -- Preserve the legacy action name without calling a handler that does not
+    -- exist in this placement-only bridge.
+    return MCP_HANDLERS.setup_list_objects(args, request_id)
 end
 
 local function mcp_setup_place_model(args, request_id, action)
@@ -446,6 +646,90 @@ local function mcp_setup_place_model(args, request_id, action)
     if position == nil then
         error("position must contain numeric x, y, and z values; " .. mcp_setup_request_summary(args, request_id, action, "error"))
     end
+    local model_bounds = mcp_bounds_box(obj)
+    if model_bounds == nil then
+        error("setup placement requires live bounds; " .. mcp_setup_request_summary(args, request_id, action, "error"))
+    end
+    local model_position = mcp_try(function() return obj.getPosition() end)
+    if type(model_position) ~= "table" then
+        error("setup placement requires a live model position; " .. mcp_setup_request_summary(args, request_id, action, "error"))
+    end
+    local pivot_to_bottom_y =
+        (tonumber(mcp_try(function() return model_position.y end)) or model_bounds.center.y)
+        - model_bounds.center.y
+        + model_bounds.size.y / 2
+    local objects_ok, objects_or_error = pcall(getObjects)
+    if not objects_ok then
+        error("TTS scene enumeration failed: " .. tostring(objects_or_error))
+    end
+    if type(objects_or_error) ~= "table" then
+        error("TTS scene enumeration returned an invalid object list")
+    end
+    local objects = objects_or_error
+
+    local target_rect = {
+        position.x - model_bounds.size.x / 2,
+        position.x + model_bounds.size.x / 2,
+        position.z - model_bounds.size.z / 2,
+        position.z + model_bounds.size.z / 2,
+    }
+    local requested_position = {
+        x = position.x,
+        y = position.y,
+        z = position.z,
+    }
+    local support_height = nil
+    local support_guids = {}
+    for _, other in ipairs(objects) do
+        if type(other) == "table" then
+            local other_guid = mcp_try(function() return other.getGUID() end)
+            if other_guid ~= nil and tostring(other_guid) ~= tostring(obj.getGUID()) then
+                local other_box = mcp_bounds_box(other)
+                if other_box ~= nil and mcp_rects_overlap(target_rect, other_box.rect) and mcp_is_setup_support_surface(other) then
+                    if support_height == nil or other_box.max_y > support_height then
+                        support_height = other_box.max_y
+                        support_guids = { tostring(other_guid) }
+                    elseif math.abs(other_box.max_y - support_height) <= 0.000001 then
+                        table.insert(support_guids, tostring(other_guid))
+                    end
+                end
+            end
+        end
+    end
+    if support_height ~= nil then
+        position = {
+            x = position.x,
+            y = math.floor((support_height + pivot_to_bottom_y) * 1000000 + 0.5) / 1000000,
+            z = position.z,
+        }
+    end
+
+    local candidate_box = {
+        rect = target_rect,
+        min_y = position.y - pivot_to_bottom_y,
+        max_y = position.y - pivot_to_bottom_y + model_bounds.size.y,
+    }
+    for _, other in ipairs(objects) do
+        if type(other) == "table" then
+            local other_guid = mcp_try(function() return other.getGUID() end)
+            if other_guid ~= nil and tostring(other_guid) ~= tostring(obj.getGUID()) then
+                local other_box = mcp_bounds_box(other)
+                local is_blocker = mcp_is_operative_figurine(other) or mcp_is_setup_objective(other)
+                if is_blocker and other_box ~= nil and mcp_rects_overlap(candidate_box.rect, other_box.rect) then
+                    local vertical_overlap = candidate_box.min_y <= other_box.max_y + 0.000001
+                        and candidate_box.max_y >= other_box.min_y - 0.000001
+                    if vertical_overlap then
+                        error(
+                            "setup placement intersects an existing model or objective "
+                            .. tostring(other_guid)
+                            .. "; "
+                            .. mcp_setup_request_summary(args, request_id, action, "reject")
+                        )
+                    end
+                end
+            end
+        end
+    end
 
     if args.smooth == true then
         obj.setPositionSmooth(position, args.collide == true, args.fast ~= false)
@@ -457,12 +741,17 @@ local function mcp_setup_place_model(args, request_id, action)
     Wait.frames(function()
         local moved = getObjectFromGUID(guid)
         local actual = moved and moved.getPosition() or position
+        local actual_bounds = moved and mcp_bounds_box(moved) or model_bounds
         mcp_send_ok(request_id, {
             status = "verified",
             guid = guid,
             name = moved and moved.getName() or mcp_try(function() return obj.getName() end),
             tags = moved and moved.getTags() or mcp_try(function() return obj.getTags() end) or {},
             source = position_source,
+            requested_position = requested_position,
+            support_height = support_height,
+            support_guids = support_guids,
+            bounds = actual_bounds,
             position = {
                 x = tonumber(actual.x) or position.x,
                 y = tonumber(actual.y) or position.y,

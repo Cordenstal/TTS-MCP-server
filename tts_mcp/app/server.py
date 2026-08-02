@@ -4,6 +4,7 @@ import asyncio
 import base64
 import functools
 import json
+import math
 import os
 import queue
 import re
@@ -489,7 +490,7 @@ class TTSBridge:
             # APIs reject those wrappers as vectors ("Specified cast is not
             # valid").  Keep movement scalar-only at this boundary; the Lua
             # bridge rebuilds a native {x, y, z} table before calling TTS.
-            if action == "move_object":
+            if action in {"move_object", "setup_place_model"}:
                 position = request_args.get("position") or {}
                 custom_message["guid"] = str(request_args.get("guid") or "")
                 custom_message["x"] = float(position["x"])
@@ -865,6 +866,13 @@ CAPABILITY_MANIFEST: list[dict[str, Any]] = [
         "verification": "bounded placement-scene object inventory with name and tag filters",
     },
     {
+        "name": "tts_killteam_setup_context",
+        "category": "observation",
+        "mutates": False,
+        "confirmation": "none",
+        "verification": "explicitly tagged placement objects with exact bounds and positions",
+    },
+    {
         "name": "tts_killteam_setup_place_model",
         "category": "game-domain",
         "mutates": True,
@@ -912,6 +920,13 @@ CAPABILITY_MANIFEST: list[dict[str, Any]] = [
         "mutates": True,
         "confirmation": "semantic AI-side roster selection from the tagged faction-deck container",
         "verification": "contained card identity, roster-list zone placement, and partial list legality",
+    },
+    {
+        "name": "tts_killteam_select_setup_card",
+        "category": "game-domain",
+        "mutates": True,
+        "confirmation": "semantic AI-side setup-card selection from the tagged faction-deck container",
+        "verification": "contained card identity, roster-list zone placement, and card-kind legality",
     },
     {
         "name": "tts_killteam_lock_rosters",
@@ -1498,6 +1513,367 @@ async def tts_killteam_setup_list_objects(
     )
 
 
+def _setup_context_tags(item: dict[str, Any]) -> set[str]:
+    raw_tags = item.get("tags", [])
+    if isinstance(raw_tags, str):
+        raw_tags = [raw_tags]
+    if not isinstance(raw_tags, list):
+        raw_tags = []
+    tags = {str(tag).strip().casefold() for tag in raw_tags if str(tag).strip()}
+    metadata = item.get("metadata")
+    if isinstance(metadata, dict):
+        entity = str(metadata.get("entity", "")).strip().casefold()
+        if entity:
+            tags.add(f"entity={entity}")
+        if metadata.get("blocks_los") is True:
+            tags.add("blocks_los=true")
+    return tags
+
+
+def _setup_box(item: dict[str, Any]) -> dict[str, float] | None:
+    """Normalize a TTS bounds record into an x/z footprint and y extent."""
+    bounds = item.get("bounds")
+    if not isinstance(bounds, dict):
+        return None
+    size = bounds.get("size")
+    position = item.get("position")
+    center = bounds.get("center") if isinstance(bounds.get("center"), dict) else position
+    if not isinstance(size, dict) or not isinstance(center, dict):
+        return None
+    try:
+        sx = abs(float(size["x"]))
+        sy = abs(float(size["y"]))
+        sz = abs(float(size["z"]))
+        cx = float(center["x"])
+        cy = float(center["y"])
+        cz = float(center["z"])
+        px = float((position or center)["x"])
+        py = float((position or center)["y"])
+        pz = float((position or center)["z"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if min(sx, sy, sz) <= 0:
+        scale = item.get("scale")
+        object_type = str(item.get("type", "")).strip().casefold()
+        if not isinstance(scale, dict) or object_type not in {"layout", "layoutzone", "scriptingtrigger", "zone"}:
+            return None
+        try:
+            sx = abs(float(scale["x"]))
+            sy = abs(float(scale["y"]))
+            sz = abs(float(scale["z"]))
+            if isinstance(position, dict):
+                cx = float(position["x"])
+                cy = float(position["y"])
+                cz = float(position["z"])
+                px = cx
+                py = cy
+                pz = cz
+        except (KeyError, TypeError, ValueError):
+            return None
+    if min(sx, sy, sz) <= 0:
+        return None
+    return {
+        "min_x": cx - sx / 2,
+        "max_x": cx + sx / 2,
+        "min_y": cy - sy / 2,
+        "max_y": cy + sy / 2,
+        "min_z": cz - sz / 2,
+        "max_z": cz + sz / 2,
+        "size_x": sx,
+        "size_y": sy,
+        "size_z": sz,
+        "position_x": px,
+        "position_y": py,
+        "position_z": pz,
+        # TTS setPosition targets the object pivot, while getBounds reports
+        # the world-space bounds center. This is the pivot-to-bottom offset
+        # needed to place the model on a terrain surface.
+        "pivot_to_bottom_y": py - cy + sy / 2,
+    }
+
+
+def _setup_rects_overlap(left: dict[str, float], right: dict[str, float], clearance: float = 0.0) -> bool:
+    return (
+        left["min_x"] < right["max_x"] + clearance
+        and left["max_x"] > right["min_x"] - clearance
+        and left["min_z"] < right["max_z"] + clearance
+        and left["max_z"] > right["min_z"] - clearance
+    )
+
+
+def _setup_candidate_plan(
+    categories: dict[str, list[dict[str, Any]]],
+    *,
+    occupancy_blockers: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Build bounded, deterministic tactical evidence for setup placement.
+
+    The placement bridge remains the authority for final collision and terrain
+    validation. This planner only supplies legal-looking alternatives so the
+    model does not repeatedly choose the deployment-zone center.
+    """
+    # Candidates are limited to undeployed AI models, but placement legality
+    # must consider every live operative, including deployed and opposing ones.
+    operatives = [item for item in categories.get("operatives", []) if _setup_box(item)]
+    operative_blockers = [
+        item for item in (occupancy_blockers if occupancy_blockers is not None else operatives)
+        if _setup_box(item)
+    ]
+    zones = [item for item in categories.get("deployment_zones", []) if _setup_box(item)]
+    terrain = [item for item in categories.get("terrain", []) if _setup_box(item)]
+    objectives = [item for item in categories.get("objectives", []) if _setup_box(item)]
+    if not operatives or not zones:
+        return {"batch_size": max(1, math.ceil(len(operatives) / 3)), "candidates": []}
+
+    zone = next(
+        (item for item in zones if "_deployment_zone_blue" in _setup_context_tags(item)),
+        zones[0],
+    )
+    zone_box = _setup_box(zone)
+    if zone_box is None:
+        return {"batch_size": max(1, math.ceil(len(operatives) / 3)), "candidates": []}
+    threat_zones = [item for item in zones if item is not zone and _setup_box(item)]
+    threat_box = _setup_box(threat_zones[0]) if threat_zones else None
+    threat_x = (threat_box["min_x"] + threat_box["max_x"]) / 2 if threat_box else zone_box["max_x"]
+    threat_z = (threat_box["min_z"] + threat_box["max_z"]) / 2 if threat_box else (zone_box["min_z"] + zone_box["max_z"]) / 2
+    objective_centers = [
+        ((_setup_box(item)["min_x"] + _setup_box(item)["max_x"]) / 2,
+         (_setup_box(item)["min_z"] + _setup_box(item)["max_z"]) / 2)
+        for item in objectives
+        if _setup_box(item) is not None
+    ]
+    candidates: list[dict[str, Any]] = []
+    for model in operatives:
+        model_box = _setup_box(model)
+        if model_box is None:
+            continue
+        half_x = model_box["size_x"] / 2
+        half_z = model_box["size_z"] / 2
+        usable_min_x = zone_box["min_x"] + half_x
+        usable_max_x = zone_box["max_x"] - half_x
+        usable_min_z = zone_box["min_z"] + half_z
+        usable_max_z = zone_box["max_z"] - half_z
+        if usable_min_x > usable_max_x or usable_min_z > usable_max_z:
+            continue
+        x_values = [usable_min_x + (usable_max_x - usable_min_x) * index / 4 for index in range(5)]
+        z_values = [usable_min_z + (usable_max_z - usable_min_z) * index / 4 for index in range(5)]
+        for x in x_values:
+            for z in z_values:
+                footprint = {
+                    "min_x": x - half_x,
+                    "max_x": x + half_x,
+                    "min_z": z - half_z,
+                    "max_z": z + half_z,
+                }
+                supports = [item for item in terrain if _setup_rects_overlap(footprint, _setup_box(item))]
+                support_height = max((_setup_box(item)["max_y"] for item in supports), default=None)
+                y = (
+                    support_height + model_box["pivot_to_bottom_y"]
+                    if support_height is not None
+                    else model_box["position_y"]
+                )
+                candidate_box = {
+                    **footprint,
+                    "min_y": y - model_box["pivot_to_bottom_y"],
+                    "max_y": y - model_box["pivot_to_bottom_y"] + model_box["size_y"],
+                }
+                blocked = False
+                for other in operative_blockers + objectives:
+                    if str(other.get("guid", "")) == str(model.get("guid", "")):
+                        continue
+                    other_box = _setup_box(other)
+                    if other_box and _setup_rects_overlap(candidate_box, other_box) and candidate_box["min_y"] <= other_box["max_y"] and candidate_box["max_y"] >= other_box["min_y"]:
+                        blocked = True
+                        break
+                if blocked:
+                    continue
+                objective_distance = min(
+                    (x - ox) ** 2 + (z - oz) ** 2 for ox, oz in objective_centers
+                ) ** 0.5 if objective_centers else 0.0
+                cover = sum(
+                    1 for item in terrain
+                    if item not in supports and _setup_rects_overlap(
+                        {"min_x": min(x, threat_x), "max_x": max(x, threat_x), "min_z": min(z, threat_z), "max_z": max(z, threat_z)},
+                        _setup_box(item),
+                    )
+                )
+                center_distance = ((x - threat_x) ** 2 + (z - threat_z) ** 2) ** 0.5
+                score = cover * 4.0 - objective_distance * 0.25 - center_distance * 0.05
+                candidates.append({
+                    "guid": model.get("guid"),
+                    "source_position": {
+                        axis: round(float(model.get("position", {}).get(axis, 0)), 5)
+                        for axis in ("x", "y", "z")
+                    },
+                    "position": {"x": round(x, 5), "y": round(y, 5), "z": round(z, 5)},
+                    "support_guids": [item.get("guid") for item in supports if item.get("guid")],
+                    "metrics": {
+                        "cover_score": cover,
+                        "objective_distance": round(objective_distance, 4),
+                        "threat_distance": round(center_distance, 4),
+                        "deployment_center_distance": round(((x - (zone_box["min_x"] + zone_box["max_x"]) / 2) ** 2 + (z - (zone_box["min_z"] + zone_box["max_z"]) / 2) ** 2) ** 0.5, 4),
+                    },
+                    "score": round(score, 5),
+                })
+    candidates.sort(key=lambda item: (-float(item["score"]), str(item.get("guid", "")), item["position"]["x"], item["position"]["z"]))
+    model_boxes = {
+        str(item.get("guid", "")): _setup_box(item)
+        for item in operatives
+        if item.get("guid") and _setup_box(item) is not None
+    }
+    candidate_indices: dict[str, int] = {}
+    for candidate in candidates:
+        guid = str(candidate.get("guid", "")).strip()
+        index = candidate_indices.get(guid, 0)
+        candidate_indices[guid] = index + 1
+        candidate["candidate_id"] = f"setup-{guid}-{index:02d}"
+        model_box = model_boxes.get(guid)
+        if model_box is not None:
+            candidate["footprint"] = {
+                "min_x": round(float(candidate["position"]["x"]) - model_box["size_x"] / 2, 5),
+                "max_x": round(float(candidate["position"]["x"]) + model_box["size_x"] / 2, 5),
+                "min_z": round(float(candidate["position"]["z"]) - model_box["size_z"] / 2, 5),
+                "max_z": round(float(candidate["position"]["z"]) + model_box["size_z"] / 2, 5),
+            }
+    recommended_batch: list[dict[str, Any]] = []
+    selected_candidates: list[dict[str, Any]] = []
+    for guid in sorted({str(item.get("guid", "")) for item in candidates if item.get("guid")}):
+        model_candidates = [item for item in candidates if str(item.get("guid", "")) == guid]
+        selected = next(
+            (
+                item for item in model_candidates
+                if all(not _setup_rects_overlap(item["footprint"], other["footprint"], clearance=0.25) for other in selected_candidates)
+            ),
+            None,
+        )
+        if selected is not None:
+            recommended_batch.append(selected)
+            selected_candidates.append(selected)
+        if len(recommended_batch) >= max(1, math.ceil(len(operatives) / 3)):
+            break
+    return {
+        "batch_size": max(1, math.ceil(len(operatives) / 3)),
+        "candidate_count": len(candidates),
+        "recommended_batch": recommended_batch,
+        "candidates": candidates[: max(12, len(operatives) * 2)],
+    }
+
+
+def _killteam_setup_context_sync(
+    *,
+    max_results: int = 200,
+    exclude_guids: list[str] | None = None,
+) -> dict[str, Any]:
+    """Return explicit placement evidence, excluding bags, cards, and decks."""
+    excluded_guids = {
+        str(guid).strip().casefold()
+        for guid in (exclude_guids or [])
+        if str(guid).strip()
+    }
+    raw = _killteam_setup_call("list_objects", max_results=1000, compact=False)
+    if not isinstance(raw, dict):
+        raise KillTeamSetupError("placement scene enumeration returned an invalid result")
+    source_objects = raw.get("objects", [])
+    if not isinstance(source_objects, list):
+        raise KillTeamSetupError("placement scene enumeration returned invalid objects")
+
+    categories: dict[str, list[dict[str, Any]]] = {
+        "operatives": [],
+        "terrain": [],
+        "deployment_zones": [],
+        "objectives": [],
+    }
+    occupancy_operatives: list[dict[str, Any]] = []
+    relevant: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in source_objects:
+        if not isinstance(item, dict):
+            continue
+        tags = _setup_context_tags(item)
+        is_operative = "operative" in tags
+        identity_text = " ".join((str(item.get("name", "")), " ".join(tags))).casefold()
+        identity_words = set(re.findall(r"[a-z0-9]+", identity_text))
+        explicitly_opponent = bool({"red", "opponent", "enemy", "human"} & identity_words)
+        is_ai_operative = is_operative and not explicitly_opponent and bool(
+            {"blue", "ai", "friendly"} & identity_words
+            or "plague marine" in identity_text
+        )
+        is_ai_candidate = is_ai_operative and str(item.get("guid", "")).strip().casefold() not in excluded_guids
+        is_deployment = (
+            "_deployment_zone_blue" in tags
+            or "_deployment_zone_red" in tags
+            or "entity=deployment" in tags
+        )
+        is_objective = "kt_mission_objective" in tags or "entity=objective" in tags
+        is_terrain = (
+            not is_operative
+            and not is_deployment
+            and not is_objective
+            and (
+                "kt_mission_terrain" in tags
+                or "entity=terrain" in tags
+                or "blocks_los=true" in tags
+            )
+        )
+        category_names = []
+        if is_ai_candidate:
+            category_names.append("operatives")
+        if is_terrain:
+            category_names.append("terrain")
+        if is_deployment:
+            category_names.append("deployment_zones")
+        if is_objective:
+            category_names.append("objectives")
+        if not category_names and not is_operative:
+            continue
+        compact = {
+            key: item[key]
+            for key in ("guid", "name", "type", "tags", "position", "scale", "bounds", "locked")
+            if key in item
+        }
+        compact["tags"] = item.get("tags", [])
+        compact["categories"] = category_names
+        if is_ai_candidate:
+            compact["team"] = "ai"
+        if is_operative:
+            occupancy_operatives.append(compact)
+        identity = str(item.get("guid", "")).strip() or f"index:{len(relevant)}"
+        if identity not in seen:
+            relevant.append(compact)
+            seen.add(identity)
+        for category_name in category_names:
+            categories[category_name].append(compact)
+
+    limit = max(1, min(int(max_results), 200))
+    setup_plan = _setup_candidate_plan(categories, occupancy_blockers=occupancy_operatives)
+    return {
+        "status": "ready",
+        "source": "placement_only_bridge",
+        # Keep the authoritative, compact plan before duplicated inventories.
+        # Tool-result compaction is bounded and previously hid this plan from
+        # the model after the large object/category payload.
+        "setup_plan": setup_plan,
+        "count": min(len(relevant), limit),
+        "total_matching": len(relevant),
+        "truncated": len(relevant) > limit,
+        "objects": relevant[:limit],
+        "categories": {name: values[:limit] for name, values in categories.items()},
+    }
+
+
+@mcp.tool()
+async def tts_killteam_setup_context(
+    max_results: int = 200,
+    exclude_guids: list[str] | None = None,
+) -> dict[str, Any]:
+    """Return compact live setup context and tactical batch candidates."""
+    return await asyncio.to_thread(
+        _killteam_setup_context_sync,
+        max_results=max_results,
+        exclude_guids=exclude_guids,
+    )
+
+
 @mcp.tool()
 async def tts_killteam_setup_place_model(
     guid: str,
@@ -1572,6 +1948,24 @@ async def tts_killteam_select_roster_card(
         "select_roster_card",
         contained_guid.strip(),
         action_id=action_id.strip() or None,
+    )
+
+
+@mcp.tool()
+async def tts_killteam_select_setup_card(
+    contained_guid: str,
+    action_id: str = "",
+    card_kind: str = "",
+) -> dict[str, Any]:
+    """Select one AI setup card from the tagged faction-deck container."""
+    if not contained_guid.strip():
+        raise ValueError("contained_guid is required")
+    return await asyncio.to_thread(
+        _killteam_call,
+        "select_setup_card",
+        contained_guid.strip(),
+        action_id=action_id.strip() or None,
+        card_kind=card_kind.strip() or None,
     )
 
 
@@ -3278,6 +3672,15 @@ def _ai_gameplay_request(action: str, args: dict[str, Any]) -> dict[str, Any]:
         if not contained_guid:
             raise ValueError("killteam roster selection requires contained_guid")
         return _killteam_call("select_roster_card", contained_guid)
+    if action == "killteam_select_setup_card":
+        contained_guid = str(args.get("contained_guid", "")).strip()
+        if not contained_guid:
+            raise ValueError("killteam setup selection requires contained_guid")
+        return _killteam_call(
+            "select_setup_card",
+            contained_guid,
+            card_kind=str(args.get("card_kind", "")).strip() or None,
+        )
     if action == "killteam_roll_initiative":
         return _killteam_call("roll_initiative")
     if action == "killteam_lock_rosters":
@@ -3312,6 +3715,11 @@ def _ai_gameplay_request(action: str, args: dict[str, Any]) -> dict[str, Any]:
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError("killteam placement requires numeric x, y, and z") from exc
         return _killteam_call("place_operative", guid, [position])
+    if action == "killteam_take_tactical_turn":
+        return _killteam_call(
+            "take_tactical_turn",
+            trigger=str(args.get("trigger", "")).strip(),
+        )
     if action == "killteam_setup_place_model":
         guid = str(args.get("guid", "")).strip()
         if not guid:
@@ -3377,6 +3785,11 @@ def _ai_observation_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
             tag=str(args.get("tag", "")),
             max_results=max(1, min(int(args.get("max_results", 200)), 1000)),
             compact=bool(args.get("compact", True)),
+        )
+    if name == "tts_killteam_setup_context":
+        return _killteam_setup_context_sync(
+            max_results=max(1, min(int(args.get("max_results", 200)), 200)),
+            exclude_guids=args.get("exclude_guids"),
         )
     if name == "tts_killteam_probe_collection":
         return bridge.request(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hmac
+import math
 import os
 import queue
 import re
@@ -229,23 +230,162 @@ def _response_was_truncated(payload: Any) -> bool:
     return any(str(reason or "").strip().lower() in {"length", "max_tokens", "max_token", "length_limit"} for reason in reasons)
 
 
-def _is_killteam_autorun_setup_message(message: Any) -> bool:
-    return bool(re.fullmatch(r"KILLTEAM_AUTORUN_SETUP", str(message or "").strip(), re.I))
+def _is_killteam_autorun_setup_message(message: Any, active_game: Any = "") -> bool:
+    text = str(message or "").strip()
+    if re.fullmatch(r"KILLTEAM_AUTORUN_SETUP", text, re.I):
+        return True
+    if active_game and str(active_game).strip().lower() != "killteam":
+        return False
+    normalized = re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
+    return bool(
+        re.search(r"\b(place|placing|resume|continue|next)\b", normalized)
+        and re.search(r"\b(model|models|unit|units|setup|deployment|deploy|ai)\b", normalized)
+    )
 
 
 def _setup_command_summary(text: str) -> tuple[list[Any], list[Any], bool]:
     commands = parse_ai_commands(text or "")
-    move_commands = [command for command in commands if command.action == "move_object"]
+    move_commands = [
+        command
+        for command in commands
+        if command.action in {"move_object", "setup_candidate_move"}
+    ]
     has_autorun = any(command.action == "killteam_autorun_setup" for command in commands)
     return commands, move_commands, has_autorun
 
 
+def _setup_batch_size(model_count: int) -> int:
+    return max(1, math.ceil(max(0, int(model_count)) / 3))
+
+
+_SETUP_CANDIDATE_TOLERANCE = 0.2
+_SETUP_FOOTPRINT_CLEARANCE = 0.25
+
+
+def _setup_candidate_box(candidate: dict[str, Any]) -> dict[str, float] | None:
+    footprint = candidate.get("footprint")
+    if not isinstance(footprint, dict):
+        return None
+    try:
+        return {
+            key: float(footprint[key])
+            for key in ("min_x", "max_x", "min_z", "max_z")
+        }
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _setup_candidate_position(candidate: dict[str, Any]) -> dict[str, float] | None:
+    position = candidate.get("position")
+    if not isinstance(position, dict):
+        return None
+    try:
+        return {axis: float(position[axis]) for axis in ("x", "y", "z")}
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _setup_candidate_source_position(candidate: dict[str, Any]) -> dict[str, float] | None:
+    position = candidate.get("source_position")
+    if not isinstance(position, dict):
+        return None
+    try:
+        return {axis: float(position[axis]) for axis in ("x", "y", "z")}
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _setup_candidate_overlaps(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    left_box = _setup_candidate_box(left)
+    right_box = _setup_candidate_box(right)
+    if left_box is None or right_box is None:
+        return False
+    return (
+        left_box["min_x"] < right_box["max_x"] + _SETUP_FOOTPRINT_CLEARANCE
+        and left_box["max_x"] > right_box["min_x"] - _SETUP_FOOTPRINT_CLEARANCE
+        and left_box["min_z"] < right_box["max_z"] + _SETUP_FOOTPRINT_CLEARANCE
+        and left_box["max_z"] > right_box["min_z"] - _SETUP_FOOTPRINT_CLEARANCE
+    )
+
+
 def _setup_repair_prompt() -> str:
     return (
-        "Previous response did not call a tool. For this setup turn, call exactly one tool now: "
-        "tts_killteam_setup_ping. Do not write prose, JSON, or any command text. After the tool result, "
-        "continue with tts_killteam_setup_list_objects and then exactly one MOVE[guid,x,y,z] command if the evidence is sufficient."
+        "Previous response did not call a tool. For this setup turn, call exactly one setup observation tool now: "
+        "tts_killteam_setup_ping or tts_killteam_setup_context. Do not write prose, JSON, or command text. "
+        "After the observation, emit the required number of distinct SETUP_MOVE[candidate_id] commands. "
+        "Use different models and different tactical positions in the batch. Inspect terrain bounds under each "
+        "target footprint and use terrain top plus half the model height for y. "
+        "Never use literal x, y, or z placeholders and never call the full setup planner."
     )
+
+
+def _setup_finalize_prompt() -> str:
+    return (
+        "The setup observation budget is exhausted. Use the evidence already returned and emit the required number "
+        "of distinct SETUP_MOVE[candidate_id] commands. Do not request another tool, do not ask "
+        "for more information, do not use literal x/y/z placeholders, and do not write any prose."
+    )
+
+
+def _setup_standalone_move(text: str) -> tuple[str, str, str, str] | None:
+    match = re.fullmatch(
+        r"\s*MOVE\[\s*([^,\]]+)\s*,\s*([^,\]]+)\s*,\s*([^,\]]+)\s*,\s*([^,\]]+)\s*\]\s*",
+        str(text or ""),
+        re.I | re.S,
+    )
+    if not match:
+        return None
+    return tuple(part.strip() for part in match.groups())  # type: ignore[return-value]
+
+
+def _setup_move_text_from_plan(
+    plan_result: dict[str, Any],
+    *,
+    placeholder_guid: str = "",
+    setup_history: dict[str, Any] | None = None,
+) -> str | None:
+    placements = plan_result.get("placements") if isinstance(plan_result, dict) else None
+    if not isinstance(placements, list):
+        return None
+    placed_guids: set[str] = set()
+    if isinstance(setup_history, dict):
+        history_guids = setup_history.get("placed_guids")
+        if isinstance(history_guids, list):
+            placed_guids.update(str(guid).strip().lower() for guid in history_guids if str(guid).strip())
+        history_placements = setup_history.get("placements")
+        if isinstance(history_placements, list):
+            for item in history_placements:
+                if not isinstance(item, dict):
+                    continue
+                guid = str(item.get("guid", "")).strip().lower()
+                if guid:
+                    placed_guids.add(guid)
+    candidates: list[tuple[str, float, float, float]] = []
+    for placement in placements:
+        if not isinstance(placement, dict):
+            continue
+        model_guid = str(placement.get("model_guid") or placement.get("guid") or "").strip()
+        target = placement.get("target_position")
+        if not model_guid or not isinstance(target, dict):
+            continue
+        try:
+            x = float(target["x"])
+            y = float(target["y"])
+            z = float(target["z"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        candidates.append((model_guid, x, y, z))
+    if not candidates:
+        return None
+    if placeholder_guid.strip():
+        for model_guid, x, y, z in candidates:
+            if model_guid.lower() == placeholder_guid.strip().lower():
+                return f"MOVE[{model_guid},{x},{y},{z}]"
+    for model_guid, x, y, z in candidates:
+        if model_guid.lower() not in placed_guids:
+            return f"MOVE[{model_guid},{x},{y},{z}]"
+    model_guid, x, y, z = candidates[0]
+    return f"MOVE[{model_guid},{x},{y},{z}]"
 
 
 def _public_ai_text(text: str) -> str:
@@ -264,7 +404,7 @@ def _public_ai_text(text: str) -> str:
         return ""
 
     cleaned = re.sub(
-        r"(?im)^\s*(?:MOVE|ROTATE|LOCK|UNLOCK|SPAWN|PLACE|SPAWN_BUILTIN|BROADCAST|DESTROY)\[[^\]\r\n]*\]\s*$",
+        r"(?im)^\s*(?:MOVE|SETUP_MOVE|ROTATE|LOCK|UNLOCK|SPAWN|PLACE|SPAWN_BUILTIN|BROADCAST|DESTROY)\[[^\]\r\n]*\]\s*$",
         "",
         text,
     )
@@ -429,6 +569,16 @@ OBSERVATION_TOOL_SPECS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "tts_killteam_setup_context",
+            "description": "Return live Kill Team setup context with unplaced operatives, fixed ceil(N/3) batch metadata, terrain-adjusted candidates, deployment zones, objectives, and tactical metrics.",
+            "parameters": {"type": "object", "properties": {
+                "max_results": {"type": "integer", "minimum": 1, "maximum": 200},
+            }},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "tts_killteam_probe_collection",
             "description": "Diagnose one bounded stage of the Kill Team setup observation collector.",
             "parameters": {"type": "object", "properties": {
@@ -542,6 +692,7 @@ KILLTEAM_OBSERVATION_TOOL_NAMES = {
     "tts_killteam_setup",
     "tts_killteam_setup_ping",
     "tts_killteam_setup_list_objects",
+    "tts_killteam_setup_context",
     "tts_killteam_probe_collection",
     "tts_killteam_observe",
     "tts_killteam_probe_line_of_sight",
@@ -550,6 +701,10 @@ KILLTEAM_OBSERVATION_TOOL_NAMES = {
     "tts_killteam_plan_objective_move",
     "tts_capture_view",
     "tts_capture_view_info",
+}
+SETUP_OBSERVATION_TOOL_NAMES = {
+    "tts_killteam_setup_ping",
+    "tts_killteam_setup_context",
 }
 VISUAL_OBSERVATION_TOOL_NAMES = {"tts_capture_view", "tts_capture_view_info"}
 _TOOL_BLOB_KEYS = {"script", "scriptstates", "ui_xml", "raw", "logs"}
@@ -835,6 +990,7 @@ class ChatBackend:
         self._game_position_provider: Callable[[], dict[str, Any] | None] | None = None
         self._game_position_saver: Callable[[dict[str, Any] | None], None] | None = None
         self._setup_history_saver: Callable[[dict[str, Any]], None] | None = None
+        self._setup_pending_saver: Callable[[list[dict[str, Any]]], None] | None = None
         self._turn_completed: Callable[[str], Any] | None = None
         self._turn_lock = threading.RLock()
         self._context_local = threading.local()
@@ -856,6 +1012,7 @@ class ChatBackend:
         game_position_provider: Callable[[], dict[str, Any] | None] | None = None,
         game_position_saver: Callable[[dict[str, Any] | None], None] | None = None,
         setup_history_saver: Callable[[dict[str, Any]], None] | None = None,
+        setup_pending_saver: Callable[[list[dict[str, Any]]], None] | None = None,
         turn_completed: Callable[[str], Any] | None = None,
     ) -> None:
         self.controller_provider = controller_provider
@@ -867,6 +1024,7 @@ class ChatBackend:
         self._game_position_provider = game_position_provider
         self._game_position_saver = game_position_saver
         self._setup_history_saver = setup_history_saver
+        self._setup_pending_saver = setup_pending_saver
         self._turn_completed = turn_completed
 
     def configure_observation_tools(
@@ -938,13 +1096,6 @@ class ChatBackend:
                 commands=[{"action": action, "args": args, "destructive": False}],
                 execution=execution,
             )
-        if re.fullmatch(r"KILLTEAM_AUTORUN_SETUP", text, re.I):
-            # This is an AI-owned setup request, not a runtime macro. Let the
-            # model inspect the live placement bridge, choose one model and
-            # one position, then emit KILLTEAM_SETUP_PLACE for that decision.
-            # The runtime macro remains available to lower-level callers, but
-            # must not silently replace the AI's tactical reasoning in chat.
-            return None
         match = re.fullmatch(r"KILLTEAM_SETUP_PLACE\[([^,\]]+),\s*(-?[0-9]+(?:\.[0-9]+)?),\s*(-?[0-9]+(?:\.[0-9]+)?),\s*(-?[0-9]+(?:\.[0-9]+)?)\]", text, re.I)
         if match:
             if self.command_execution is None:
@@ -1066,16 +1217,17 @@ class ChatBackend:
             text_result = f"Setup plan {match.group(1)} stopped during {result.get('failed_phase', 'execution')}."
         return {
             "text": text_result,
-            "commands": [],
-            "killteam_setup_execution": result,
-        }
+                "commands": [],
+                "killteam_setup_execution": result,
+            }
 
-    def _observation_tool_specs(self) -> list[dict[str, Any]]:
+    def _observation_tool_specs(self, *, setup_turn: bool = False) -> list[dict[str, Any]]:
         controller = self.controller_provider() if self.controller_provider else {}
         if str(controller.get("active_game", "")).strip().lower() == "killteam":
+            allowed = SETUP_OBSERVATION_TOOL_NAMES if setup_turn else KILLTEAM_OBSERVATION_TOOL_NAMES
             return [
                 spec for spec in OBSERVATION_TOOL_SPECS
-                if spec["function"]["name"] in KILLTEAM_OBSERVATION_TOOL_NAMES
+                if spec["function"]["name"] in allowed
             ]
         return OBSERVATION_TOOL_SPECS
 
@@ -1102,27 +1254,44 @@ class ChatBackend:
             "visual review. Never guess a GUID, coordinate, or visual fact. Screenshots do not prove exact "
             "transforms. If any action or verification fails, stop issuing actions and wait for player "
             "instructions. "
-            "For Kill Team, do not use tts_list_objects. For AI-owned setup placement, use the dedicated "
-            "placement bridge: call tts_killteam_setup_ping, then tts_killteam_setup_list_objects. The AI owns "
-            "every AI-side model selection and placement. Ignore bags, decks, cards, and other containers; use "
-            "only live figurines with the Operative tag. Use the live returned model GUIDs, deployment-zone "
-            "bounds, terrain, objectives, and role priority to choose exactly one AI model and one legal tactical "
-            "position for this setup turn. Emit exactly one standalone line in this form: "
-            "MOVE[guid,x,y,z]. Never select or place a human model. Stop after that verified "
-            "placement; if more AI models remain, wait for a new KILLTEAM_AUTORUN_SETUP request. "
+            "For Kill Team, do not use tts_list_objects. For KILLTEAM_AUTORUN_SETUP, use only the dedicated "
+            "placement bridge: call tts_killteam_setup_ping, then tts_killteam_setup_context. The context is "
+            "already filtered to live Operative figurines, explicitly tagged terrain, deployment zones, and "
+            "objectives; ignore bags, decks, cards, and other containers. The AI owns every AI-side model "
+            "selection and placement. Use the live returned model GUIDs, exact bounds, deployment-zone bounds, "
+            "terrain, objectives, and the returned setup batch plan. The batch size is ceil(unplaced AI models / 3) "
+            "for the first batch and remains fixed for the setup session; for six models this is two models per "
+            "request. Select that many distinct AI models and distinct legal tactical positions. The "
+            "setup_plan.recommended_batch is the authoritative legal batch for this request. Use only the "
+            "candidate_id values listed in recommended_batch, exactly once each; do not select candidate IDs from "
+            "the broader candidates list for this batch. Emit one standalone SETUP_MOVE[candidate_id] line per "
+            "recommended candidate. Never select or place a human model. Stop after the batch "
+            "has been verified; if more AI models remain, wait for a new KILLTEAM_AUTORUN_SETUP request. "
             "KILLTEAM_AUTORUN_SETUP is only an incoming setup request and must not be emitted as the response to "
-            "that request. Use tts_killteam_observe only for the larger runtime after setup. The observation returns "
+            "that request. Use tts_killteam_observe only for the larger runtime after setup. For the full game "
+            "startup sequence, begin with initiative, then select operatives, then select available setup cards "
+            "such as equipment, ploys, and tactical-op cards, then lock the roster, deploy operatives in "
+            "initiative order, and finally continue into the first turning point. The observation returns "
             "exact operative IDs and live GUIDs; use the GUID from that observation directly in "
-            "MOVE[guid,x,y,z] when repositioning an AI operative. Do not use KILLTEAM_PLACE for ordinary movement. "
-            "For setup deployment, use the live figurine GUID rather than an operative_id when calling "
-            "tts_killteam_deploy_setup_operative or the semantic KILLTEAM_DEPLOY_SETUP command. "
-            "When objective control is the goal, call tts_killteam_plan_objective_move with the operative_id "
-            "before emitting MOVE and use the returned target position instead of inventing coordinates. "
-            "Continue the placement-only loop one model at a time until all AI models are placed. Do not issue an "
-            "AI placement for a human model, and do not use the larger runtime's batch or reconciliation commands "
-            "for this placement-only setup flow. "
-            "If a model profile or roster identity is missing, call tts_killteam_get_roster; it reads only the "
-            "dedicated AI roster container. Do not inspect arbitrary containers. "
+            "MOVE[guid,x,y,z] when repositioning an AI operative. For setup, emit SETUP_MOVE[candidate_id] copied "
+            "exactly from one returned candidate record. Do not transcribe setup coordinates. Legacy MOVE commands "
+            "are accepted only when all coordinates match the same candidate; never combine a GUID from one "
+            "operative with coordinates from another. The server will reject cross-paired targets and normalize y "
+            "from the authoritative candidate. "
+            "Do not use KILLTEAM_PLACE for ordinary movement. "
+            "Before choosing the target, inspect the target x/z footprint against every returned terrain, objective, "
+            "and operative bounds. A destination is invalid if the model footprint overlaps an existing operative "
+            "or objective. For every terrain piece that overlaps the chosen footprint, use the highest terrain "
+            "max_y plus the model's live pivot-to-bottom offset for y; the server resolves this from the candidate "
+            "record. Never place the model at the terrain "
+            "center or reuse its old y. Do not call tts_killteam_setup, "
+            "tts_killteam_plan_setup_board, tts_killteam_observe, or any batch/reconciliation command during this "
+            "placement-only turn. Do not repeat a GUID or reuse a position in the same batch. Prefer the supplied "
+            "candidates with cover, objective, spacing, and threat metrics over the deployment-zone center. "
+            "After setup, if a model profile or roster identity is missing, call tts_killteam_get_roster; it reads "
+            "only the dedicated AI roster container. Do not inspect arbitrary containers. "
+            "After setup, when objective control is the goal, call tts_killteam_plan_objective_move with the "
+            "operative_id before emitting MOVE and use the returned target position instead of inventing coordinates. "
             "For Kill Team, use tts_killteam_probe_line_of_sight on a visible target before entering an exposed "
             "lane or preparing a ranged attack. Treat blocker GUIDs, visibility_fraction, and the collider_warning "
             "as evidence; do not infer a clear shot from distance alone. "
@@ -1139,12 +1308,18 @@ class ChatBackend:
         )
 
     @staticmethod
-    def _validate_observation_call(call: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    def _validate_observation_call(
+        call: dict[str, Any],
+        *,
+        setup_turn: bool = False,
+    ) -> tuple[str, dict[str, Any]]:
         if not isinstance(call, dict):
             raise ValueError("tool call must be an object")
         name = str(call.get("name", "")).strip()
         if name not in OBSERVATION_TOOL_NAMES:
             raise ValueError(f"tool is not allowlisted: {name or '<missing>'}")
+        if setup_turn and name not in SETUP_OBSERVATION_TOOL_NAMES:
+            raise ValueError(f"tool is not available during placement-only setup: {name or '<missing>'}")
         arguments = call.get("arguments", {})
         if isinstance(arguments, str):
             try:
@@ -1165,6 +1340,7 @@ class ChatBackend:
             "tts_killteam_setup": {"ai_team", "units_per_inch", "ai_dice_count", "opponent_dice_count"},
             "tts_killteam_setup_ping": set(),
             "tts_killteam_setup_list_objects": {"name_contains", "tag", "max_results", "compact"},
+            "tts_killteam_setup_context": {"max_results", "exclude_guids"},
             "tts_killteam_probe_collection": {"stage", "index", "item_index"},
             "tts_killteam_observe": set(),
             "tts_killteam_get_roster": set(),
@@ -1201,6 +1377,17 @@ class ChatBackend:
             bounded["tag"] = str(bounded.get("tag", ""))
             bounded["max_results"] = max(1, min(int(bounded.get("max_results", 200)), 1000))
             bounded["compact"] = bool(bounded.get("compact", True))
+        if name == "tts_killteam_setup_context":
+            bounded["max_results"] = max(1, min(int(bounded.get("max_results", 200)), 200))
+            if "exclude_guids" in bounded:
+                excluded = bounded["exclude_guids"]
+                if not isinstance(excluded, list):
+                    raise ValueError("exclude_guids must be a list")
+                bounded["exclude_guids"] = [
+                    str(guid).strip()
+                    for guid in excluded[:200]
+                    if str(guid).strip()
+                ]
         if name == "tts_killteam_probe_collection":
             allowed_stages = {
                 "decode",
@@ -1252,9 +1439,26 @@ class ChatBackend:
             bounded["jpeg_quality"] = max(30, min(int(bounded.get("jpeg_quality", 85)), 95))
         return name, bounded
 
-    def _invoke_observation(self, call: dict[str, Any]) -> dict[str, Any]:
+    def _invoke_observation(self, call: dict[str, Any], *, setup_turn: bool = False) -> dict[str, Any]:
+        if setup_turn and str(call.get("name", "")).strip() == "tts_killteam_setup_context":
+            controller = self.controller_provider() if self.controller_provider else {}
+            history = controller.get("killteam_setup_history") if isinstance(controller, dict) else {}
+            placed_guids = history.get("placed_guids") if isinstance(history, dict) else []
+            excluded = sorted({
+                str(guid).strip()
+                for guid in placed_guids
+                if str(guid).strip()
+            }) if isinstance(placed_guids, list) else []
+            if excluded:
+                call = {
+                    **call,
+                    "arguments": {
+                        **(call.get("arguments") if isinstance(call.get("arguments"), dict) else {}),
+                        "exclude_guids": excluded,
+                    },
+                }
         try:
-            name, arguments = self._validate_observation_call(call)
+            name, arguments = self._validate_observation_call(call, setup_turn=setup_turn)
         except (KeyError, TypeError, ValueError) as exc:
             error = f"invalid observation tool call: {str(exc)[:300]}"
             self._trace_observation_failure(
@@ -1265,7 +1469,7 @@ class ChatBackend:
             return {"ok": False, "error": error}
         available_names = {
             str(item.get("function", {}).get("name", ""))
-            for item in self._observation_tool_specs()
+            for item in self._observation_tool_specs(setup_turn=setup_turn)
             if isinstance(item, dict)
         }
         if name not in available_names:
@@ -1287,11 +1491,13 @@ class ChatBackend:
             if not isinstance(result, dict):
                 result = {"value": result}
             controller = self.controller_provider() if self.controller_provider else {}
+            if setup_turn and name == "tts_killteam_setup_context":
+                result = self._enrich_setup_context(result, controller)
             if name == "tts_list_objects" and str(controller.get("active_game", "")).strip().lower() == "checkers":
                 checkers_board = _checkers_board_observation(result)
                 if checkers_board is not None:
                     return checkers_board
-            list_limit = 200 if name in {"tts_killteam_setup", "tts_killteam_setup_list_objects", "tts_killteam_observe", "tts_killteam_plan_setup_board", "tts_killteam_plan_objective_move"} else 50
+            list_limit = 200 if name in {"tts_killteam_setup", "tts_killteam_setup_list_objects", "tts_killteam_setup_context", "tts_killteam_observe", "tts_killteam_plan_setup_board", "tts_killteam_plan_objective_move"} else 50
             compact = _compact_tool_value(result, list_limit=list_limit)
             if not isinstance(compact, dict):
                 compact = {"value": compact}
@@ -1312,10 +1518,197 @@ class ChatBackend:
             )
             return {"ok": False, "error": error}
 
+    def _enrich_setup_context(self, result: dict[str, Any], controller: dict[str, Any]) -> dict[str, Any]:
+        """Attach persisted batch progress without coupling the bridge to the controller."""
+        if not isinstance(result, dict):
+            return result
+        categories = result.get("categories") if isinstance(result.get("categories"), dict) else {}
+        operatives = [item for item in categories.get("operatives", []) if isinstance(item, dict)]
+        history = controller.get("killteam_setup_history") if isinstance(controller, dict) else {}
+        history = history if isinstance(history, dict) else {}
+        placed_guids = {
+            str(guid).strip().lower()
+            for guid in history.get("placed_guids", [])
+            if str(guid).strip()
+        } if isinstance(history.get("placed_guids"), list) else set()
+        reconciled_placements: list[dict[str, Any]] = []
+        pending = history.get("pending_placements")
+        if isinstance(pending, list):
+            live_by_guid = {
+                str(item.get("guid", "")).strip().casefold(): item
+                for item in operatives
+                if str(item.get("guid", "")).strip()
+            }
+            for item in pending:
+                if not isinstance(item, dict):
+                    continue
+                guid = str(item.get("guid", "")).strip()
+                target = item.get("target_position")
+                live = live_by_guid.get(guid.casefold())
+                live_position = live.get("position") if isinstance(live, dict) else None
+                if not guid or not isinstance(target, dict) or not isinstance(live_position, dict):
+                    continue
+                try:
+                    matched = all(
+                        abs(float(live_position[axis]) - float(target[axis])) <= 0.2
+                        for axis in ("x", "y", "z")
+                    )
+                except (KeyError, TypeError, ValueError):
+                    matched = False
+                if not matched:
+                    continue
+                placement = {
+                    "status": "verified",
+                    "guid": guid,
+                    "position": {
+                        axis: float(live_position[axis])
+                        for axis in ("x", "y", "z")
+                    },
+                    "requested_position": {
+                        axis: float(target[axis])
+                        for axis in ("x", "y", "z")
+                    },
+                    "reconciled_from_pending": True,
+                    "batch_size": item.get("batch_size"),
+                }
+                reconciled_placements.append(placement)
+                placed_guids.add(guid.casefold())
+                if self._setup_history_saver is not None:
+                    self._setup_history_saver(placement)
+        if reconciled_placements:
+            _record_trace(
+                "ai_setup_pending_reconciled",
+                placements=reconciled_placements,
+            )
+        unplaced = [
+            item for item in operatives
+            if str(item.get("guid", "")).strip().lower() not in placed_guids
+        ]
+        plan = result.get("setup_plan") if isinstance(result.get("setup_plan"), dict) else {}
+        try:
+            batch_size = int(history.get("batch_size", 0))
+        except (TypeError, ValueError):
+            batch_size = 0
+        if batch_size <= 0:
+            try:
+                batch_size = int(plan.get("batch_size", 0))
+            except (TypeError, ValueError):
+                batch_size = 0
+        batch_size = max(1, batch_size or _setup_batch_size(len(operatives)))
+        try:
+            batch_progress = int(history.get("batch_progress", len(placed_guids) % batch_size) or 0)
+        except (TypeError, ValueError):
+            batch_progress = len(placed_guids) % batch_size
+        batch = {
+            "batch_size": batch_size,
+            "batch_target": min(batch_size, len(unplaced)) if unplaced else 0,
+            "batch_progress": batch_progress,
+            "remaining_models": len(unplaced),
+            "placed_guids": sorted(placed_guids),
+            "unplaced_guids": [str(item.get("guid", "")) for item in unplaced if item.get("guid")],
+        }
+        candidates = plan.get("candidates") if isinstance(plan.get("candidates"), list) else []
+        recommended_batch = plan.get("recommended_batch") if isinstance(plan.get("recommended_batch"), list) else []
+        candidate_map: dict[str, dict[str, Any]] = {}
+
+        def normalize_candidate(candidate: Any, index: int) -> dict[str, Any] | None:
+            if not isinstance(candidate, dict):
+                return None
+            guid = str(candidate.get("guid", "")).strip()
+            position = _setup_candidate_position(candidate)
+            if not guid or position is None or guid.casefold() in placed_guids:
+                return None
+            if guid.casefold() not in {
+                str(item.get("guid", "")).strip().casefold()
+                for item in unplaced
+                if item.get("guid")
+            }:
+                return None
+            normalized = dict(candidate)
+            normalized["guid"] = guid
+            normalized["position"] = position
+            normalized.setdefault("candidate_id", f"setup-{guid}-{index:02d}")
+            candidate_map[str(normalized["candidate_id"])] = normalized
+            return normalized
+
+        normalized_recommended = [
+            normalized
+            for index, candidate in enumerate(recommended_batch)
+            if (normalized := normalize_candidate(candidate, index)) is not None
+        ]
+        recommended_candidate_ids = {
+            str(candidate.get("candidate_id", "")).strip().casefold()
+            for candidate in normalized_recommended
+            if str(candidate.get("candidate_id", "")).strip()
+        }
+        normalized_candidates = [
+            normalized
+            for index, candidate in enumerate(candidates)
+            if (normalized := normalize_candidate(candidate, index)) is not None
+        ]
+        # The placement bridge ranks the full scene and cannot see the
+        # controller's persisted setup history. Refill recommendations after
+        # removing already-placed models, using only bridge candidate records
+        # and preserving distinct models and footprints.
+        if len(normalized_recommended) < batch["batch_target"]:
+            selected_guids = {
+                str(candidate.get("guid", "")).strip().casefold()
+                for candidate in normalized_recommended
+                if str(candidate.get("guid", "")).strip()
+            }
+            for candidate in normalized_candidates:
+                guid = str(candidate.get("guid", "")).strip().casefold()
+                if not guid or guid in selected_guids:
+                    continue
+                if any(
+                    _setup_candidate_overlaps(candidate, selected)
+                    for selected in normalized_recommended
+                ):
+                    continue
+                normalized_recommended.append(candidate)
+                selected_guids.add(guid)
+                if len(normalized_recommended) >= batch["batch_target"]:
+                    break
+            if normalized_recommended:
+                _record_trace(
+                    "ai_setup_batch_refilled",
+                    batch_target=batch["batch_target"],
+                    recommended_candidate_ids=[
+                        str(candidate.get("candidate_id", ""))
+                        for candidate in normalized_recommended
+                    ],
+                )
+            recommended_candidate_ids = {
+                str(candidate.get("candidate_id", "")).strip().casefold()
+                for candidate in normalized_recommended
+                if str(candidate.get("candidate_id", "")).strip()
+            }
+        result["setup_batch"] = batch
+        if reconciled_placements:
+            result["reconciled_placements"] = reconciled_placements
+        result["setup_plan"] = {
+            **plan,
+            "batch_size": batch_size,
+            "recommended_batch": normalized_recommended,
+            "candidates": normalized_candidates,
+        }
+        self._context_local.setup_batch = batch
+        self._context_local.setup_candidates = candidate_map
+        self._context_local.setup_batch_candidate_ids = recommended_candidate_ids
+        self._context_local.setup_batch_candidate_order = [
+            str(candidate.get("candidate_id", "")).strip()
+            for candidate in normalized_recommended
+            if str(candidate.get("candidate_id", "")).strip()
+        ]
+        self._context_local.setup_context_ready = True
+        return result
+
     def _invoke_observation_with_image_budget(
         self,
         call: dict[str, Any],
         image_count: int,
+        *,
+        setup_turn: bool = False,
     ) -> tuple[dict[str, Any], int]:
         name = str(call.get("name", ""))
         if name in VISUAL_OBSERVATION_TOOL_NAMES:
@@ -1324,14 +1717,238 @@ class ChatBackend:
                     "ok": False,
                     "error": "image review budget exhausted; one screenshot is allowed per turn",
                 }, image_count
-            result = self._invoke_observation(call)
+            result = self._invoke_observation(call, setup_turn=setup_turn)
             # A failed or empty capture must not consume the one-image budget;
             # the model may still retry the visual observation once with a
             # corrected rectangle or after TTS rendering recovers.
             if result.get("ok") is True and isinstance(result.get("image_base64"), str) and result["image_base64"]:
                 return result, image_count + 1
             return result, image_count
-        return self._invoke_observation(call), image_count
+        return self._invoke_observation(call, setup_turn=setup_turn), image_count
+
+    def _validate_setup_candidate_batch(
+        self,
+        commands: list[ParsedCommand],
+    ) -> tuple[list[ParsedCommand], dict[str, Any] | None]:
+        """Bind freeform setup MOVE lines to the live candidate plan.
+
+        The model may still emit the established MOVE syntax, but it cannot
+        pair one operative GUID with another operative's coordinates. The
+        candidate plan also gives the server an authoritative terrain-adjusted
+        y value and footprint for whole-batch spacing checks.
+        """
+        candidate_map = getattr(self._context_local, "setup_candidates", {})
+        batch_candidate_ids = getattr(self._context_local, "setup_batch_candidate_ids", None)
+        if not isinstance(batch_candidate_ids, set):
+            batch_candidate_ids = None
+        if not isinstance(candidate_map, dict) or not candidate_map:
+            if getattr(self._context_local, "setup_context_ready", False):
+                return [], {
+                    "reason": "setup context did not provide any legal placement candidates",
+                }
+            # Preserve direct/manual callers that do not perform the setup
+            # observation first. Production AUTORUN turns fail closed after a
+            # context observation that cannot produce a legal candidate.
+            return commands, None
+
+        normalized: list[ParsedCommand] = []
+        selections: list[dict[str, Any]] = []
+        legal_candidates = [
+            item
+            for item in candidate_map.values()
+            if batch_candidate_ids is None
+            or str(item.get("candidate_id", "")).strip().casefold() in batch_candidate_ids
+        ]
+        selected_candidate_ids: set[str] = set()
+        repaired_candidates: list[dict[str, str]] = []
+        for command in commands:
+            requested: dict[str, float] | None = None
+            candidate: dict[str, Any] | None = None
+            candidate_id = str(command.args.get("candidate_id", "")).strip()
+            if command.action == "setup_candidate_move":
+                exact_matches = [
+                    item
+                    for item in legal_candidates
+                    if str(item.get("candidate_id", "")).strip().casefold() == candidate_id.casefold()
+                ]
+                alias_matches = [
+                    item
+                    for item in legal_candidates
+                    if str(item.get("guid", "")).strip().casefold() == candidate_id.casefold()
+                ]
+                matches = exact_matches or alias_matches
+                candidate = matches[0] if len(matches) == 1 else None
+                if candidate is None and batch_candidate_ids is not None:
+                    candidate = next(
+                        (
+                            item
+                            for item in legal_candidates
+                            if str(item.get("candidate_id", "")).strip().casefold()
+                            not in selected_candidate_ids
+                        ),
+                        None,
+                    )
+                    if candidate is not None:
+                        repaired_candidates.append({
+                            "requested": candidate_id,
+                            "resolved": str(candidate.get("candidate_id", "")).strip(),
+                        })
+                if candidate is None:
+                    return [], {
+                        "reason": "setup candidate is not in the recommended legal batch",
+                        "candidate_id": candidate_id,
+                        "allowed_candidate_ids": sorted(batch_candidate_ids or {
+                            str(item.get("candidate_id", ""))
+                            for item in candidate_map.values()
+                            if str(item.get("candidate_id", "")).strip()
+                        }),
+                        "args": dict(command.args),
+                    }
+                selected_candidate_ids.add(str(candidate.get("candidate_id", "")).strip().casefold())
+                guid = str(candidate.get("guid", "")).strip()
+            else:
+                guid = str(command.args.get("guid", "")).strip()
+                try:
+                    requested = {axis: float(command.args[axis]) for axis in ("x", "y", "z")}
+                except (KeyError, TypeError, ValueError):
+                    return [], {
+                        "reason": "setup MOVE did not contain numeric coordinates",
+                        "args": dict(command.args),
+                    }
+                matches = []
+                candidate_items = (
+                    item for item in candidate_map.values()
+                    if batch_candidate_ids is None
+                    or str(item.get("candidate_id", "")).strip().casefold() in batch_candidate_ids
+                )
+                for item in candidate_items:
+                    if str(item.get("guid", "")).strip().casefold() != guid.casefold():
+                        continue
+                    position = _setup_candidate_position(item)
+                    if position is None:
+                        continue
+                    distance = (
+                        (requested["x"] - position["x"]) ** 2
+                        + (requested["z"] - position["z"]) ** 2
+                    ) ** 0.5
+                    if distance <= _SETUP_CANDIDATE_TOLERANCE:
+                        matches.append((distance, item))
+                if not matches:
+                    alternatives = [
+                        {
+                            "candidate_id": str(item.get("candidate_id", "")),
+                            "position": item.get("position"),
+                        }
+                        for item in candidate_map.values()
+                        if str(item.get("guid", "")).strip().casefold() == guid.casefold()
+                        and (
+                            batch_candidate_ids is None
+                            or str(item.get("candidate_id", "")).strip().casefold() in batch_candidate_ids
+                        )
+                    ][:5]
+                    return [], {
+                        "reason": "setup target does not match a live candidate for the requested GUID",
+                        "guid": guid,
+                        "requested_position": requested,
+                        "alternatives": alternatives,
+                    }
+                candidate = min(matches, key=lambda item: item[0])[1]
+            source_position = _setup_candidate_source_position(candidate)
+            target = _setup_candidate_position(candidate)
+            if target is None:
+                return [], {
+                    "reason": "setup candidate is missing an authoritative position",
+                    "candidate_id": candidate.get("candidate_id"),
+                }
+            if source_position is not None and all(
+                abs(target[axis] - source_position[axis]) <= _SETUP_CANDIDATE_TOLERANCE
+                for axis in ("x", "y", "z")
+            ):
+                return [], {
+                    "reason": "setup candidate would leave the model at its current position",
+                    "candidate_id": candidate.get("candidate_id"),
+                    "guid": guid,
+                    "position": target,
+                }
+            normalized.append(ParsedCommand(
+                command.action,
+                {"guid": guid, **target},
+                command.destructive,
+            ))
+            selections.append({
+                "candidate_id": candidate.get("candidate_id"),
+                "guid": guid,
+                "requested_position": requested or {"candidate_id": candidate_id},
+                "normalized_position": target,
+                "support_guids": candidate.get("support_guids", []),
+            })
+
+        if repaired_candidates:
+            _record_trace("ai_setup_candidate_repaired", repairs=repaired_candidates)
+
+        if len({str(item.get("guid", "")).casefold() for item in selections}) != len(selections):
+            return [], {
+                "reason": "setup batch selected the same model more than once",
+                "selections": selections,
+            }
+
+        for index, left in enumerate(normalized):
+            left_candidate = next(
+                candidate for candidate in candidate_map.values()
+                if str(candidate.get("candidate_id", "")) == str(selections[index].get("candidate_id", ""))
+            )
+            for right_index in range(index):
+                right_candidate = next(
+                    candidate for candidate in candidate_map.values()
+                    if str(candidate.get("candidate_id", "")) == str(selections[right_index].get("candidate_id", ""))
+                )
+                if _setup_candidate_overlaps(left_candidate, right_candidate):
+                    return [], {
+                        "reason": "setup candidates overlap within the requested batch",
+                        "left": selections[index],
+                        "right": selections[right_index],
+                    }
+        return normalized, {"selections": selections}
+
+    def _complete_underfilled_setup_batch(
+        self,
+        commands: list[ParsedCommand],
+        expected_count: int,
+    ) -> tuple[list[ParsedCommand], dict[str, Any] | None]:
+        """Fill a short model response from the fresh authoritative batch."""
+        if not getattr(self._context_local, "setup_context_ready", False):
+            return commands, None
+        candidate_order = getattr(self._context_local, "setup_batch_candidate_order", None)
+        if not isinstance(candidate_order, list) or len(candidate_order) != expected_count:
+            return commands, None
+
+        _, validation = self._validate_setup_candidate_batch(commands)
+        if validation is None or "reason" in validation:
+            return commands, None
+        selected_ids = [
+            str(item.get("candidate_id", "")).strip()
+            for item in validation.get("selections", [])
+            if str(item.get("candidate_id", "")).strip()
+        ]
+        authoritative_ids = [str(candidate_id).strip() for candidate_id in candidate_order]
+        if any(candidate_id.casefold() not in {item.casefold() for item in authoritative_ids} for candidate_id in selected_ids):
+            return commands, None
+
+        completed = [
+            ParsedCommand("setup_candidate_move", {"candidate_id": candidate_id}, False)
+            for candidate_id in authoritative_ids
+        ]
+        details = {
+            "expected_count": expected_count,
+            "model_candidate_ids": selected_ids,
+            "supplied_candidate_ids": [
+                candidate_id
+                for candidate_id in authoritative_ids
+                if candidate_id.casefold() not in {item.casefold() for item in selected_ids}
+            ],
+            "completed_candidate_ids": authoritative_ids,
+        }
+        return completed, details
 
     @staticmethod
     def _observation_failure_report(failures: list[dict[str, Any]] | None = None) -> str:
@@ -1353,7 +1970,7 @@ class ChatBackend:
                 if name:
                     detail = f"{name} failed"
                     break
-        suffix = " I won't assume the Lua bridge is missing. Please provide further instructions or ask me to retry."
+        suffix = " I will keep working with the evidence already available."
         if detail:
             return f"{prefix} {detail}{suffix}"
         return f"{prefix}{suffix}"
@@ -1368,6 +1985,12 @@ class ChatBackend:
         if call_id:
             payload["call_id"] = call_id
         _record_trace("ai_observation_tool_error", **payload)
+
+    def _setup_placeholder_move_fallback(self, text: str) -> str | None:
+        # A prose/placeholder response must not silently switch setup into the
+        # full Save 131 planner. That planner uses a different bridge contract
+        # and was the source of the live nil-handler failure.
+        return None
 
     @staticmethod
     def _extract_tool_calls(payload: Any) -> list[dict[str, Any]]:
@@ -1661,9 +2284,9 @@ class ChatBackend:
         if review_text:
             return _public_ai_text(
                 "I couldn't complete that action, so I stopped. Visual review: "
-                f"{review_text} Please provide further instructions."
+                f"{review_text}"
             )
-        return "I couldn't complete that action, so I stopped. Please provide further instructions."
+        return "I couldn't complete that action, so I stopped."
 
     @staticmethod
     def _normalize_checkers_commands(
@@ -1724,13 +2347,64 @@ class ChatBackend:
         with self._turn_lock:
             text = str(result.get("text", ""))
             raw_commands = parse_ai_commands(text)
-            setup_turn = _is_killteam_autorun_setup_message(payload.get("message"))
+            controller = self.controller_provider() if self.controller_provider else {}
+            setup_turn = _is_killteam_autorun_setup_message(
+                payload.get("message"),
+                controller.get("active_game", "") if isinstance(controller, dict) else "",
+            )
+            setup_batch = getattr(self._context_local, "setup_batch", {})
+            if not isinstance(setup_batch, dict):
+                setup_batch = {}
+            try:
+                expected_setup_moves = int(setup_batch.get("batch_target", 0))
+            except (TypeError, ValueError):
+                expected_setup_moves = 0
+            if setup_turn and expected_setup_moves <= 0:
+                history = self.controller_provider().get("killteam_setup_history", {}) if self.controller_provider else {}
+                try:
+                    expected_setup_moves = int(history.get("batch_size", 0))
+                except (AttributeError, TypeError, ValueError):
+                    expected_setup_moves = 0
+                expected_setup_moves = max(1, expected_setup_moves)
             # The chat-level setup request is a prompt for AI reasoning, not
             # an executable runtime macro. Only the AI's resulting placement
             # commands may mutate the board.
-            setup_move_commands = [command for command in raw_commands if command.action == "move_object"]
+            setup_move_commands = [
+                command
+                for command in raw_commands
+                if command.action in {"move_object", "setup_candidate_move"}
+            ]
             has_autorun = any(command.action == "killteam_autorun_setup" for command in raw_commands)
-            if setup_turn and (has_autorun or len(setup_move_commands) != 1 or len(raw_commands) != 1):
+            setup_keys = [
+                (
+                    "candidate:" + str(command.args.get("candidate_id", "")).strip().lower()
+                    if command.action == "setup_candidate_move"
+                    else "guid:" + str(command.args.get("guid", "")).strip().lower()
+                )
+                for command in setup_move_commands
+            ]
+            duplicate_setup_key = len(setup_keys) != len(set(setup_keys))
+            invalid_setup_shape = bool(
+                has_autorun
+                or len(raw_commands) != len(setup_move_commands)
+                or duplicate_setup_key
+                or len(setup_move_commands) > expected_setup_moves
+            )
+            if setup_turn and not invalid_setup_shape and len(setup_move_commands) < expected_setup_moves:
+                completed_commands, completion = self._complete_underfilled_setup_batch(
+                    setup_move_commands,
+                    expected_setup_moves,
+                )
+                if completion is not None:
+                    setup_move_commands = completed_commands
+                    raw_commands = completed_commands
+                    text = "I am placing the next setup batch."
+                    _record_trace("ai_setup_batch_completed", **completion)
+            if setup_turn and (
+                invalid_setup_shape
+                or len(setup_move_commands) != expected_setup_moves
+                or len(raw_commands) != len(setup_move_commands)
+            ):
                 result["parsed_commands"] = [
                     {"action": item.action, "args": item.args, "destructive": item.destructive}
                     for item in raw_commands
@@ -1741,31 +2415,90 @@ class ChatBackend:
                     "blocked": [{
                         "action": "move_object",
                         "status": "blocked",
-                        "reason": "setup responses must contain exactly one MOVE command and no KILLTEAM_AUTORUN_SETUP echo",
+                        "reason": (
+                            f"setup response must contain exactly {expected_setup_moves} distinct SETUP_MOVE or MOVE commands "
+                            "and no KILLTEAM_AUTORUN_SETUP echo"
+                        ),
                         "args": setup_move_commands[0].args if setup_move_commands else {},
                     }],
                     "stopped": True,
-                    "stop_reason": "setup response was rejected; waiting for player instructions",
+                    "stop_reason": "setup response was rejected",
                 }
-                result["text"] = "I rejected that Kill Team setup response because it was not a single MOVE command."
+                result["text"] = (
+                    "I rejected that Kill Team setup response because it did not contain the required distinct "
+                    f"batch of {expected_setup_moves} setup placement commands."
+                )
                 _record_trace(
                     "ai_setup_response_rejected",
-                    reason="setup response contained multiple commands, a non-MOVE command, or echoed KILLTEAM_AUTORUN_SETUP",
+                    reason="setup response did not contain the required distinct setup batch or echoed KILLTEAM_AUTORUN_SETUP",
                     commands=result["parsed_commands"],
                 )
                 return result
-            commands = [
-                ParsedCommand(
-                    "killteam_setup_place_model",
-                    dict(command.args),
-                    command.destructive,
+            candidate_validation: dict[str, Any] | None = None
+            if setup_turn:
+                validated_setup_commands, candidate_validation = self._validate_setup_candidate_batch(
+                    setup_move_commands,
                 )
-                if setup_turn and command.action == "move_object"
-                else command
-                for command in raw_commands
-                if command.action != "killteam_autorun_setup"
-            ]
-            controller = self.controller_provider() if self.controller_provider else {}
+                if candidate_validation and "reason" in candidate_validation:
+                    result["parsed_commands"] = [
+                        {"action": item.action, "args": item.args, "destructive": item.destructive}
+                        for item in raw_commands
+                    ]
+                    result["execution"] = {
+                        "executed": [],
+                        "approval_required": [],
+                        "blocked": [{
+                            "action": "move_object",
+                            "status": "blocked",
+                            "reason": candidate_validation["reason"],
+                            "args": candidate_validation.get("args") or candidate_validation.get("requested_position") or {},
+                            "candidate_validation": candidate_validation,
+                        }],
+                        "stopped": True,
+                        "stop_reason": "setup candidate validation failed",
+                    }
+                    result["text"] = "I rejected that Kill Team setup batch because its model and target positions did not match the live placement plan."
+                    _record_trace(
+                        "ai_setup_candidate_rejected",
+                        reason=candidate_validation["reason"],
+                        details=candidate_validation,
+                        commands=result["parsed_commands"],
+                    )
+                    return result
+                commands = [
+                    ParsedCommand(
+                        "killteam_setup_place_model",
+                        dict(command.args),
+                        command.destructive,
+                    )
+                    for command in validated_setup_commands
+                ]
+                if candidate_validation:
+                    _record_trace(
+                        "ai_setup_candidates_validated",
+                        selections=candidate_validation.get("selections", []),
+                    )
+                if self._setup_pending_saver is not None:
+                    pending = [
+                        {
+                            "guid": str(command.args.get("guid", "")).strip(),
+                            "target_position": {
+                                axis: float(command.args[axis])
+                                for axis in ("x", "y", "z")
+                            },
+                            "batch_size": setup_batch.get("batch_size"),
+                        }
+                        for command in commands
+                        if str(command.args.get("guid", "")).strip()
+                    ]
+                    self._setup_pending_saver(pending)
+                    _record_trace("ai_setup_pending_recorded", placements=pending)
+            else:
+                commands = [
+                    command
+                    for command in raw_commands
+                    if command.action != "killteam_autorun_setup"
+                ]
             active_checkers = str(controller.get("active_game", "")).strip().lower() == "checkers"
             corrections: list[dict[str, Any]] = []
             # Player chat must never receive the internal board snapshot or
@@ -1857,8 +2590,12 @@ class ChatBackend:
                             continue
                         placement = item.get("result")
                         if isinstance(placement, dict):
+                            if setup_batch.get("batch_size"):
+                                placement = {
+                                    **placement,
+                                    "batch_size": int(setup_batch["batch_size"]),
+                                }
                             self._setup_history_saver(placement)
-                        break
                 if execution.get("executed") or execution.get("approval_required"):
                     _record_trace("ai_commands_processed", commands=result["parsed_commands"], execution=execution)
                 if str(controller.get("state", "")) == "running" and (verified_actions or execution.get("approval_required")):
@@ -1900,6 +2637,107 @@ class ChatBackend:
             r"|i\s+crowned\s+(?:the\s+)?(?:black\s+)?king\s+(?:for\s+you,?\s*)?(?:it(?:'s| is)\s+)?your\s+turn"
         )
         return bool(re.fullmatch(prefix + f"(?:{request})", text))
+
+    @staticmethod
+    def _is_killteam_turn_request(message: str) -> bool:
+        text = re.sub(r"^\s*!ai\s*", "", message, flags=re.IGNORECASE).strip().lower()
+        text = re.sub(r"[.!?]+$", "", text).strip()
+        prefix = r"(?:ai|opponent|enemy)?\s*,?\s*"
+        request = (
+            r"(?:it(?:'s| is)\s+)?your\s+turn"
+            r"|(?:take|play|make)\s+your\s+turn"
+            r"|pass\s+initiative"
+            r"|your\s+move"
+            r"|go\s+ahead"
+            r"|end\s+your\s+turn"
+        )
+        return bool(re.fullmatch(prefix + f"(?:{request})", text))
+
+    def _complete_autonomous_killteam_turn(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Run one AI Kill Team tactical turn and pass initiative onward."""
+        controller = self.controller_provider() if self.controller_provider else {}
+        if str(controller.get("state", "")) != "running":
+            return {
+                "text": "Autonomous Kill Team play is not running. Ask the host to resume it first.",
+                "commands": [],
+            }
+        if self.command_execution is None:
+            return {
+                "text": "I cannot safely play Kill Team because the verified gameplay adapter is unavailable.",
+                "commands": [],
+            }
+
+        try:
+            turn = self.command_execution.request(
+                "killteam_take_tactical_turn",
+                {"trigger": str(payload.get("message", ""))},
+            )
+        except (RuntimeError, ValueError, KeyError) as exc:
+            _record_trace("killteam_autonomous_stop", reason=str(exc))
+            return {
+                "text": f"I stopped Kill Team play safely: {str(exc)[:240]}",
+                "commands": [],
+                "execution": {"status": "stopped", "reason": str(exc)[:500]},
+                "autonomous": True,
+            }
+
+        actions = turn.get("actions", []) if isinstance(turn, dict) else []
+
+        def _describe_action(item: dict[str, Any]) -> str:
+            action = str(item.get("action", "")).strip()
+            result = item.get("result") if isinstance(item.get("result"), dict) else {}
+            if action == "activate_operative":
+                operative = str(result.get("operative_id") or item.get("operative_id") or "")
+                return f"activated {operative}" if operative else "activated an operative"
+            if action == "shoot":
+                target = str(result.get("target_id") or "")
+                weapon = str(result.get("weapon_id") or "")
+                parts = ["shot"]
+                if target:
+                    parts.append(target)
+                if weapon:
+                    parts.append(f"with {weapon}")
+                return " ".join(parts)
+            if action == "move_operative":
+                operative = str(result.get("operative_id") or "")
+                position = result.get("position") if isinstance(result.get("position"), dict) else {}
+                where = ", ".join(
+                    str(position.get(axis))
+                    for axis in ("x", "y", "z")
+                    if axis in position
+                )
+                if operative and where:
+                    return f"moved {operative} to ({where})"
+                if operative:
+                    return f"moved {operative}"
+                return "moved an operative"
+            if action == "end_activation":
+                return "ended activation"
+            return action.replace("_", " ")
+
+        action_summaries = [
+            summary for summary in (_describe_action(item) for item in actions if isinstance(item, dict))
+            if summary
+        ]
+        if action_summaries:
+            text = "I took my Kill Team turn: " + "; ".join(action_summaries) + ". I passed initiative to the next player."
+        else:
+            text = "I had no legal Kill Team action, so I passed initiative to the next player."
+        if self._turn_completed is not None:
+            self._turn_completed("ai")
+        result = {
+            "text": text,
+            "commands": [],
+            "execution": turn,
+            "autonomous": True,
+            "initiative_passed": True,
+        }
+        conversation_id = self._conversation(payload)
+        self.history.append(conversation_id, [
+            {"role": "user", "content": _public_ai_text(str(payload.get("message", "")))},
+            {"role": "assistant", "content": text},
+        ])
+        return result
 
     def _complete_autonomous_checkers_turn(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Run Save 128 Black through the deterministic rules/search seam."""
@@ -1991,6 +2829,23 @@ class ChatBackend:
         self.history.reset(selected)
         return selected
 
+    def complete_start_fresh(self, payload: dict[str, Any], controller_result: dict[str, Any]) -> dict[str, Any]:
+        """Run a fresh-start controller command and immediately launch setup when requested."""
+        result = dict(controller_result)
+        if result.get("fresh_start"):
+            self.reset(str(payload.get("conversation_id", "")))
+        if not result.get("autostart_setup"):
+            return result
+        setup_payload = dict(payload)
+        setup_payload["message"] = "KILLTEAM_AUTORUN_SETUP"
+        setup_result = self.complete(setup_payload)
+        if isinstance(setup_result, dict):
+            setup_result["startup"] = {
+                "fresh_start": True,
+                "controller": result,
+            }
+        return setup_result
+
     def next_message(self, timeout: float) -> dict[str, Any] | None:
         try:
             return self._inbox.get(timeout=max(0.0, min(timeout, 300.0)))
@@ -1999,7 +2854,13 @@ class ChatBackend:
 
     def _queue_for_external_client(self, payload: dict[str, Any]) -> dict[str, Any]:
         payload = dict(payload)
-        payload["tools"] = self._observation_tool_specs()
+        controller = self.controller_provider() if self.controller_provider else {}
+        payload["tools"] = self._observation_tool_specs(
+            setup_turn=_is_killteam_autorun_setup_message(
+                payload.get("message"),
+                controller.get("active_game", "") if isinstance(controller, dict) else "",
+            )
+        )
         payload["tool_call_endpoint"] = "/chat/tool"
         payload["tool_budget"] = {
             "max_calls": self.observation_max_calls,
@@ -2018,7 +2879,14 @@ class ChatBackend:
             raise RuntimeError("AI inbox is full; no external AI client is consuming it") from exc
         return {"text": "", "commands": [], "queued": True, "id": item["id"], "tool_call_endpoint": "/chat/tool"}
 
-    def _complete_command(self, payload: dict[str, Any], messages: list[dict[str, Any]], *, include_tools: bool = True) -> dict[str, Any]:
+    def _complete_command(
+        self,
+        payload: dict[str, Any],
+        messages: list[dict[str, Any]],
+        *,
+        include_tools: bool = True,
+        setup_turn: bool = False,
+    ) -> dict[str, Any]:
         if not _env_bool("TTS_ALLOW_COMMAND_BACKEND"):
             raise RuntimeError("command backend is disabled; set TTS_ALLOW_COMMAND_BACKEND=1 explicitly")
         if not self.command:
@@ -2035,7 +2903,7 @@ class ChatBackend:
         command_payload = dict(payload)
         command_payload["messages"] = messages
         if include_tools:
-            command_payload["tools"] = self._observation_tool_specs()
+            command_payload["tools"] = self._observation_tool_specs(setup_turn=setup_turn)
         encoded = json.dumps(command_payload, ensure_ascii=False)
         _record_trace(
             "ai_backend_outbound",
@@ -2083,11 +2951,17 @@ class ChatBackend:
         observation_failures: list[dict[str, Any]] = []
         observation_successes = 0
         current = list(messages)
+        controller = self.controller_provider() if self.controller_provider else {}
+        setup_turn = _is_killteam_autorun_setup_message(
+            payload.get("message"),
+            controller.get("active_game", "") if isinstance(controller, dict) else "",
+        )
         while True:
             result = self._complete_command(
                 payload,
                 current,
                 include_tools=tool_count < self.observation_max_calls,
+                setup_turn=setup_turn,
             )
             calls = self._extract_tool_calls(result.get("backend_response"))
             if not calls:
@@ -2106,9 +2980,13 @@ class ChatBackend:
             current.append(self._assistant_tool_message(result.get("backend_response")))
             for call in calls[:remaining]:
                 try:
-                    name, arguments = self._validate_observation_call(call)
+                    name, arguments = self._validate_observation_call(call, setup_turn=setup_turn)
                     normalized_call = {"id": call.get("id", uuid.uuid4().hex), "name": name, "arguments": arguments}
-                    tool_result, image_count = self._invoke_observation_with_image_budget(normalized_call, image_count)
+                    tool_result, image_count = self._invoke_observation_with_image_budget(
+                        normalized_call,
+                        image_count,
+                        setup_turn=setup_turn,
+                    )
                 except (TypeError, ValueError) as exc:
                     normalized_call = {"id": call.get("id", uuid.uuid4().hex), "name": str(call.get("name", "")), "arguments": {}}
                     tool_result = {"ok": False, "error": str(exc)[:300]}
@@ -2129,7 +3007,14 @@ class ChatBackend:
                     "content": "The read-only observation budget is exhausted. Do not request another tool; answer using the evidence already returned.",
                 })
 
-    def _http_request(self, payload: dict[str, Any], messages: list[dict[str, Any]], *, include_tools: bool = True) -> Any:
+    def _http_request(
+        self,
+        payload: dict[str, Any],
+        messages: list[dict[str, Any]],
+        *,
+        include_tools: bool = True,
+        setup_turn: bool = False,
+    ) -> Any:
         native_ollama = self.format == "ollama" or self.url.rstrip("/").endswith("/api/chat")
         if native_ollama:
             request_payload: dict[str, Any] = {
@@ -2154,7 +3039,7 @@ class ChatBackend:
             if self.model:
                 request_payload["model"] = self.model
         if include_tools:
-            request_payload["tools"] = self._observation_tool_specs()
+            request_payload["tools"] = self._observation_tool_specs(setup_turn=setup_turn)
 
         encoded = json.dumps(request_payload).encode("utf-8")
         headers = {"Content-Type": "application/json", "Accept": "application/json"}
@@ -2211,27 +3096,54 @@ class ChatBackend:
         checkers_legal_moves: list[dict[str, Any]] = []
         checkers_mandatory_capture = False
         current = list(messages)
-        setup_turn = _is_killteam_autorun_setup_message(payload.get("message"))
-        setup_retry_applied = False
+        controller = self.controller_provider() if self.controller_provider else {}
+        setup_turn = _is_killteam_autorun_setup_message(
+            payload.get("message"),
+            controller.get("active_game", "") if isinstance(controller, dict) else "",
+        )
+        setup_retry_count = 0
+        setup_retry_limit = 3
         response: Any = None
         while True:
-            response = self._http_request(payload, current, include_tools=tool_count < self.observation_max_calls)
+            response = self._http_request(
+                payload,
+                current,
+                include_tools=tool_count < self.observation_max_calls,
+                setup_turn=setup_turn,
+            )
             calls = self._extract_tool_calls(response)
             if not calls:
                 text = _extract_text(response)
                 commands, placement_commands, has_autorun = _setup_command_summary(text)
-                if setup_turn and not setup_retry_applied and not commands:
+                if setup_turn and not commands:
+                    resolved_text = self._setup_placeholder_move_fallback(text)
+                    if resolved_text:
+                        return {
+                            "text": resolved_text,
+                            "commands": [],
+                            "backend_response": response,
+                            "observation_failures": observation_failures,
+                            "observation_successes": observation_successes,
+                            "_checkers_legal_moves": checkers_legal_moves,
+                            "_checkers_mandatory_capture": checkers_mandatory_capture,
+                        }
+                if setup_turn and not commands and setup_retry_count < setup_retry_limit:
                     _record_trace(
                         "ai_setup_retry_requested",
                         reason="backend returned prose without tool calls",
+                        attempt=setup_retry_count + 1,
                         response=response,
                     )
                     current.append(self._assistant_tool_message(response))
+                    budget_exhausted = (
+                        tool_count >= self.observation_max_calls
+                        or time.monotonic() - started >= self.observation_timeout
+                    )
                     current.append({
                         "role": "system",
-                        "content": _setup_repair_prompt(),
+                        "content": _setup_finalize_prompt() if budget_exhausted else _setup_repair_prompt(),
                     })
-                    setup_retry_applied = True
+                    setup_retry_count += 1
                     continue
                 if observation_failures and not observation_successes:
                     text = self._observation_failure_report(observation_failures)
@@ -2240,17 +3152,15 @@ class ChatBackend:
                         "I reached my response limit before I could finish analyzing the board, so I stopped. "
                         "Please provide further instructions."
                     )
-                if setup_turn and setup_retry_applied and not commands:
+                if setup_turn and not commands:
                     _record_trace(
                         "ai_setup_retry_failed",
                         reason="backend still did not emit a placement command",
+                        attempts=setup_retry_count,
                         response=response,
                     )
                     return {
-                        "text": (
-                            "I could not get a valid setup placement command from the AI. "
-                            "Please retry the setup request."
-                        ),
+                        "text": "I could not complete the setup automatically.",
                         "commands": [],
                         "backend_response": response,
                         "observation_failures": observation_failures,
@@ -2275,9 +3185,13 @@ class ChatBackend:
             current.append(self._assistant_tool_message(response))
             for call in calls[:remaining]:
                 try:
-                    name, arguments = self._validate_observation_call(call)
+                    name, arguments = self._validate_observation_call(call, setup_turn=setup_turn)
                     normalized_call = {"id": call.get("id", uuid.uuid4().hex), "name": name, "arguments": arguments}
-                    result, image_count = self._invoke_observation_with_image_budget(normalized_call, image_count)
+                    result, image_count = self._invoke_observation_with_image_budget(
+                        normalized_call,
+                        image_count,
+                        setup_turn=setup_turn,
+                    )
                 except (TypeError, ValueError) as exc:
                     result = {"ok": False, "error": str(exc)[:300]}
                     normalized_call = {"id": call.get("id", uuid.uuid4().hex), "name": str(call.get("name", "")), "arguments": {}}
@@ -2305,12 +3219,21 @@ class ChatBackend:
             if tool_count >= self.observation_max_calls or time.monotonic() - started >= self.observation_timeout:
                 current.append({
                     "role": "system",
-                    "content": "The read-only observation budget is exhausted. Do not request another tool; answer using the evidence already returned.",
+                    "content": (
+                        _setup_finalize_prompt()
+                        if setup_turn
+                        else "The read-only observation budget is exhausted. Do not request another tool; answer using the evidence already returned."
+                    ),
                 })
 
     def complete(self, payload: dict[str, Any]) -> dict[str, Any]:
         if not self.enabled:
             raise RuntimeError("AI backend is stopped. Start it from /admin.")
+        self._context_local.setup_batch = {}
+        self._context_local.setup_candidates = {}
+        self._context_local.setup_batch_candidate_ids = set()
+        self._context_local.setup_batch_candidate_order = []
+        self._context_local.setup_context_ready = False
         message = str(payload.get("message", ""))
         payload = dict(payload)
         payload.setdefault("message", message)
@@ -2336,6 +3259,11 @@ class ChatBackend:
             and self._is_checkers_turn_request(message)
         ):
             return self._complete_autonomous_checkers_turn(payload)
+        if (
+            str(controller.get("active_game", "")).strip().lower() == "killteam"
+            and self._is_killteam_turn_request(message)
+        ):
+            return self._complete_autonomous_killteam_turn(payload)
         _record_trace(
             "ai_request_start",
             direction="gateway_to_ai_backend",
@@ -2611,9 +3539,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 is_host=is_host,
             )
             payload.setdefault("conversation_id", self.controller.conversation_id())
-            if str(payload.get("message", "")).strip().lower() == "!ai start fresh":
-                self.backend.reset(payload["conversation_id"])
-            result = defense_result or setup_result or draw_result or command_result or self.backend.complete(payload)
+            if isinstance(command_result, dict) and command_result.get("fresh_start"):
+                result = self.backend.complete_start_fresh(payload, command_result)
+            else:
+                result = defense_result or setup_result or draw_result or command_result or self.backend.complete(payload)
             _record_trace(
                 "ai_message_response",
                 direction="ai_gateway_to_tts",
@@ -2693,6 +3622,7 @@ class HttpGateway:
             game_position_provider=controller.game_position,
             game_position_saver=controller.set_game_position,
             setup_history_saver=controller.record_setup_placement,
+            setup_pending_saver=controller.record_setup_pending,
             turn_completed=controller.advance_turn,
         )
         controller.set_approval_executor(

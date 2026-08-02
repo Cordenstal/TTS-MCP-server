@@ -208,6 +208,9 @@ backlog is tracked in [Kill Team opponent tickets](killteam-tickets.md).
 - `[done]` Implement the typed rules adapter for one ranged activation.
 - `[partial]` Implement semantic movement, shooting, dice rolling, saves,
   damage, and wounds. Resource/scoring projections remain.
+- `[done]` Route Kill Team `Your turn` prompts to a bounded tactical-turn
+  request that claims the initiative token, performs one legal AI action, and
+  passes initiative to the next player.
 - `[partial]` Add uncertain-commit recovery and action idempotency. Human-event
   reconciliation and host rulings remain.
 - `[done]` Validate the first slice against a deterministic fake bridge.
@@ -272,6 +275,65 @@ ranged-action slice:
 12. `[done]` Add a placement-only Kill Team setup bridge and runtime that can
     ping, list objects, and place a live model at an exact coordinate without
     loading the larger setup/combat runtime.
+
+## 12. Setup expansion — next
+
+The runtime already has the first playable setup slice: roster/deployment
+cadence, a tactical placement planner, and the Save 131 validation path. KT-018
+through KT-021 are now settled. Model placement is complete; the next setup
+slice covers operative tokens, equipment, and other non-model fixtures.
+`KILLTEAM_AUTORUN_SETUP` is a bounded AI placement turn through the
+placement-only bridge, not a full-runtime batch macro. The gateway advertises
+only setup ping and compact setup context, and the runtime verifies one
+terrain-aware placement before stopping. The fresh-start launcher for a new
+game is `!ai start fresh killteam`; it selects Kill Team if needed and then
+starts the autorun setup path.
+
+- `[done]` Define the deployment-context snapshot and occupancy rules that the
+  setup planner will trust before it scores any slot. This is the
+  geometry-and-staleness foundation for KT-016.
+- `[done]` Add candidate generation and tactical scoring for cover, exposure,
+  objective pressure, friendly spacing, hostile threat lanes, and faction
+  style. This is the core placement-policy work for KT-017.
+- `[done]` Wire the planner into the setup state machine so each alternating
+  pass advances the correct side and batch instead of falling back to a
+  zone-center move. This is KT-018.
+- `[done]` Define the setup recovery policy so fresh-start, human
+  reconciliation, pending placements, and uncertain commits behave
+  predictably. This is KT-019.
+- `[done]` Lock the regression matrix and docs alignment so dense boards,
+  blockers, objectives, and stale revisions stay covered by deterministic
+  tests and live validation notes. This is KT-020.
+- `[done]` Route `KILLTEAM_AUTORUN_SETUP` to one AI-authored `MOVE` turn with a
+  placement-only context tool; keep terrain-aware y adjustment and model
+  collision validation in the placement runtime. This is KT-021.
+- `[next]` Add setup placement for operative tokens, equipment, and other
+  non-model fixtures using a separate bounded fixture-placement ticket. This is
+  KT-022.
+
+Completion criteria:
+
+1. Setup can explain why a slot is legal, blocked, or stale before it moves a
+   model.
+2. The planner can pick a non-center slot based on actual board context.
+3. Re-running setup on the same board yields the same choice and the same
+   recovery behavior.
+4. The docs and regression matrix describe the same setup contract as the
+   runtime plan.
+5. Setup-time tokens and equipment have their own bounded placement contract
+   instead of being folded into the model-placement workflow.
+
+### Setup expansion workplan
+
+Work the remaining setup expansion in the following order so the next layer
+has the state it depends on before it lands:
+
+1. KT-022, because token and equipment placement should build on the completed
+   model-placement contract instead of widening it.
+
+Each ticket should finish with tests and docs for its own scope before the
+next one starts. That keeps the runtime changes reviewable and avoids
+accidentally broadening the setup contract while it is still being shaped.
 
 ## Later implementation order
 

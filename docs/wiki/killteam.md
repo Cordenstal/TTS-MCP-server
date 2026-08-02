@@ -68,6 +68,98 @@ roster locking, and deployment cadence in the typed state machine.
 The generic object scan first tries the canonical `tts_mcp:` setup tags, then
 falls back to a raw compact scene scan when that canonical scan is empty.
 
+### Setup contract gaps
+
+The current implementation already covers the Save 131 setup-validation
+vertical slice, the roster/deployment cadence, the tactical placement
+planner, and the KT-018 through KT-020 setup contract. The remaining setup
+work is KT-021 gateway enforcement for `KILLTEAM_AUTORUN_SETUP`.
+
+- KT-021: what the gateway must do to keep `KILLTEAM_AUTORUN_SETUP` on the
+  planner-backed legal slot path and fail closed when no legal slot exists.
+
+### Setup decision checklist
+
+KT-018 through KT-020 are settled and the answers below are now reflected in
+the runtime, tests, and backlog. KT-021 remains open.
+
+1. KT-016: What exact board-context facts must the planner trust before it
+   scores a deployment slot?
+   - Decide the minimum live geometry, occupancy, objective, and revision
+     snapshot the planner can rely on.
+   - Decide which stale-context conditions fail closed.
+   - Decide whether the context is derived once per setup turn or refreshed
+     before every placement recommendation.
+2. KT-017: How should legal setup slots be ranked?
+   - Decide the score inputs for cover, exposure, objective pressure, friendly
+     spacing, hostile lanes, and faction style.
+   - Decide the tie-break order so repeated planning is deterministic.
+   - Decide whether the current `ceil(N/3)` cadence should prefer safety,
+     pressure, or a named faction policy when those preferences conflict.
+3. KT-018: What ends a setup pass and how does the next side advance?
+   - Decide whether the current alternating cadence is fixed or configurable.
+   - Decide how the current batch is preserved across repeated observations.
+   - Decide what happens when a side has no remaining legal placements or the
+     planner cannot improve the current pass.
+4. KT-019: What setup history survives recovery?
+   - Decide what `!ai start fresh` clears versus preserves.
+   - Decide how human reconciliation resumes AI setup after a human batch.
+   - Decide how pending placements and uncertain commits are retried, rolled
+     back, or invalidated.
+5. KT-020: What proves the setup contract is settled?
+   - Decide the deterministic fixture matrix for dense boards, blockers,
+     objectives, hostile pressure, and stale revisions.
+   - Decide which live Save 131 scenarios remain mandatory.
+   - Decide which public docs and API references must change with the final
+     contract.
+
+### Setup decision table
+
+| Ticket | Current state | Settled answer | Default owner |
+| --- | --- | --- | --- |
+| KT-016 | The runtime already builds a live deployment snapshot for setup planning, including deployment-zone bounds, terrain blockers, objectives, and visible occupancy. | Settled: one revision-stamped snapshot per setup turn with hard stale-context gates on map revision, occupancy, objective, and support-height changes. | Runtime + docs |
+| KT-017 | The runtime already computes a tactical recommended position from live geometry and faction play style. | Settled: explicit faction-style mapping first, then deterministic tie-breaks over priority, objective distance, cover, threat distance, exposure, path distance, and board coordinates. | Runtime + docs |
+| KT-018 | The runtime already tracks alternating setup passes, batch progress, and pass completion after successful placements. | Settled: `ceil(N/3)` remains the cadence, batch carry-forward is stable across repeated observations, and the pass advances when the batch is complete or no legal placements remain. | Runtime + gameplay |
+| KT-019 | The runtime already has rollback and reconciliation hooks for setup deployment. | Settled: `!ai start fresh` clears setup history, human reconciliation resumes only after explicit batch acknowledgment, and unsafe uncertain commits stay in read-only recovery. | Runtime + controller |
+| KT-020 | The docs, tickets, and API pages now agree that the setup slice exists but is still contract-staged. | Settled: deterministic dense-board fixtures, Save 131 live validation notes, and docs/API wording now match the geometry-aware setup contract. | Docs + tests |
+
+### Setup grilling sequence
+
+| Step | Ticket | Question | Recommended answer |
+| --- | --- | --- | --- |
+| 1 | KT-016 | What is the minimum board-context snapshot the planner must trust before it ranks a slot? | Use one revision-stamped snapshot per setup turn with deployment-zone bounds, terrain support surfaces, objective footprints, visible friendly/enemy occupancy, support-height metadata, and a hard stale-context gate on map revision or affecting occupancy/objective/support changes. |
+| 2 | KT-017 | What should the planner optimize when multiple legal slots exist? | Use an explicit faction-style map first, fall back to tag inference, and break ties deterministically after the style-specific priority, objective distance, cover, threat distance, exposure, path distance, and board coordinates. |
+| 3 | KT-018 | What ends a setup pass and advances the next side? | Keep the alternating cadence with `ceil(N/3)` as the default, keep the current batch fixed until it is complete, and advance once the batch is done unless the board is stale or ambiguous. |
+| 4 | KT-019 | What setup history survives recovery and host reset? | Make `!ai start fresh` a full table reset back to selected teams, add a separate board-reset command that preserves team and roster choices while clearing deployed board state, resume only after explicit human batch-complete acknowledgment, and use read-only recovery for unsafe uncertain commits. |
+| 5 | KT-020 | What proves the setup contract is stable enough to freeze? | Lock a deterministic fixture matrix, keep Save 131 as the canonical live validation path, add fixture-specific live checklists only when a new profile is supported, and update the docs and API wording to match the final contract. |
+
+### Settled decisions
+
+- KT-016 is a per-turn revision-stamped snapshot, not an indefinite cache.
+- KT-016 fails closed on geometry revision changes and on occupancy,
+  objective, or support-height changes that affect legality or scoring.
+- KT-017 uses an explicit faction-style map first, with tag inference as the
+  fallback.
+- KT-017 keeps deterministic tie-breaks after the style-specific priority,
+  objective distance, cover, threat distance, exposure, path distance, and
+  board coordinates.
+- KT-018 keeps `ceil(N/3)` as the default cadence and fixes the current batch
+  until it is complete.
+- KT-018 advances once the batch is complete unless the board is stale or
+  ambiguous.
+- KT-019 makes `!ai start fresh` a full table reset to the selected-team
+  point.
+- KT-019 adds a separate board-reset command that preserves the selected teams
+  and roster choices while clearing deployed board state.
+- KT-019 resumes setup only after explicit human acknowledgment that the batch
+  is complete.
+- KT-019 rolls back uncertain or partial commits only when the runtime can
+  prove the rollback is safe; otherwise it stops in read-only recovery.
+- KT-020 treats Save 131 as the canonical live validation path.
+- KT-020 requires deterministic coverage for dense boards, boundary slots,
+  overlaps, objectives, hostile pressure lanes, friendly spacing, stale
+  revisions, and the current Save 131 flow.
+
 ## Observation and map model
 
 Before each activation and before each attack, the AI must obtain a fresh
@@ -83,24 +175,40 @@ tags and exact anchors; the Lua bridge does not hard-code this fixture and
 falls back to a raw compact scene enumeration only when the canonical tagged
 scan is empty.
 The placement-only setup bridge is separate from that full runtime. It
-exposes `tts_killteam_setup_ping`, `tts_killteam_setup_list_objects`, and
-`tts_killteam_setup_place_model` for manual or debug compatibility, and the
-same bridge accepts the move alias used by the AI-owned setup turn.
+exposes `tts_killteam_setup_ping`, `tts_killteam_setup_context`,
+`tts_killteam_setup_list_objects`, and `tts_killteam_setup_place_model` for
+manual or debug compatibility. The AI-owned setup turn uses the dedicated
+placement action; the legacy move alias remains available for compatibility.
+The context tool includes only explicitly tagged
+live operatives, terrain, deployment-zone, and objective objects so the AI can
+inspect the footprint before it commits to a position. During this turn the
+gateway does not advertise or invoke the full setup or Save 131 planner. A
+missing or malformed MOVE is rejected rather than replaced by a center or
+planner fallback.
 `tts_killteam_setup_ping` now verifies that the loaded Global script matches
 the checked-in `tts_killteam_setup_global.lua` before any placement command
 runs.
 `KILLTEAM_AUTORUN_SETUP` is a chat-level AI setup request, not a runtime Lua
-macro; the gateway turns it into one bounded AI placement turn through the
-placement bridge and then stops for that turn.
+  macro; the gateway turns it into one bounded AI placement batch through the
+  placement bridge and then stops for that turn. The batch size is fixed at
+  `ceil(N/3)` for the setup session, so six Plague Marines are placed as `2+2+2`.
 `tts_killteam_observe` then returns the current revision, observation ID,
 visible operative records, terrain, AI dice references, counters, roller GUID,
 and an explicit truncation flag. Setup is a start-of-game operation and must
 not be repeated during an activation. The gateway exposes these two bounded
 tools to the AI backend. The gateway also accepts the bounded semantic
 `tts_killteam_plan_objective_move` planner for objective-control placement and
-`MOVE[guid,x,y,z]` command for initial AI placement; the runtime uses the live
+`SETUP_MOVE[candidate_id]` command for initial AI placement; the runtime uses the live
 figurine GUID at the move step and keeps the semantic operative identity
 separate. Activation and attacks remain on the semantic MCP interface.
+
+During AI-owned setup and the deployment smoke test, the runtime now projects
+the placement `y` value onto the highest terrain support under the model
+footprint so elevated terrain is respected instead of clipping the model into
+the surface. The bridge reports the support surface used, and the runtime
+accepts the elevated read-back only when it matches that evidence. If another
+model or objective occupies the footprint, the slot is rejected and the AI must
+choose a different position.
 
 `tts_killteam_probe_line_of_sight` is the bounded physical visibility query.
 It accepts semantic attacker and visible-target IDs, converts them to TTS
@@ -161,6 +269,22 @@ height above that plane. Setup calibration defines the board origin, axis
 orientation, ground height, and world-units-per-inch scale. Rules calculations
 use Kill Team inches; TTS coordinates are used for placement and physical
 queries.
+
+Placement candidates are server-owned records rather than independent AI
+coordinate guesses. A candidate binds one eligible, undeployed AI operative
+GUID to one target and footprint, while every live operative remains an
+occupancy blocker, including already placed AI and opponent models. Setup
+rejects a target copied from another model, rejects a same-position no-op,
+validates all candidates in the batch before dispatch, and then rechecks
+occupancy after each verified placement. Elevated terrain support determines
+the final `y`; for zero-size deployment LayoutZones, the zone transform scale
+supplies the horizontal deployment rectangle.
+
+A fresh setup context also fixes the authoritative batch order for the turn.
+If the model returns only part of that batch, the gateway fills the missing
+candidate IDs from the ordered recommendation and validates the complete batch
+before any mutation. This prevents response-formatting omissions from stopping
+a resumed setup pass without allowing guessed or stale placements.
 
 For `TS_Save_131.json`, the profile declares one TTS world unit per inch and
 validates the unique `combat_zone` LayoutZone at approximately 30 by 22 world
@@ -247,6 +371,7 @@ slices. The public MCP entry points are
 `tts_killteam_setup_place_model`, `tts_killteam_get_roster`,
 `tts_killteam_plan_objective_move`,
 `tts_killteam_select_roster_card`,
+`tts_killteam_select_setup_card`,
 `tts_killteam_lock_rosters`, `tts_killteam_start_setup_deployment`,
 `tts_killteam_deploy_setup_operative`,
 `tts_killteam_rollback_pending_deployment`,
@@ -260,13 +385,21 @@ isolated deployment smoke test with `KILLTEAM_DEPLOY_TEST` and
 starts the fixture pipeline with `KILLTEAM_VALIDATE_SETUP[action_id]`. The
 fixture pipeline resumes only
 when authenticated Red or host chat says `Defense roll complete`.
+During live play the chat gateway also recognizes `Your turn` and related
+initiative-pass prompts while Kill Team is active, routes them to the tactical
+turn request, claims the initiative token for the AI side, executes one
+bounded tactical action, ends activation, and then passes initiative to the
+next player before waiting for the next prompt.
 The placement-only setup bridge also accepts `KILLTEAM_SETUP_PLACE[guid,x,y,z]`
 for exact model placement without loading the broader setup state machine.
 The chat gateway also accepts `KILLTEAM_AUTORUN_SETUP` for the AI-owned setup
 pass when the full runtime Lua bridge is loaded. With the placement-only
 bridge, use `MOVE[guid,x,y,z]` after resolving the live object through
 `tts_killteam_setup_list_objects`. The bridge-level `KILLTEAM_SETUP_PLACE`
-form remains available for manual or lower-level debugging paths.
+form remains available for manual or lower-level debugging paths. The
+placement bridge also projects the final `y` onto terrain support when a
+terrain piece intersects the chosen footprint, rather than trusting the raw
+requested `y`.
 
 ### Setup deployment state machine
 
@@ -281,26 +414,43 @@ Semantic pregame setup follows this bounded sequence:
    selection can begin immediately. Use `tts_killteam_roll_initiative` only
    when the host explicitly overrides that default and wants a physical
    initiative roll instead.
-3. `KILLTEAM_AUTORUN_SETUP` starts an AI-owned setup pass. The AI observes the
-   live placement objects, selects exactly one AI model by role priority and
-   board context, chooses a tactical legal position, and emits exactly one
-   `MOVE[guid,x,y,z]`. The gateway translates that move into the setup
-   runtime's verified placement path, which validates the selected GUID and
-   coordinates, then the AI stops for that turn. The controller persists the
-   placed GUIDs so a later `KILLTEAM_AUTORUN_SETUP` call resumes from the last
-   finished placement instead of repeating the same model. Use `!ai start
+3. `KILLTEAM_AUTORUN_SETUP` starts an AI-owned setup pass. The game begins with
+   initiative, then the AI selects its operatives, then selects any available
+   setup cards such as equipment, ploys, or tactical-op cards, and only then
+   starts deployment. The AI observes the live placement objects and setup
+   candidates, selects the required number of distinct AI models by role
+   priority and board context, chooses distinct tactical legal positions from
+   the returned `recommended_batch`, and emits one `SETUP_MOVE[candidate_id]`
+   per recommended model. Candidate IDs outside that batch are not legal for
+   the current turn. The
+   gateway translates those moves into sequential verified placement actions,
+   which validate each selected GUID and coordinate. The controller persists
+   every successful GUID so a later `KILLTEAM_AUTORUN_SETUP` call resumes from
+   the last finished placement instead of repeating the same model. Use `!ai start
    fresh` to clear that setup history. The human never selects or moves an AI
-   model.
+   model. If the observation budget runs out before the model emits a
+   placement, the gateway switches to a setup-command-only completion prompt instead of
+   asking for more tools it can no longer request.
+   Clear natural-language requests such as "place your next model" use the
+   same resume path. Existing setup history is normalized by GUID so repeated
+   or legacy records do not reset the AI's remaining batch. If the bridge's
+   ranked recommendations contain already-placed models, the gateway refills
+   the legal batch from the remaining bridge candidates while preserving
+   distinct footprints. The persisted placed GUIDs are also supplied to the
+   context collector before ranking, so normal second-round planning excludes
+   completed models at the source.
 4. Deployment then follows the configured cadence: starting with the AI-first
    `initiative_side` unless the host overrode it, each side alternates setup
-   passes and places `floor(N/3)` operatives per pass, with a minimum pass of
+   passes and places `ceil(N/3)` operatives per pass, with a minimum pass of
    one operative and a smaller final remainder when fewer remain.
 5. The human side places only its own current batch directly into its deployment
    zone. After the human reports that batch placed, the AI sends another
    `KILLTEAM_AUTORUN_SETUP` request; the gateway calls
    `tts_killteam_reconcile_setup_step` to detect and validate the human models,
    consumes the batch, and then performs one new AI placement turn.
-   Reconciliation is never used to place AI models.
+   Reconciliation is never used to place AI models. For a brand-new game, use
+   `!ai start fresh killteam` to clear controller history, select Kill Team if
+   needed, and immediately enter this autorun setup path.
 6. The AI setup planner derives its play style from faction tags. Teams with
    aggressive melee or pressure tags prefer objective pressure and forward
    lanes; ranged or precision-oriented factions prefer cover and standoff
@@ -309,6 +459,18 @@ Semantic pregame setup follows this bounded sequence:
    deployed operative receives a starting `Conceal` order. The lower-level
    roster-card selection and lock actions remain available for tables that
    explicitly use physical roster-card lists.
+
+The setup contract is therefore still intentionally staged: the runtime
+already supports the first playable slice, but the docs and backlog still need
+to settle geometry, ranking policy, turn-order nuances, recovery semantics,
+and the regression matrix before the setup path is considered complete. The
+live AI setup plan also exposes ranked deployment evidence in
+`recommended_position_evidence`, including the candidate order, support
+height, and score metadata for the next legal slot. The dedicated setup
+listing also returns live object bounds so the runtime can compute that
+support height from the footprint actually occupied on the table. If Kill Team
+is already the active game, `!ai start fresh` performs the same reset and
+resumes autorun setup.
 
 The runtime exposes semantic actions such as `move_operative`, `shoot`,
 `roll_attack_dice`, `score_objective`, `gain_cp`, and `spend_cp`. GUIDs are

@@ -9,6 +9,7 @@ from tts_mcp.runtime.gameplay_runtime import (
     CommandExecution,
     GamePromptBuilder,
     Intent,
+    ParsedCommand,
     classify_intent,
     parse_ai_commands,
     ScenePlacementIntelligence,
@@ -557,7 +558,8 @@ def test_command_execution_runs_autonomous_killteam_setup_macro() -> None:
     )
 
     assert result["executed"][0]["status"] == "executed"
-    assert result["executed"][0]["result"]["final_state"]["current_side"] == "opponent"
+    setup_result = result["executed"][0]["result"]["executed"][0]["result"]
+    assert setup_result["final_state"]["current_side"] == "opponent"
     assert [action for action, _ in calls] == [
         "tts_killteam_observe",
         "tts_killteam_setup",
@@ -573,6 +575,62 @@ def test_command_execution_runs_autonomous_killteam_setup_macro() -> None:
         "tts_killteam_deploy_setup_operative",
         "tts_killteam_observe",
         "tts_killteam_reconcile_setup_step",
+        "tts_killteam_observe",
+    ]
+
+
+def test_command_execution_supports_non_operative_setup_card_selection() -> None:
+    calls: list[tuple[str, dict]] = []
+    state = {"step": 0}
+
+    def snapshot() -> dict:
+        if state["step"] == 0:
+            return {
+                "stage": "roster_selection",
+                "current_side": "ai",
+                "current_batch_target": 0,
+                "current_batch_progress": 0,
+                "next_action": {
+                    "type": "select_setup_card",
+                    "card_guid": "card-ai-equipment-1",
+                    "card_kind": "equipment",
+                },
+                "sides": {
+                    "ai": {"selected_count": 0, "selected_setup_count": 0, "deployed_count": 0, "remaining_count": 0, "batch_size": 2},
+                    "opponent": {"selected_count": 0, "selected_setup_count": 0, "deployed_count": 0, "remaining_count": 0, "batch_size": 2},
+                },
+            }
+        return {
+            "stage": "complete",
+            "current_side": None,
+            "current_batch_target": 0,
+            "current_batch_progress": 0,
+            "sides": {
+                "ai": {"selected_count": 0, "selected_setup_count": 1, "deployed_count": 0, "remaining_count": 0, "batch_size": 2},
+                "opponent": {"selected_count": 0, "selected_setup_count": 0, "deployed_count": 0, "remaining_count": 0, "batch_size": 2},
+            },
+        }
+
+    def request(action: str, args: dict) -> dict:
+        calls.append((action, args))
+        if action == "tts_killteam_observe":
+            return {"setup": snapshot()}
+        if action == "tts_killteam_select_setup_card":
+            assert args == {"contained_guid": "card-ai-equipment-1", "card_kind": "equipment"}
+            state["step"] = 1
+            return {"status": "selected", "guid": args["contained_guid"], "card_kind": "equipment", "selected_count": 1}
+        raise AssertionError(f"unexpected action {action}")
+
+    result = CommandExecution(request, lambda _: "unused").execute(
+        parse_ai_commands("KILLTEAM_AUTORUN_SETUP"),
+        running=False,
+        active_game="killteam",
+    )
+
+    assert result["executed"][0]["status"] == "executed"
+    assert [action for action, _ in calls] == [
+        "tts_killteam_observe",
+        "tts_killteam_select_setup_card",
         "tts_killteam_observe",
     ]
 
@@ -627,7 +685,7 @@ def test_autonomous_killteam_setup_reconciles_human_batch_then_resumes_ai() -> N
         active_game="killteam",
     )
 
-    final_state = result["executed"][0]["result"]["final_state"]
+    final_state = result["executed"][0]["result"]["executed"][0]["result"]["final_state"]
     assert final_state["stage"] == "complete"
     assert [action for action, _ in calls] == [
         "tts_killteam_observe",
@@ -665,6 +723,14 @@ def test_parser_supports_guid_based_killteam_deployment() -> None:
         "y": 1.0,
         "z": 3.5,
     }
+
+
+def test_parser_supports_killteam_setup_card_selection() -> None:
+    commands = parse_ai_commands("KILLTEAM_SELECT_SETUP[card-ai-equipment-1]")
+
+    assert len(commands) == 1
+    assert commands[0].action == "killteam_select_setup_card"
+    assert commands[0].args == {"contained_guid": "card-ai-equipment-1"}
 
 
 def test_parser_supports_v6_catalog_spawn_and_place() -> None:
@@ -878,6 +944,23 @@ def test_location_context_returns_exact_live_position() -> None:
 
 
 class KillTeamCommandProtocolTests(unittest.TestCase):
+    def test_setup_candidate_move_parses_without_coordinate_transcription(self) -> None:
+        commands = parse_ai_commands("SETUP_MOVE[setup-0e43c7-00]")
+
+        self.assertEqual(commands, [
+            ParsedCommand("setup_candidate_move", {"candidate_id": "setup-0e43c7-00"})
+        ])
+
+    def test_setup_candidate_move_ignores_prompt_examples_inside_prose(self) -> None:
+        commands = parse_ai_commands(
+            "Use `SETUP_MOVE[candidate_id]` exactly once.\n"
+            "SETUP_MOVE[setup-0e43c7-00]\n"
+        )
+
+        self.assertEqual(commands, [
+            ParsedCommand("setup_candidate_move", {"candidate_id": "setup-0e43c7-00"})
+        ])
+
     def test_parser_supports_semantic_placement(self) -> None:
         commands = parse_ai_commands("KILLTEAM_PLACE[plague-warrior-01, 1.5, 1.0, -3.25]")
         self.assertEqual(commands[0].action, "killteam_place_operative")
@@ -955,14 +1038,18 @@ class KillTeamCommandProtocolTests(unittest.TestCase):
         self.assertNotIn("setup.ai_plan", prompt)
         self.assertNotIn("KILLTEAM_LOCK_ROSTERS", prompt)
         self.assertIn("tts_killteam_plan_objective_move", prompt)
-        self.assertIn("MOVE[guid,x,y,z]", prompt)
+        self.assertIn("SETUP_MOVE[candidate_id]", prompt)
+        self.assertIn("tts_killteam_select_setup_card", prompt)
         self.assertNotIn("tts_list_objects", prompt)
         self.assertIn("MOVE[guid,target_x,target_y,target_z]", prompt)
         self.assertIn("MOVE[guid,x,y,z]", prompt)
         self.assertIn("Ignore bags, decks, cards, and other containers", prompt)
         self.assertIn("choose only a live figurine with the Operative tag", prompt)
-        self.assertIn("Stop after that verified placement", prompt)
+        self.assertIn("Never reuse a GUID that appears in the persisted Kill Team setup memory", prompt)
+        self.assertIn("choose only an unplaced live figurine", prompt)
+        self.assertIn("Stop after that verified batch", prompt)
         self.assertIn("wait for a new KILLTEAM_AUTORUN_SETUP request", prompt)
+        self.assertIn("begin with initiative, then select operatives, then select available setup cards", prompt)
         self.assertNotIn("KILLTEAM_DEPLOY_SETUP[guid,target_x,target_y,target_z]", prompt)
         self.assertNotIn("KILLTEAM_PLACE[operative_id,target_x,target_y,target_z]", prompt)
         self.assertIn("\nKILLTEAM_DEPLOY_TEST\n", prompt)

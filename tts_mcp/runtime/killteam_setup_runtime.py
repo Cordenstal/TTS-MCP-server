@@ -233,6 +233,107 @@ def _has_tag(obj: dict[str, Any], requested: str) -> bool:
     return any(_norm(tag) == wanted for tag in tags)
 
 
+def _normalized_tags(obj: dict[str, Any]) -> set[str]:
+    tags: set[str] = set()
+    for raw in obj.get("tags") or []:
+        text = _norm(raw)
+        if not text:
+            continue
+        tags.add(text)
+        if text.startswith("tts_mcp:"):
+            tags.add(text.removeprefix("tts_mcp:"))
+    return tags
+
+
+def _rect_tuple(value: dict[str, float] | tuple[float, float, float, float]) -> tuple[float, float, float, float]:
+    if isinstance(value, tuple):
+        return value
+    return (
+        float(value["min_x"]),
+        float(value["max_x"]),
+        float(value["min_z"]),
+        float(value["max_z"]),
+    )
+
+
+def _rects_overlap(
+    first: dict[str, float] | tuple[float, float, float, float],
+    second: dict[str, float] | tuple[float, float, float, float],
+    *,
+    tolerance: float = 1e-6,
+) -> bool:
+    a = _rect_tuple(first)
+    b = _rect_tuple(second)
+    return not (
+        a[1] < b[0] - tolerance
+        or a[0] > b[1] + tolerance
+        or a[3] < b[2] - tolerance
+        or a[2] > b[3] + tolerance
+    )
+
+
+def _bounds_box(obj: dict[str, Any]) -> dict[str, Any] | None:
+    raw = obj.get("bounds") or {}
+    center = raw.get("center") or obj.get("position") or {}
+    position = obj.get("position") or center
+    size = raw.get("size") or {}
+    try:
+        cx = float(center["x"])
+        cy = float(center["y"])
+        cz = float(center["z"])
+        px = float(position["x"])
+        py = float(position["y"])
+        pz = float(position["z"])
+        sx = abs(float(size.get("x", 0)))
+        sy = abs(float(size.get("y", 0)))
+        sz = abs(float(size.get("z", 0)))
+    except (KeyError, TypeError, ValueError):
+        return None
+    if min(sx, sy, sz) <= 0:
+        return None
+    return {
+        "rect": (cx - sx / 2, cx + sx / 2, cz - sz / 2, cz + sz / 2),
+        "min_y": cy - sy / 2,
+        "max_y": cy + sy / 2,
+        "center": {"x": cx, "y": cy, "z": cz},
+        "size": {"x": sx, "y": sy, "z": sz},
+        "position": {"x": px, "y": py, "z": pz},
+        "pivot_to_bottom_y": py - cy + sy / 2,
+    }
+
+
+def _is_terrain_surface(obj: dict[str, Any]) -> bool:
+    tags = _normalized_tags(obj)
+    if {
+        "operative",
+        "kt_mission_objective",
+        "_deployment_zone_blue",
+        "_deployment_zone_red",
+        "entity=objective",
+        "entity=deployment",
+    } & tags:
+        return False
+    return "entity=terrain" in tags or "kt_mission_terrain" in tags or "blocks_los=true" in tags
+
+
+def _is_setup_objective(obj: dict[str, Any]) -> bool:
+    tags = _normalized_tags(obj)
+    return bool({"objective", "kt_mission_objective", "entity=objective"} & tags)
+
+
+def _is_setup_blocker(obj: dict[str, Any]) -> bool:
+    return _has_tag(obj, "Operative") or _is_setup_objective(obj)
+
+
+def _optional_number(value: Any) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _clean_name(value: Any) -> str:
     return " ".join(str(value or "").split())
 
@@ -343,12 +444,91 @@ class KillTeamSetupRuntime:
         live_guid = _live_guid(guid)
         if live_guid is None:
             raise KillTeamSetupRuleError("a live model GUID is required")
+        try:
+            raw_objects = self.bridge.list_objects(max_results=1000, compact=False)
+        except Exception as exc:
+            raise KillTeamSetupError("placement scene enumeration failed") from exc
+        objects = raw_objects.get("objects", []) if isinstance(raw_objects, dict) else []
+        if not isinstance(objects, list):
+            raise KillTeamSetupError("placement scene enumeration returned invalid objects")
+        live_model = next(
+            (
+                obj
+                for obj in objects
+                if isinstance(obj, dict) and _norm(obj.get("guid")) == _norm(live_guid)
+            ),
+            None,
+        )
+        if live_model is None:
+            raise KillTeamSetupRuleError("a live model GUID is required")
+        model_box = _bounds_box(live_model)
+        if model_box is None:
+            raise KillTeamSetupRuleError("the live model is missing bounds")
         target = {
             axis: _number(position.get(axis, 0), f"position.{axis}")
             for axis in ("x", "y", "z")
         }
+        requested_target = dict(target)
+        support_height: float | None = None
+        support_guids: list[str] = []
+        if model_box is not None:
+            rect = (
+                target["x"] - model_box["size"]["x"] / 2,
+                target["x"] + model_box["size"]["x"] / 2,
+                target["z"] - model_box["size"]["z"] / 2,
+                target["z"] + model_box["size"]["z"] / 2,
+            )
+            for obj in objects:
+                if not isinstance(obj, dict):
+                    continue
+                if _norm(obj.get("guid")) == _norm(live_guid):
+                    continue
+                box = _bounds_box(obj)
+                if box is None or not _rects_overlap(rect, box["rect"]):
+                    continue
+                if _is_terrain_surface(obj):
+                    top_y = float(box["max_y"])
+                    if support_height is None or top_y > support_height:
+                        support_height = top_y
+                        support_guids = [str(obj.get("guid", ""))]
+                    elif support_height is not None and abs(top_y - support_height) <= 1e-6:
+                        support_guids.append(str(obj.get("guid", "")))
+        if support_height is not None:
+            target = dict(target)
+            target["y"] = round(support_height + model_box["pivot_to_bottom_y"], 6)
+        model_bottom_offset = float(model_box["pivot_to_bottom_y"])
+        candidate_span = (
+            float(target["y"]) - model_bottom_offset,
+            float(target["y"]) - model_bottom_offset + model_box["size"]["y"],
+        )
+        for obj in objects:
+            if not isinstance(obj, dict):
+                continue
+            if _norm(obj.get("guid")) == _norm(live_guid) or _is_terrain_surface(obj):
+                continue
+            if not _is_setup_blocker(obj):
+                continue
+            box = _bounds_box(obj)
+            if box is None or not _rects_overlap(
+                (
+                    target["x"] - model_box["size"]["x"] / 2,
+                    target["x"] + model_box["size"]["x"] / 2,
+                    target["z"] - model_box["size"]["z"] / 2,
+                    target["z"] + model_box["size"]["z"] / 2,
+                ),
+                box["rect"],
+            ):
+                continue
+            blocker_span = (float(box["min_y"]), float(box["max_y"]))
+            if blocker_span[1] < candidate_span[0] - 1e-6 or blocker_span[0] > candidate_span[1] + 1e-6:
+                continue
+            if _is_setup_objective(obj):
+                raise KillTeamSetupRuleError(
+                    f"setup placement intersects objective {obj.get('guid', '')}"
+                )
+            raise KillTeamSetupRuleError("setup placement intersects another model")
         try:
-            raw = self.bridge.move_object(live_guid, target)
+            raw = self.bridge.place_model(live_guid, target)
         except Exception as exc:
             self._mark_uncertain(action_id)
             raise KillTeamSetupUncertainCommit("setup placement commit is uncertain") from exc
@@ -360,10 +540,33 @@ class KillTeamSetupRuntime:
             self._mark_uncertain(action_id)
             raise KillTeamSetupUncertainCommit("setup placement readback did not verify the GUID")
         actual = _position(raw)
-        if any(
-            abs(actual[axis] - target[axis]) > self.config.placement_tolerance
-            for axis in ("x", "y", "z")
-        ):
+        bridge_support_height = _optional_number(raw.get("support_height"))
+        bridge_support_guids = [
+            str(guid)
+            for guid in (raw.get("support_guids") or [])
+            if str(guid).strip()
+        ]
+        if bridge_support_height is not None:
+            if support_height is not None and abs(bridge_support_height - support_height) > self.config.placement_tolerance:
+                self._mark_uncertain(action_id)
+                raise KillTeamSetupUncertainCommit("placement support height disagreed with the live bridge")
+            support_height = bridge_support_height
+            support_guids = bridge_support_guids
+            target = dict(target)
+            target["y"] = round(support_height + model_box["pivot_to_bottom_y"], 6)
+        actual_box = _bounds_box(raw)
+        if actual_box is not None and support_height is not None:
+            verified = (
+                abs(actual["x"] - target["x"]) <= self.config.placement_tolerance
+                and abs(actual["z"] - target["z"]) <= self.config.placement_tolerance
+                and abs(actual_box["min_y"] - support_height) <= self.config.placement_tolerance
+            )
+        else:
+            verified = all(
+                abs(actual[axis] - target[axis]) <= self.config.placement_tolerance
+                for axis in ("x", "y", "z")
+            )
+        if not verified:
             self._mark_uncertain(action_id)
             raise KillTeamSetupUncertainCommit("setup placement did not verify")
         self._revision += 1
@@ -372,6 +575,10 @@ class KillTeamSetupRuntime:
             "guid": actual_guid,
             "name": _clean_name(raw.get("name")),
             "position": actual,
+            "bounds": copy.deepcopy(raw.get("bounds")),
+            "requested_position": requested_target,
+            "support_height": support_height,
+            "support_guids": [guid for guid in support_guids if guid],
             "tags": copy.deepcopy(raw.get("tags", [])),
             "revision": self._revision,
         }

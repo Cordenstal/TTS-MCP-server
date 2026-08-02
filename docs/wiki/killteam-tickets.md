@@ -4,6 +4,17 @@ This backlog breaks the Kill Team semantic opponent into executable work items.
 The order assumes the current setup and observation slice already exists and
 extends it into a full match-playing AI.
 
+The setup-specific KT-016 through KT-021 tickets are implemented and frozen
+for the current setup slice: board-context geometry, placement policy,
+turn-order behavior, recovery semantics, gateway execution, and the regression
+matrix that locks the public docs to the runtime. The geometry snapshot,
+slot-ranking, turn ordering, recovery, gateway routing, and regression
+subtasks are all implemented. KT-021 is now implemented as direct gateway
+execution of the runtime `KILLTEAM_AUTORUN_SETUP` macro, which keeps the
+semantic setup path authoritative and avoids the repeated-MOVE fallback.
+KT-022 tracks the next setup slice for operative tokens, equipment, and other
+non-model fixtures.
+
 ## Phases
 
 1. Foundation: state, identity, tokens, legality.
@@ -30,6 +41,13 @@ extends it into a full match-playing AI.
 | KT-013 | Persistence and replay | KT-001, KT-011 | Save and restore match state plus event history so a game can resume or be replayed from logs. |
 | KT-014 | Scenario fixtures and regression tests | KT-001 through KT-013 | Deterministic tests for deployment, markers, activations, combat, scoring, and turning-point transitions. |
 | KT-015 | Documentation and operator guidance | All prior tickets | Updated wiki pages, API contracts, and operator notes that explain what the opponent can do and how to validate it. |
+| KT-016 | Setup deployment geometry model | KT-001, KT-002, KT-011, KT-012 | A revision-stamped deployment context that captures live geometry, occupancy, objectives, and stale-context boundaries for setup planning. Implemented in the runtime; KT-016c and KT-016d remain to freeze stale-context and regression behavior. |
+| KT-017 | Context-aware setup placement policy | KT-001, KT-007, KT-009, KT-010, KT-016 | A tactical slot-ranking contract that weighs cover, exposure, objective pressure, friendly spacing, hostile threat, and faction style. Implemented in the runtime; KT-017d remains to pin policy regressions. |
+| KT-018 | Setup turn-order and pass advancement | KT-001, KT-011, KT-012, KT-016, KT-017 | A deterministic setup flow that chooses the next side, advances alternating passes, and carries the current deployment batch forward without collapsing to zone-center placement. Implemented in the runtime and pinned by setup regression tests. |
+| KT-019 | Setup recovery and reset semantics | KT-001, KT-011, KT-012, KT-016, KT-017, KT-018 | A recovery contract for `!ai start fresh`, human reconciliation, pending placements, and uncertain setup commits. Implemented in the controller and runtime recovery paths. |
+| KT-020 | Setup regression matrix and docs alignment | KT-014, KT-015, KT-016, KT-017, KT-018, KT-019 | A locked validation plan and doc update set that proves the geometry-aware setup path on dense boards and stale revisions. Implemented in the regression docs and tests. |
+| KT-021 | Autorun setup gateway execution | KT-016, KT-017, KT-018, KT-020 | Implemented in the runtime and gateway; `KILLTEAM_AUTORUN_SETUP` executes through the semantic setup macro so legal-slot selection, terrain-aware placement, and fail-closed setup progression stay inside the rules engine. |
+| KT-022 | Setup placement for operative tokens and equipment | KT-003, KT-016, KT-017, KT-021 | A bounded setup-placement contract for operative tokens, equipment, and other non-model fixtures, with legality checks, readback, and separate regression coverage from model placement. |
 
 ## Detailed Tickets
 
@@ -1204,3 +1222,340 @@ Execution order:
    aligned.
 8. KT-015h, because the final doc set should be checked for consistency once
    the content is in place.
+
+### KT-016 Setup deployment geometry model
+
+Status:
+
+- KT-016a and KT-016b are already implemented in the runtime.
+- KT-016c and KT-016d remain to freeze stale-context gating and the regression matrix.
+
+Define the live board-context model that setup planning will trust.
+
+Question:
+
+- What live geometry, occupancy, and revision facts must the setup planner see
+  before it can decide whether a deployment slot is legal and still current?
+
+Scope:
+
+- Capture deployment-zone bounds, model footprints, terrain blockers,
+  objectives, and visible enemy/friendly operatives in one revision-stamped
+  context object.
+- Treat map revision and placement context revision as hard validity gates.
+- Keep the context bounded so the planner can reason about the board without
+  scanning the entire scene ad hoc.
+- Make legality fail closed when a candidate slot would overlap a model,
+  protrude outside the deployment zone, or rely on stale geometry.
+
+Implementation subtasks:
+
+| Subtask | Primary file(s) | Supporting file(s) | Outcome |
+| --- | --- | --- | --- |
+| KT-016a Deployment-context snapshot | `tts_mcp/runtime/killteam_runtime.py` | `tests/test_killteam_runtime.py` | Define the live setup context with deployment-zone bounds, terrain, objectives, friendly and hostile occupancy, and revision metadata. |
+| KT-016b Footprint and clearance rules | `tts_mcp/runtime/killteam_runtime.py` | `tests/test_killteam_runtime.py` | Decide how model bounds, terrain geometry, and objective footprints invalidate a candidate placement slot. |
+| KT-016c Stale-context gating | `tts_mcp/runtime/killteam_runtime.py` | `tests/test_killteam_runtime.py` | Fail closed when a placement plan is older than the current map revision or the live board changed after planning. |
+| KT-016d Geometry regression tests | `tests/test_killteam_runtime.py` | `tts_mcp/runtime/killteam_runtime.py` | Cover dense boards, boundary slots, overlapping models, and stale-revision rejection. |
+
+File ownership:
+
+- `tts_mcp/runtime/killteam_runtime.py`: deployment-context snapshot and
+  legality gates.
+- `tests/test_killteam_runtime.py`: dense-board and stale-context tests.
+
+Execution order:
+
+1. KT-016a, because the planner needs a canonical board-context snapshot.
+2. KT-016b, because legality rules depend on how footprints and clearance are
+   measured.
+3. KT-016c, because stale-context handling must be decided before slot scoring
+   can rely on it.
+4. KT-016d, because the geometry contract should be pinned before the planner
+   consumes it.
+
+### KT-017 Context-aware setup placement policy
+
+Status:
+
+- KT-017a, KT-017b, and KT-017c are already implemented in the runtime.
+- KT-017d remains to lock the placement-policy regression cases.
+
+Decide how the setup planner should rank legal deployment slots.
+
+Question:
+
+- How should the planner score legal setup candidates across cover, exposure,
+  objective pressure, friendly support, hostile threat lanes, and faction
+  style?
+
+Scope:
+
+- Rank legal slots across the full deployment zone rather than defaulting to
+  zone-center placement.
+- Prefer cover and safe staging by default, but allow faction or mission style
+  to bias toward aggressive pressure or objective contest.
+- Keep tie-breakers deterministic so the same board state always yields the
+  same placement choice.
+- Make the planner explain its ranking so the AI can justify why a slot won.
+
+Implementation subtasks:
+
+| Subtask | Primary file(s) | Supporting file(s) | Outcome |
+| --- | --- | --- | --- |
+| KT-017a Candidate generation | `tts_mcp/runtime/killteam_runtime.py` | `tests/test_killteam_runtime.py` | Enumerate legal deployment candidates across the available footprint instead of using a single center point. |
+| KT-017b Tactical scoring model | `tts_mcp/runtime/killteam_runtime.py` | `tests/test_killteam_runtime.py` | Define the score inputs for cover, exposure, objectives, friendly spacing, hostile proximity, and faction style. |
+| KT-017c Deterministic tie-breaks | `tts_mcp/runtime/killteam_runtime.py` | `tests/test_killteam_runtime.py` | Ensure repeated planning on the same context returns the same ranked result. |
+| KT-017d Placement-policy tests | `tests/test_killteam_runtime.py` | `tts_mcp/runtime/killteam_runtime.py` | Cover cover-first, objective-first, and threat-avoidance cases on the same fixture set. |
+
+File ownership:
+
+- `tts_mcp/runtime/killteam_runtime.py`: candidate generation, scoring, and
+  ranking helpers.
+- `tests/test_killteam_runtime.py`: tactical-policy regression tests.
+
+Execution order:
+
+1. KT-017a, because the scorer needs candidate placements to rank.
+2. KT-017b, because the ranking contract is the core policy decision.
+3. KT-017c, because deterministic tie-breaking keeps the planner stable.
+4. KT-017d, because the chosen policy should be locked down with tests.
+
+### KT-018 Setup turn-order policy
+
+Status:
+
+- KT-018a through KT-018d are implemented and covered by runtime and gameplay regression tests.
+
+Decide which side acts next and how the current deployment pass advances when
+placement is already planned from board context.
+
+Question:
+
+- What rule should decide the next setup side, the active batch, and when a
+  pass is considered complete?
+
+Scope:
+
+- Keep the existing alternating deployment cadence, but define the pass
+  boundary in terms of board state rather than a fixed center slot.
+- Preserve the active batch across repeated observations until a legal commit
+  advances it.
+- Make the next-side decision deterministic when a batch completes, a side has
+  no remaining legal placements, or the planner cannot improve the current
+  pass.
+- Keep the already-placed AI models in the setup state so the next pass can
+  continue from the correct remainder.
+
+Implementation subtasks:
+
+| Subtask | Primary file(s) | Supporting file(s) | Outcome |
+| --- | --- | --- | --- |
+| KT-018a Next-side rule | `tts_mcp/runtime/killteam_runtime.py` | `tests/test_killteam_runtime.py` | Decide how the setup state machine advances from one side to the next when the current pass is complete or exhausted. |
+| KT-018b Batch carry-forward | `tts_mcp/runtime/killteam_runtime.py` | `tests/test_killteam_runtime.py` | Decide how batch counters and already-placed models stay attached to the active pass across repeated observations. |
+| KT-018c Planner handoff | `tts_mcp/runtime/killteam_runtime.py` | `tests/test_killteam_runtime.py` | Decide how the tactical planner feeds the current pass without changing the alternating cadence. |
+| KT-018d Turn-order tests | `tests/test_killteam_runtime.py`, `tests/test_gameplay_runtime.py` | `tts_mcp/runtime/killteam_runtime.py` | Cover side switching, batch completion, repeated observation stability, and deterministic pass advancement. |
+
+File ownership:
+
+- `tts_mcp/runtime/killteam_runtime.py`: setup turn-order, batch counters,
+  and pass advancement rules.
+- `tests/test_killteam_runtime.py`, `tests/test_gameplay_runtime.py`:
+  turn-order and batch progression coverage.
+
+Execution order:
+
+1. KT-018a, because the next-side rule determines the rest of the turn-order
+   contract.
+2. KT-018b, because batch carry-forward has to stay consistent with the active
+   pass.
+3. KT-018c, because the planner has to feed the turn-order rule.
+4. KT-018d, because the turn-order contract should be pinned with tests.
+
+### KT-019 Setup recovery policy
+
+Status:
+
+- KT-019a through KT-019d are implemented and covered by runtime, gameplay, and controller regression tests.
+
+Decide what setup state survives pauses, human batches, and host-triggered
+resets.
+
+Question:
+
+- What should happen to setup history after `!ai start fresh`, a human
+  reconciliation pass, an uncertain commit, or a pending placement rollback?
+
+Scope:
+
+- Define what `!ai start fresh` clears and what it preserves.
+- Define when human-side reconciliation resumes AI setup after a human pass.
+- Make rollback and uncertain-commit recovery explicit so placement can be
+  retried only when the board state is still trustworthy.
+- Keep recovery separate from turn-order so each policy stays narrow.
+
+Implementation subtasks:
+
+| Subtask | Primary file(s) | Supporting file(s) | Outcome |
+| --- | --- | --- | --- |
+| KT-019a Setup-history model | `tts_mcp/runtime/killteam_runtime.py`, `tts_mcp/app/ai_controller.py` | `tests/test_killteam_runtime.py`, `tests/test_gameplay_runtime.py` | Decide which deployed models, batches, and recovery markers persist across setup turns. |
+| KT-019b Human resume rule | `tts_mcp/runtime/killteam_runtime.py` | `tests/test_gameplay_runtime.py` | Decide when human-side reconciliation allows the AI to resume after a human pass. |
+| KT-019c Reset and rollback rule | `tts_mcp/runtime/killteam_runtime.py`, `tts_mcp/app/ai_controller.py` | `tests/test_killteam_runtime.py`, `tests/test_gameplay_runtime.py` | Decide how fresh-start, rollback, and uncertain-commit cases clear or preserve setup history. |
+| KT-019d Recovery tests | `tests/test_killteam_runtime.py`, `tests/test_gameplay_runtime.py` | `tts_mcp/runtime/killteam_runtime.py` | Cover history reset, replay of a pending setup turn, recovery after a stale or partial placement, and human resume behavior. |
+
+File ownership:
+
+- `tts_mcp/runtime/killteam_runtime.py`: setup recovery, resume markers, and
+  commit rollback rules.
+- `tts_mcp/app/ai_controller.py`: persisted setup-history reset behavior if
+  the controller contract needs to change.
+- `tests/test_killteam_runtime.py`, `tests/test_gameplay_runtime.py`:
+  recovery and reset coverage.
+
+Execution order:
+
+1. KT-019a, because the recovery contract needs a history model.
+2. KT-019b, because the human-resume rule determines when the AI may continue.
+3. KT-019c, because fresh-start and rollback behavior must be defined
+   together.
+4. KT-019d, because the recovery policy should be pinned with tests.
+
+### KT-020 Setup regression matrix and docs alignment
+
+Status:
+
+- KT-020a through KT-020d are implemented and covered by runtime tests, docs, and roadmap updates.
+
+Decide the validation matrix and documentation updates for the new setup
+planner.
+
+Question:
+
+- Which deterministic tests, live validation cases, and doc updates are
+  required to prove the new geometry-aware setup path works on dense, blocked,
+  and stale boards?
+
+Scope:
+
+- Define the fixture matrix for cover, overlap, objectives, hostile pressure,
+  friendly spacing, and stale-revision cases.
+- Keep deterministic runtime tests separate from any live TTS validation
+  checklist.
+- Update the wiki, roadmap, and API reference once the setup planner contract
+  is settled.
+
+Implementation subtasks:
+
+| Subtask | Primary file(s) | Supporting file(s) | Outcome |
+| --- | --- | --- | --- |
+| KT-020a Deterministic fixture matrix | `tests/test_killteam_runtime.py` | `tts_mcp/runtime/killteam_runtime.py` | Define the dense-board and geometry fixtures used to validate the new deployment planner. |
+| KT-020b Live validation checklist | `docs/wiki/killteam.md` | `docs/wiki/roadmap.md` | Spell out the live TTS scenarios needed to prove the planner-backed autorun path against the current Save 131 fixture or future equivalents, including the fail-closed no-legal-slot case. |
+| KT-020c Wiki and API alignment | `docs/wiki/killteam.md`, `docs/wiki/api-reference.md`, `docs/wiki/api-and-rules.md` | `docs/wiki/roadmap.md` | Update the setup-phase wording so the public docs describe geometry-aware placement and the rejected fallback path instead of center-of-zone behavior. |
+| KT-020d Roadmap status update | `docs/wiki/roadmap.md` | `docs/wiki/killteam-tickets.md` | Mark the new setup expansion as the next Kill Team setup workstream after the current slice. |
+
+File ownership:
+
+- `tests/test_killteam_runtime.py`: deterministic setup regression coverage.
+- `docs/wiki/killteam.md`, `docs/wiki/api-reference.md`,
+  `docs/wiki/api-and-rules.md`: setup guidance updates.
+- `docs/wiki/roadmap.md`: sequencing and status updates.
+
+Execution order:
+
+1. KT-020a, because the regression matrix has to exist before validation can
+   be trusted.
+2. KT-020b, because live validation should be planned after the deterministic
+   matrix is known.
+3. KT-020c, because the public docs should describe the settled setup contract.
+4. KT-020d, because the roadmap should point at the new setup workstream once
+   the plan is clear.
+
+### KT-021 Autorun setup gateway execution
+
+Status:
+
+- KT-021a through KT-021c are implemented and covered by runtime, gateway,
+  and regression tests.
+
+Question:
+
+- How should `KILLTEAM_AUTORUN_SETUP` be routed so one AI-authored MOVE uses
+  the placement-only bridge without entering the incompatible full runtime?
+
+Scope:
+
+- Treat the chat-level autorun request as one bounded AI placement turn.
+- Advertise only setup ping and compact, explicitly tagged placement context.
+- Keep terrain-aware y adjustment, model collision checks, and readback in the
+  placement runtime; never call the full Save 131 planner as a fallback.
+
+Implementation subtasks:
+
+| Subtask | Primary file(s) | Supporting file(s) | Outcome |
+| --- | --- | --- | --- |
+| KT-021a Gateway placement handoff | `tts_mcp/app/http_gateway.py`, `tts_mcp/app/server.py` | `tests/test_http_gateway.py`, `tests/test_server.py` | Route `KILLTEAM_AUTORUN_SETUP` through the placement-only AI context and one model-authored MOVE path. |
+| KT-021b Runtime fail closed | `tts_mcp/runtime/gameplay_runtime.py`, `tts_mcp/runtime/killteam_runtime.py` | `tests/test_gameplay_runtime.py`, `tests/test_killteam_runtime.py` | Keep the runtime setup macro fail-closed when it cannot produce a legal slot or the live board state is stale. |
+| KT-021c Gateway regression test | `tests/test_http_gateway.py` | `tts_mcp/runtime/killteam_setup_runtime.py` | Prove that the chat-level autorun request does not dispatch the runtime macro, exposes only setup tools, and verifies one terrain-aware MOVE. |
+
+File ownership:
+
+- `tts_mcp/app/http_gateway.py`: autorun routing and runtime handoff.
+- `tests/test_http_gateway.py`: gateway-level regression coverage.
+- `tts_mcp/runtime/gameplay_runtime.py`, `tts_mcp/runtime/killteam_runtime.py`: runtime semantic setup flow, planner evidence, and stale-context support.
+
+Execution order:
+
+1. KT-021a, because the gateway handoff is the actual bug surface.
+2. KT-021b, because the runtime fail-closed behavior must remain authoritative.
+3. KT-021c, because the regression needs to prove the runtime macro is the path
+   used by chat-level autorun.
+
+### KT-022 Setup placement for operative tokens and equipment
+
+Status:
+
+- Planned as the next setup-placement slice after model placement is complete.
+
+Question:
+
+- How should setup-time placement cover operative tokens, equipment, and other
+  non-model fixtures without widening the model-placement contract?
+
+Scope:
+
+- Place operative tokens, equipment, and similar setup fixtures through an
+  explicit bounded placement path.
+- Keep legality checks, readback, and failure handling separate from the
+  model-placement workflow.
+- Reuse the existing geometry and occupancy facts where fixture placement needs
+  them, but do not force non-model items through model-specific assumptions.
+- Keep the setup docs, roadmap, and regression coverage aligned with the
+  fixture-specific placement contract.
+
+Implementation subtasks:
+
+| Subtask | Primary file(s) | Supporting file(s) | Outcome |
+| --- | --- | --- | --- |
+| KT-022a Token placement rules | `tts_mcp/runtime/killteam_runtime.py` | `tests/test_killteam_runtime.py` | Add explicit legality and placement handling for operative tokens and other setup markers. |
+| KT-022b Equipment placement rules | `tts_mcp/runtime/killteam_runtime.py` | `tests/test_killteam_runtime.py` | Add placement handling for equipment and similar setup fixtures, including collision, snapping, and zone checks as applicable. |
+| KT-022c Setup-context surface | `tts_mcp/app/http_gateway.py`, `tts_mcp/runtime/killteam_setup_runtime.py` | `tests/test_http_gateway.py`, `tests/test_killteam_setup_runtime.py` | Expose the bounded setup context needed to place tokens and equipment without broadening the full runtime. |
+| KT-022d Regression and docs alignment | `tests/test_killteam_runtime.py`, `docs/wiki/killteam.md`, `docs/wiki/roadmap.md` | `tts_mcp/runtime/killteam_runtime.py` | Lock the token/equipment placement contract and describe the supported setup objects. |
+
+File ownership:
+
+- `tts_mcp/runtime/killteam_runtime.py`: token and equipment placement rules,
+  legality checks, and readback hooks.
+- `tts_mcp/app/http_gateway.py` and `tts_mcp/runtime/killteam_setup_runtime.py`:
+  bounded setup-context exposure if the placement surface needs to broaden.
+- `tests/test_killteam_runtime.py` and `tests/test_killteam_setup_runtime.py`:
+  fixture-placement regression coverage.
+- `docs/wiki/killteam.md` and `docs/wiki/roadmap.md`: setup-placement wording
+  and sequencing updates.
+
+Execution order:
+
+1. KT-022a, because token placement needs a canonical legality contract first.
+2. KT-022b, because equipment placement should reuse the same fixture model
+   after the token path is settled.
+3. KT-022c, because any setup-context expansion must stay bounded.
+4. KT-022d, because the docs and regression surface should match the runtime
+   contract once the placement behavior is stable.

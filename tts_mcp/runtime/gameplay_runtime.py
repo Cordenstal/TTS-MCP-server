@@ -141,10 +141,14 @@ def parse_ai_commands(text: str, *, max_commands: int = 50) -> list[ParsedComman
 
     for m in re.finditer(rf"MOVE\[({_GUID}),\s*({_NUMBER}),\s*({_NUMBER}),\s*({_NUMBER})\]", text, re.I):
         add("move_object", {"guid": m.group(1), "x": float(m.group(2)), "y": float(m.group(3)), "z": float(m.group(4))})
+    for m in re.finditer(r"^[ \t]*SETUP_MOVE\[([^,\]\r\n]+)\][ \t]*$", text, re.I | re.M):
+        add("setup_candidate_move", {"candidate_id": m.group(1).strip()})
     for _ in re.finditer(r"^\s*KILLTEAM_ROLL_INITIATIVE\s*$", text, re.I | re.M):
         add("killteam_roll_initiative", {})
     for m in re.finditer(r"KILLTEAM_SELECT_ROSTER\[([^\]]+)\]", text, re.I):
         add("killteam_select_roster_card", {"contained_guid": m.group(1).strip()})
+    for m in re.finditer(r"KILLTEAM_SELECT_SETUP\[([^\]]+)\]", text, re.I):
+        add("killteam_select_setup_card", {"contained_guid": m.group(1).strip()})
     for _ in re.finditer(r"^\s*KILLTEAM_LOCK_ROSTERS\s*$", text, re.I | re.M):
         add("killteam_lock_rosters", {})
     for _ in re.finditer(r"^\s*KILLTEAM_AUTORUN_SETUP\s*$", text, re.I | re.M):
@@ -210,6 +214,7 @@ def parse_ai_commands(text: str, *, max_commands: int = 50) -> list[ParsedComman
                 "move_object",
                 "killteam_roll_initiative",
                 "killteam_select_roster_card",
+                "killteam_select_setup_card",
                 "killteam_lock_rosters",
                 "killteam_autorun_setup",
                 "killteam_start_setup_deployment",
@@ -381,6 +386,11 @@ class GamePromptBuilder:
                 "When objective control is the goal, call tts_killteam_plan_objective_move with the operative_id "
                 "before emitting MOVE. Use the returned MOVE target instead of inventing a coordinate and prefer "
                 "the safest contesting point the planner returns.\n"
+                "For Kill Team setup, begin with initiative, then select operatives, then select available "
+                "setup cards such as equipment, ploys, and tactical-op cards before locking the roster. Use "
+                "tts_killteam_select_roster_card for operative cards and tts_killteam_select_setup_card for "
+                "non-operative setup cards. After the roster is locked, alternate deployment in one-third batches "
+                "starting with the side that has initiative, then continue through the first turning point.\n"
                 "To move one of the AI's own models, emit exactly one standalone line in this form:\n"
                 "MOVE[guid,x,y,z]\n"
                 "Use the live GUID from tts_killteam_observe or the current setup deployment plan. Preserve the source y coordinate unless you are "
@@ -390,24 +400,37 @@ class GamePromptBuilder:
                 "\nFor semantic pregame roster setup, use these setup commands before the firefight phase:\n"
                 "KILLTEAM_ROLL_INITIATIVE\n"
                 "KILLTEAM_AUTORUN_SETUP (AI-owned setup request)\n"
+                "KILLTEAM_SELECT_SETUP[card_guid]\n"
                 "KILLTEAM_ROLLBACK_PENDING\n"
                 "KILLTEAM_RECONCILE_SETUP[side_id]\n"
                 "When the player asks for AI-owned setup, do not execute a runtime placement macro. Call "
-                "tts_killteam_setup_list_objects and inspect the returned live model, terrain, deployment-zone, "
+                "tts_killteam_setup_context and inspect the returned live model, terrain, deployment-zone, "
                 "and objective tags. Ignore bags, decks, cards, and other containers; choose only a live "
-                "figurine with the Operative tag. Use your own tactical reasoning and role priority to choose "
-                "exactly one AI model and one legal position for this setup turn, then emit exactly one standalone line: "
-                "MOVE[guid,x,y,z]. Never select or place a human model. Stop after that verified "
-                "placement; if more AI models remain, wait for a new KILLTEAM_AUTORUN_SETUP request. The runtime "
+                "figurine with the Operative tag. Never reuse a GUID that appears in the persisted Kill Team setup "
+                "memory; choose only an unplaced live figurine. The setup context supplies a fixed batch size of "
+                "ceil(unplaced AI models / 3); for six models select two distinct models per request. The "
+                "setup_plan.recommended_batch is the authoritative legal batch for this request. Use only the "
+                "candidate IDs listed in recommended_batch, exactly once each; do not select from the broader "
+                "candidates list. Use tactical reasoning to prioritize the recommended models and positions, then "
+                "emit one standalone setup command per model: SETUP_MOVE[candidate_id]. Copy the candidate ID "
+                "exactly from the returned record and do not transcribe coordinates. Legacy MOVE[guid,x,y,z] "
+                "commands remain valid only when all coordinates come from the same candidate record. The server "
+                "owns the candidate-to-GUID binding and terrain-adjusted y value. Before choosing each candidate, inspect "
+                "that footprint against terrain pieces, objectives, and other models. "
+                "If terrain occupies the footprint, raise y so the model lands on top of the terrain. If another model occupies "
+                "the footprint, choose a different position. Do not reuse a position in the same batch. Prefer cover, "
+                "objective access, line-of-sight protection, and spacing over the deployment-zone center. Never select "
+                "or place a human model. Stop after that verified batch; if more AI models remain, wait for a new "
+                "KILLTEAM_AUTORUN_SETUP request. The runtime "
                 "only validates and executes your selected GUID and coordinates.\n"
-                "Use MOVE[guid,target_x,target_y,target_z] for the live figurine move. The GUID must identify the figurine you are placing, not the roster-card operative ID; preserve its live y coordinate. "
-                "For the dedicated placement-only setup bridge, use tts_killteam_setup_ping and tts_killteam_setup_list_objects to resolve the live model, then use "
-                "MOVE[guid,x,y,z] for exact setup placement."
+                "Use MOVE[guid,target_x,target_y,target_z] for the live figurine move. The GUID must identify the figurine you are placing, not the roster-card operative ID; for setup deployment, set target_y from the terrain-adjusted placement logic so the model rests on top of the terrain rather than preserving the live y coordinate. "
+                "For the dedicated placement-only setup bridge, use tts_killteam_setup_ping and tts_killteam_setup_context to resolve the live model and tactical candidates, then use "
+                "SETUP_MOVE[candidate_id] for exact setup placement."
                 "\nFor the deployment smoke test, emit exactly one standalone line:\n"
                 "KILLTEAM_DEPLOY_TEST\n"
                 "This zero-argument command resolves exactly one model whose name contains Plague Marine Warrior "
-                "and exactly one destination tagged _deployment_zone_blue. It copies the zone's x/z coordinates, preserves the "
-                "model's y coordinate, moves the model, and verifies its final x/z position within 0.25 units. "
+                "and exactly one destination tagged _deployment_zone_blue. It copies the zone's x/z coordinates, computes the "
+                "terrain-adjusted y, moves the model, and verifies its final position within tolerance. "
                 "It does not require Kill Team setup."
                 "\nFor the agreed Save 131 vertical-slice test, emit exactly one standalone line:\n"
                 "KILLTEAM_VALIDATE_SETUP[action_id]\n"
@@ -921,7 +944,8 @@ class CommandExecution:
                     break
 
                 if stage == "roster_selection":
-                    if isinstance(next_action, dict) and str(next_action.get("type") or "").strip().lower() == "select_roster_card":
+                    next_action_type = str(next_action.get("type") or "").strip().lower() if next_action else ""
+                    if next_action_type in {"select_roster_card", "select_setup_card"}:
                         card_guid = str(
                             next_action.get("card_guid")
                             or next_action.get("contained_guid")
@@ -930,16 +954,22 @@ class CommandExecution:
                         ).strip()
                         if not card_guid:
                             return failure("Kill Team setup did not provide a roster card GUID", failed_action="tts_killteam_observe")
-                        select_result = self.request("tts_killteam_select_roster_card", {"contained_guid": card_guid})
-                        record("tts_killteam_select_roster_card", select_result, summary={
+                        request_name = "tts_killteam_select_roster_card" if next_action_type == "select_roster_card" else "tts_killteam_select_setup_card"
+                        request_args = {"contained_guid": card_guid}
+                        card_kind = str(next_action.get("card_kind") or "").strip()
+                        if card_kind:
+                            request_args["card_kind"] = card_kind
+                        select_result = self.request(request_name, request_args)
+                        record(request_name, select_result, summary={
                             "card_guid": card_guid,
+                            "card_kind": card_kind or next_action_type,
                             "selected_count": select_result.get("selected_count"),
                         })
                         observed = self.request("tts_killteam_observe", {})
                         record("tts_killteam_observe", observed)
                         snapshot = self._killteam_setup_snapshot(observed)
                         if not snapshot:
-                            return failure("Kill Team setup state disappeared after roster selection", failed_action="tts_killteam_observe")
+                            return failure("Kill Team setup state disappeared after setup-card selection", failed_action="tts_killteam_observe")
                         continue
 
                     lock_result = self.request("tts_killteam_lock_rosters", {})

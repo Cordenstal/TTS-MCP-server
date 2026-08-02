@@ -396,7 +396,7 @@ array, which avoids relying on OpenAI-compatibility translation:
 ```powershell
 $env:AI_BACKEND_KIND = "http"
 $env:AI_BACKEND_URL = "http://127.0.0.1:11434/api/chat"
-$env:AI_BACKEND_MODEL = "gemma4:12b"
+$env:AI_BACKEND_MODEL = "gemma4:26b-a4b-it-qat"
 $env:AI_BACKEND_FORMAT = "ollama"
 $env:AI_BACKEND_TIMEOUT = "300"
 ```

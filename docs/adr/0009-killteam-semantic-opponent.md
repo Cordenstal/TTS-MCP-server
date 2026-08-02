@@ -41,6 +41,11 @@ Build Kill Team as a role-specific adapter over the generic TTS control plane.
 - Fresh observation is required before each activation and attack. The AI
   announces a bounded plan, executes legal non-destructive actions
   autonomously, re-observes after each action, and replans on state change.
+- The active Kill Team turn loop is bounded. When the player says `Your turn`
+  or an equivalent initiative-pass prompt, the gateway hands the request to a
+  tactical-turn action that claims the initiative token, performs one legal AI
+  action, ends the activation, and passes initiative back to the next player
+  before waiting for the next prompt.
 - TTS uses `x/z` as the horizontal plane and `y` as height. Setup calibration
   records origin, orientation, ground height, and world-units-per-inch scale.
   Terrain uses bounds by default with explicit metadata overrides. Map changes

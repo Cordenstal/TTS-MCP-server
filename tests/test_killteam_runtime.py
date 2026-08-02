@@ -372,7 +372,16 @@ def setup_container(guid, *, name, entity, side_id):
     }
 
 
-def roster_card_item(guid, *, side_id, faction_id, operative_type_id, instance_id, role="operative"):
+def roster_card_item(
+    guid,
+    *,
+    side_id,
+    faction_id,
+    operative_type_id,
+    instance_id,
+    role="operative",
+    card_kind="operative",
+):
     operative_id = f"{operative_type_id}#{instance_id}"
     tags = tag(
         "entity=roster_card",
@@ -382,6 +391,7 @@ def roster_card_item(guid, *, side_id, faction_id, operative_type_id, instance_i
         f"instance_id={instance_id}",
         f"operative_id={operative_id}",
         f"role={role}",
+        f"card_kind={card_kind}",
     ) + ["_roster_card"]
     return {
         "guid": guid,
@@ -585,6 +595,34 @@ def mission_terrain(guid, *, name, x, z, size_x, size_z):
     }
 
 
+def elevated_terrain(guid, *, name, x, z, size_x, size_z, center_y=3.0, size_y=4.0):
+    return {
+        "guid": guid,
+        "name": name,
+        "type": "LayoutZone",
+        "tags": tag("entity=terrain"),
+        "position": {"x": x, "y": center_y, "z": z},
+        "bounds": {
+            "center": {"x": x, "y": center_y, "z": z},
+            "size": {"x": size_x, "y": size_y, "z": size_z},
+        },
+    }
+
+
+def blocks_los_terrain(guid, *, name, x, z, size_x, size_z, center_y=3.0, size_y=4.0):
+    return {
+        "guid": guid,
+        "name": name,
+        "type": "LayoutZone",
+        "tags": tag("blocks_los=true"),
+        "position": {"x": x, "y": center_y, "z": z},
+        "bounds": {
+            "center": {"x": x, "y": center_y, "z": z},
+            "size": {"x": size_x, "y": size_y, "z": size_z},
+        },
+    }
+
+
 def fixture_objects():
     return [
         operative("ai-1", team="ai", operative_id="plague-warrior-01", profile="plague_warrior", x=0, z=0),
@@ -675,6 +713,16 @@ def save_131_native_objects():
                 "size": {"x": 4, "y": 2, "z": 1},
             },
         },
+        elevated_terrain(
+            "blue-platform",
+            name="Blue Platform",
+            x=-18.0,
+            z=6.0,
+            size_x=6.0,
+            size_z=4.0,
+            center_y=3.0,
+            size_y=4.0,
+        ),
     ]
 
 
@@ -772,7 +820,7 @@ class KillTeamRuntimeTests(unittest.TestCase):
         return runtime, bridge
 
     def test_setup_discovers_side_scoped_roster_objects_and_waits_for_initiative(self):
-        runtime, _bridge = self._runtime_with_roster_setup()
+        runtime, bridge = self._runtime_with_roster_setup()
 
         result = runtime.setup()
         observation = runtime.observe()
@@ -799,6 +847,15 @@ class KillTeamRuntimeTests(unittest.TestCase):
         with self.assertRaisesRegex(KillTeamRuleError, "initiative has already been determined"):
             runtime.roll_initiative()
 
+    def test_setup_batch_size_rounds_up_to_the_next_third(self):
+        self.assertEqual(KillTeamRuntime._setup_batch_size(1), 1)
+        self.assertEqual(KillTeamRuntime._setup_batch_size(2), 1)
+        self.assertEqual(KillTeamRuntime._setup_batch_size(3), 1)
+        self.assertEqual(KillTeamRuntime._setup_batch_size(4), 2)
+        self.assertEqual(KillTeamRuntime._setup_batch_size(5), 2)
+        self.assertEqual(KillTeamRuntime._setup_batch_size(6), 2)
+        self.assertEqual(KillTeamRuntime._setup_batch_size(10), 4)
+
     def test_generic_setup_queries_scene_tags_without_placeholder_target_guid(self):
         objects, containers = setup_fixture_with_rosters()
         bridge = FakeKillTeamBridge(objects, containers=containers, rolls=[[6], [2]])
@@ -821,7 +878,45 @@ class KillTeamRuntimeTests(unittest.TestCase):
 
         self.assertEqual(first_call["query_tags"], list(_GENERIC_SETUP_QUERY_TAGS))
 
-    def test_auto_setup_starts_model_deployment_and_switches_after_floor_batch(self):
+    def test_setup_infers_side_id_from_names_when_explicit_tags_are_missing(self):
+        objects, containers = setup_fixture_with_rosters()
+        for obj in objects:
+            tags = {str(tag_value).lower() for tag_value in obj.get("tags", [])}
+            if any(
+                marker in tags
+                for marker in {
+                    "tts_mcp:entity=faction_decks",
+                    "tts_mcp:entity=roster",
+                    "tts_mcp:entity=roster_list_zone",
+                    "tts_mcp:entity=deployed_zone",
+                    "tts_mcp:entity=deployment",
+                }
+            ):
+                obj["tags"] = [
+                    tag_value
+                    for tag_value in obj.get("tags", [])
+                    if not str(tag_value).startswith("tts_mcp:side_id=")
+                    and not str(tag_value).startswith("tts_mcp:team=")
+                ]
+
+        bridge = FakeKillTeamBridge(objects, containers=containers, rolls=[[6], [2]])
+        runtime = KillTeamRuntime(
+            bridge,
+            KillTeamConfig(
+                ai_team="ai",
+                ai_dice_count=1,
+                opponent_dice_count=1,
+            ),
+        )
+
+        result = runtime.setup()
+
+        self.assertEqual(result["status"], "ready")
+        self.assertEqual(sorted(result["setup"]["sides"].keys()), ["ai", "opponent"])
+        self.assertEqual(result["setup"]["sides"]["ai"]["roster_list_zone_guid"], "roster-list-ai")
+        self.assertEqual(result["setup"]["sides"]["opponent"]["deployment_zone_guid"], "drop-op")
+
+    def test_auto_setup_starts_model_deployment_and_switches_after_rounded_up_batch(self):
         runtime, bridge = self._runtime_with_roster_setup()
 
         started = runtime.setup(auto_start=True)
@@ -840,9 +935,11 @@ class KillTeamRuntimeTests(unittest.TestCase):
             setup["next_action"]["recommended_position"],
         )
         runtime.start_setup_deployment("balefire_acolyte#1")
+        second_target = dict(runtime.observe()["setup"]["next_action"]["recommended_position"])
+        second_target["z"] += 2.0
         second = runtime.deploy_setup_operative(
             "model-ai-balefire-1",
-            runtime.observe()["setup"]["next_action"]["recommended_position"],
+            second_target,
         )
 
         self.assertEqual(second["status"], "deployed")
@@ -850,28 +947,85 @@ class KillTeamRuntimeTests(unittest.TestCase):
         self.assertEqual(runtime.observe()["setup"]["current_batch_target"], 2)
         self.assertTrue(any(call[0] == "take_from_container" for call in bridge.calls))
 
-        bridge.take_from_container(
-            "roster-op",
-            item_guid="model-op-chosen-1",
-            position={"x": 16.0, "y": 1.0, "z": 6.0},
-            smooth=False,
-        )
-        bridge.take_from_container(
-            "roster-op",
-            item_guid="model-op-warrior-1",
-            position={"x": 18.0, "y": 1.0, "z": 6.0},
-            smooth=False,
-        )
-        human_batch = runtime.reconcile_setup_step("opponent")
+    def test_setup_observation_keeps_ranked_position_and_batch_progress_stable_until_commit(self):
+        runtime, bridge = self._runtime_with_roster_setup()
 
-        self.assertEqual(human_batch["deployed_count"], 2)
-        self.assertEqual(runtime.observe()["setup"]["current_side"], "ai")
+        runtime.setup()
+        for contained_guid in (
+            "card-ai-chosen-1",
+            "card-ai-warrior-1",
+            "card-ai-warrior-2",
+            "card-ai-butcher-1",
+            "card-ai-balefire-1",
+            "card-ai-icon-1",
+        ):
+            runtime.select_roster_card(contained_guid)
+        for index, contained_guid in enumerate((
+            "card-op-chosen-1",
+            "card-op-warrior-1",
+            "card-op-warrior-2",
+            "card-op-butcher-1",
+            "card-op-balefire-1",
+            "card-op-icon-1",
+        )):
+            bridge.objects[contained_guid] = live_card(
+                next(item for item in bridge.containers["deck-op"]["items"] if item["guid"] == contained_guid),
+                x=18.0 + (index % 3),
+                z=-12.0 + (index // 3),
+            )
+            bridge.containers["deck-op"]["items"] = [
+                item for item in bridge.containers["deck-op"]["items"] if item["guid"] != contained_guid
+            ]
 
-        with self.assertRaisesRegex(KillTeamRuleError, "AI models must be deployed"):
-            runtime.reconcile_setup_step("ai")
+        runtime.lock_rosters()
+
+        first = runtime.observe()["setup"]
+        second = runtime.observe()["setup"]
+
+        self.assertEqual(first["current_side"], "ai")
+        self.assertEqual(first["current_batch_target"], 2)
+        self.assertEqual(first["current_batch_progress"], 0)
+        self.assertEqual(first["next_action"], second["next_action"])
+        self.assertEqual(
+            first["ai_plan"]["next_deployment"]["recommended_position_evidence"],
+            second["ai_plan"]["next_deployment"]["recommended_position_evidence"],
+        )
+
+        runtime.start_setup_deployment("chosen#1")
+        runtime.deploy_setup_operative(
+            "model-ai-chosen-1",
+            first["next_action"]["recommended_position"],
+        )
+
+        after = runtime.observe()["setup"]
+        self.assertEqual(after["current_side"], "ai")
+        self.assertEqual(after["current_batch_progress"], 1)
+        self.assertEqual(after["next_action"]["model_guid"], "model-ai-balefire-1")
+        self.assertEqual(after["next_action"]["batch_progress"], 1)
+
+    def test_rollback_pending_model_deployment_clears_reservation_without_advancing_turn(self):
+        runtime, bridge = self._runtime_with_roster_setup()
+
+        started = runtime.setup(auto_start=True)
+        self.assertEqual(started["setup"]["mode"], "model_deployment")
+
+        runtime.start_setup_deployment("chosen#1")
+        pending = runtime.observe()["setup"]
+        self.assertEqual(pending["pending_operative_id"], "chosen#1")
+        self.assertEqual(pending["pending_model_guid"], "model-ai-chosen-1")
+
+        rolled_back = runtime.rollback_pending_deployment()
+        setup = runtime.observe()["setup"]
+
+        self.assertEqual(rolled_back["status"], "rolled_back")
+        self.assertEqual(rolled_back["operative_id"], "chosen#1")
+        self.assertIsNone(setup["pending_operative_id"])
+        self.assertIsNone(setup["pending_model_guid"])
+        self.assertEqual(setup["current_side"], "ai")
+        self.assertEqual(setup["current_batch_progress"], 0)
 
     def test_setup_exposes_ai_selection_and_deployment_order(self):
-        runtime, _bridge = self._runtime_with_roster_setup()
+        runtime, bridge = self._runtime_with_roster_setup()
         runtime.setup()
 
         observation = runtime.observe()
@@ -914,6 +1068,61 @@ class KillTeamRuntimeTests(unittest.TestCase):
         self.assertEqual(ai_plan["next_deployment"]["model_guid"], "model-ai-chosen-1")
         self.assertEqual(ai_plan["play_style"], "aggressive")
         self.assertIn("pressure", ai_plan["play_style_reason"])
+        evidence = ai_plan["next_deployment"]["recommended_position_evidence"]
+        self.assertIsNotNone(evidence)
+        self.assertEqual(evidence["play_style"], "aggressive")
+        self.assertGreater(evidence["candidate_count"], 0)
+        self.assertEqual(
+            ai_plan["next_deployment"]["recommended_position"],
+            evidence["ranked_positions"][0]["position"],
+        )
+
+    def test_setup_skips_already_deployed_models_even_if_scene_still_lists_them(self):
+        runtime, bridge = self._runtime_with_roster_setup()
+        runtime.setup()
+
+        for contained_guid in (
+            "card-ai-chosen-1",
+            "card-ai-balefire-1",
+            "card-ai-icon-1",
+            "card-ai-butcher-1",
+            "card-ai-warrior-1",
+            "card-ai-warrior-2",
+        ):
+            runtime.select_roster_card(contained_guid)
+
+        for index, contained_guid in enumerate((
+            "card-op-chosen-1",
+            "card-op-warrior-1",
+            "card-op-warrior-2",
+            "card-op-butcher-1",
+            "card-op-balefire-1",
+            "card-op-icon-1",
+        )):
+            bridge.objects[contained_guid] = live_card(
+                next(item for item in bridge.containers["deck-op"]["items"] if item["guid"] == contained_guid),
+                x=18.0 + (index % 3),
+                z=-12.0 + (index // 3),
+            )
+            bridge.containers["deck-op"]["items"] = [
+                item for item in bridge.containers["deck-op"]["items"] if item["guid"] != contained_guid
+            ]
+
+        runtime.lock_rosters()
+        setup_state = runtime._state["setup"]  # noqa: SLF001 - test-only seam
+        ai_side = setup_state["sides"]["ai"]
+        ai_side["deployed_operatives"]["chosen#1"] = {
+            "operative_id": "chosen#1",
+            "semantic_operative_id": "ai:chosen#1",
+            "guid": "model-ai-chosen-1",
+        }
+        setup_state["current_batch_progress"] = 1
+
+        ai_plan = runtime.observe()["setup"]["ai_plan"]
+
+        self.assertNotIn("chosen#1", [entry["operative_id"] for entry in ai_plan["deployment_order"]])
+        self.assertEqual(ai_plan["next_deployment"]["operative_id"], "balefire_acolyte#1")
+        self.assertEqual(ai_plan["next_deployment"]["model_guid"], "model-ai-balefire-1")
 
     def test_setup_prefers_safe_objective_access_in_tactical_deployment(self):
         objects, containers = setup_fixture_with_rosters()
@@ -964,6 +1173,74 @@ class KillTeamRuntimeTests(unittest.TestCase):
         self.assertGreater(recommended["x"], -17.5)
         self.assertGreater(recommended["z"], 7.0)
 
+    def test_setup_ranks_elevated_slots_with_support_height_evidence(self):
+        objects, containers = setup_fixture_with_rosters()
+        objects.append(
+            elevated_terrain(
+                "blue-platform-large",
+                name="Blue Platform",
+                x=-18.0,
+                z=6.0,
+                size_x=10.0,
+                size_z=8.0,
+                center_y=3.0,
+                size_y=4.0,
+            )
+        )
+        bridge = FakeKillTeamBridge(objects, containers=containers, rolls=[[6], [2]])
+        runtime = KillTeamRuntime(
+            bridge,
+            KillTeamConfig(
+                ai_team="ai",
+                ai_dice_count=1,
+                opponent_dice_count=1,
+            ),
+        )
+
+        runtime.setup()
+        for contained_guid in (
+            "card-ai-chosen-1",
+            "card-ai-warrior-1",
+            "card-ai-warrior-2",
+            "card-ai-butcher-1",
+            "card-ai-balefire-1",
+            "card-ai-icon-1",
+        ):
+            runtime.select_roster_card(contained_guid)
+        for index, contained_guid in enumerate((
+            "card-op-chosen-1",
+            "card-op-warrior-1",
+            "card-op-warrior-2",
+            "card-op-butcher-1",
+            "card-op-balefire-1",
+            "card-op-icon-1",
+        )):
+            bridge.objects[contained_guid] = live_card(
+                next(item for item in bridge.containers["deck-op"]["items"] if item["guid"] == contained_guid),
+                x=18.0 + (index % 3),
+                z=-12.0 + (index // 3),
+            )
+            bridge.containers["deck-op"]["items"] = [
+                item for item in bridge.containers["deck-op"]["items"] if item["guid"] != contained_guid
+            ]
+
+        locked = runtime.lock_rosters()
+        evidence = locked["setup"]["ai_plan"]["next_deployment"]["recommended_position_evidence"]
+        recommended = locked["setup"]["ai_plan"]["next_deployment"]["recommended_position"]
+
+        self.assertIsNotNone(evidence)
+        self.assertGreater(evidence["candidate_count"], 0)
+        self.assertEqual(recommended, evidence["ranked_positions"][0]["position"])
+        elevated = next(
+            (slot for slot in evidence["ranked_positions"] if slot["support_height"] > 1.0),
+            None,
+        )
+        self.assertIsNotNone(elevated)
+        self.assertIn(
+            "blue-platform-large",
+            [source["guid"] for source in elevated["support_sources"]],
+        )
+
     def test_setup_team_play_style_prefers_cover_for_tau_like_tags(self):
         runtime = KillTeamRuntime(FakeKillTeamBridge(setup_fixture_with_rosters()[0]))
 
@@ -1004,6 +1281,60 @@ class KillTeamRuntimeTests(unittest.TestCase):
 
         with self.assertRaisesRegex(KillTeamRuleError, "duplicate limit"):
             runtime.select_roster_card("card-ai-butcher-2")
+
+    def test_select_setup_card_places_non_operative_card_and_lock_ignores_it(self):
+        runtime, bridge = self._runtime_with_roster_setup()
+        bridge.containers["deck-ai"]["items"].append(
+            roster_card_item(
+                "card-ai-equipment-1",
+                side_id="ai",
+                faction_id="legionary",
+                operative_type_id="krak_grenade",
+                instance_id="1",
+                role="equipment",
+                card_kind="equipment",
+            )
+        )
+        runtime.setup()
+
+        selected = runtime.select_setup_card("card-ai-equipment-1")
+        self.assertEqual(selected["status"], "selected")
+        self.assertEqual(selected["card_kind"], "equipment")
+
+        for contained_guid in (
+            "card-ai-chosen-1",
+            "card-ai-warrior-1",
+            "card-ai-warrior-2",
+            "card-ai-butcher-1",
+            "card-ai-balefire-1",
+            "card-ai-icon-1",
+        ):
+            runtime.select_roster_card(contained_guid)
+
+        for index, contained_guid in enumerate((
+            "card-op-chosen-1",
+            "card-op-warrior-1",
+            "card-op-warrior-2",
+            "card-op-butcher-1",
+            "card-op-balefire-1",
+            "card-op-icon-1",
+        )):
+            bridge.objects[contained_guid] = live_card(
+                next(item for item in bridge.containers["deck-op"]["items"] if item["guid"] == contained_guid),
+                x=18.0 + (index % 3),
+                z=-12.0 + (index // 3),
+            )
+            bridge.containers["deck-op"]["items"] = [
+                item for item in bridge.containers["deck-op"]["items"] if item["guid"] != contained_guid
+            ]
+
+        locked = runtime.lock_rosters()
+        observation = runtime.observe()
+
+        self.assertEqual(locked["status"], "locked")
+        self.assertEqual(observation["setup"]["sides"]["ai"]["selected_count"], 6)
+        self.assertEqual(observation["setup"]["sides"]["ai"]["selected_setup_count"], 1)
+        self.assertEqual(observation["setup"]["sides"]["ai"]["selected_card_counts"]["equipment"], 1)
 
     def test_lock_rosters_validates_lists_and_starts_initiative_deployment(self):
         runtime, bridge = self._runtime_with_roster_setup()
@@ -1103,6 +1434,148 @@ class KillTeamRuntimeTests(unittest.TestCase):
         self.assertEqual(observation["setup"]["current_batch_target"], 2)
         self.assertEqual(observation["setup"]["current_batch_progress"], 0)
 
+    def test_deploy_setup_operative_adjusts_y_for_elevated_terrain(self):
+        objects, containers = setup_fixture_with_rosters()
+        objects.append(
+            elevated_terrain(
+                "blue-platform",
+                name="Blue Platform",
+                x=-20.0,
+                z=6.0,
+                size_x=10.0,
+                size_z=8.0,
+                center_y=3.0,
+                size_y=4.0,
+            )
+        )
+        bridge = FakeKillTeamBridge(objects, containers=containers, rolls=[[6], [2]])
+        runtime = KillTeamRuntime(
+            bridge,
+            KillTeamConfig(
+                ai_team="ai",
+                ai_dice_count=1,
+                opponent_dice_count=1,
+            ),
+        )
+        runtime.setup()
+        for contained_guid in (
+            "card-ai-chosen-1",
+            "card-ai-warrior-1",
+            "card-ai-warrior-2",
+            "card-ai-butcher-1",
+            "card-ai-balefire-1",
+            "card-ai-icon-1",
+        ):
+            runtime.select_roster_card(contained_guid)
+        for index, contained_guid in enumerate((
+            "card-op-chosen-1",
+            "card-op-warrior-1",
+            "card-op-warrior-2",
+            "card-op-butcher-1",
+            "card-op-balefire-1",
+            "card-op-icon-1",
+        )):
+            bridge.objects[contained_guid] = live_card(
+                next(item for item in bridge.containers["deck-op"]["items"] if item["guid"] == contained_guid),
+                x=18.0 + (index % 3),
+                z=-12.0 + (index // 3),
+            )
+            bridge.containers["deck-op"]["items"] = [
+                item for item in bridge.containers["deck-op"]["items"] if item["guid"] != contained_guid
+            ]
+        runtime.lock_rosters()
+
+        runtime.start_setup_deployment("chosen#1")
+        result = runtime.deploy_setup_operative("model-ai-chosen-1", {"x": -20.0, "y": 0.0, "z": 6.0})
+
+        self.assertEqual(result["status"], "deployed")
+        self.assertEqual(bridge.objects["model-ai-chosen-1"]["position"], {
+            "x": -20.0,
+            "y": 6.0,
+            "z": 6.0,
+        })
+
+    def test_deploy_setup_operative_adjusts_y_for_blocks_los_terrain(self):
+        objects, containers = setup_fixture_with_rosters()
+        objects.append(
+            blocks_los_terrain(
+                "blue-platform",
+                name="Blue Platform",
+                x=-20.0,
+                z=6.0,
+                size_x=10.0,
+                size_z=8.0,
+                center_y=3.0,
+                size_y=4.0,
+            )
+        )
+        bridge = FakeKillTeamBridge(objects, containers=containers, rolls=[[6], [2]])
+        runtime = KillTeamRuntime(
+            bridge,
+            KillTeamConfig(
+                ai_team="ai",
+                ai_dice_count=1,
+                opponent_dice_count=1,
+            ),
+        )
+        runtime.setup()
+        for contained_guid in (
+            "card-ai-chosen-1",
+            "card-ai-warrior-1",
+            "card-ai-warrior-2",
+            "card-ai-butcher-1",
+            "card-ai-balefire-1",
+            "card-ai-icon-1",
+        ):
+            runtime.select_roster_card(contained_guid)
+        for index, contained_guid in enumerate((
+            "card-op-chosen-1",
+            "card-op-warrior-1",
+            "card-op-warrior-2",
+            "card-op-butcher-1",
+            "card-op-balefire-1",
+            "card-op-icon-1",
+        )):
+            bridge.objects[contained_guid] = live_card(
+                next(item for item in bridge.containers["deck-op"]["items"] if item["guid"] == contained_guid),
+                x=18.0 + (index % 3),
+                z=-12.0 + (index // 3),
+            )
+            bridge.containers["deck-op"]["items"] = [
+                item for item in bridge.containers["deck-op"]["items"] if item["guid"] != contained_guid
+            ]
+        runtime.lock_rosters()
+
+        runtime.start_setup_deployment("chosen#1")
+        result = runtime.deploy_setup_operative("model-ai-chosen-1", {"x": -20.0, "y": 0.0, "z": 6.0})
+
+        self.assertEqual(result["status"], "deployed")
+        self.assertEqual(bridge.objects["model-ai-chosen-1"]["position"], {
+            "x": -20.0,
+            "y": 6.0,
+            "z": 6.0,
+        })
+        self.assertIn(
+            (
+                "take_from_container",
+                "roster-ai",
+                "model-ai-chosen-1",
+                None,
+                {"x": -20.0, "y": 5.0, "z": 6.0},
+                False,
+                False,
+            ),
+            bridge.calls,
+        )
+        self.assertIn(
+            (
+                "move_object",
+                "model-ai-chosen-1",
+                {"x": -20.0, "y": 6.0, "z": 6.0},
+            ),
+            bridge.calls,
+        )
+
     def test_reconcile_setup_step_validates_human_side_one_operative_at_a_time(self):
         runtime, bridge = self._runtime_with_roster_setup()
         runtime.setup()
@@ -1176,6 +1649,29 @@ class KillTeamRuntimeTests(unittest.TestCase):
                 "snap_point_tags_json": '["_start_test_spot"]',
             },
         )])
+
+    def test_live_bridge_falls_back_to_setup_list_objects_when_legacy_list_objects_is_unavailable(self):
+        calls = []
+
+        def request(action, args):
+            calls.append((action, args))
+            if action == "killteam_list_objects":
+                raise RuntimeError("Unknown placement MCP action: killteam_list_objects")
+            return {"objects": [{"guid": "model-1", "name": "Plague Marine Warrior", "tags": ["Operative"]}]}
+
+        bridge = TTSKillTeamBridge(request)
+
+        result = bridge.list_objects(
+            max_results=1000,
+            compact=True,
+            required_guids=["96fe20"],
+            query_tags=["Operative", "_dice_blue"],
+            snap_point_tags=["_start_test_spot"],
+        )
+
+        self.assertEqual(calls[0][0], "killteam_list_objects")
+        self.assertEqual(calls[1], ("setup_list_objects", {"max_results": 1000, "compact": True}))
+        self.assertEqual(result["objects"][0]["guid"], "model-1")
 
     def test_live_bridge_uses_zero_argument_deployment_resolver(self):
         calls = []
@@ -1322,6 +1818,8 @@ class KillTeamRuntimeTests(unittest.TestCase):
             "y": 1.0,
             "z": -10.25,
         })
+        self.assertEqual(plan["placements"][0]["support_height"], 0.0)
+        self.assertEqual(plan["placements"][0]["support_sources"], [])
         self.assertEqual(plan["deployment_zone"]["bounds"], {
             "min_x": -33.0,
             "max_x": -3.0,
@@ -1329,6 +1827,56 @@ class KillTeamRuntimeTests(unittest.TestCase):
             "max_z": -5.0,
         })
         self.assertIn(("get_setup_roster_cards", "aefe3b"), bridge.calls)
+
+    def test_plan_setup_board_raises_y_over_terrain_support_surface(self):
+        objects = save_131_native_objects()
+        deployment = next(item for item in objects if item["guid"] == "865d5c")
+        deployment["position"] = {"x": -18.0, "y": 1.0, "z": 6.0}
+        deployment["bounds"]["center"] = {"x": -18.0, "y": 1.0, "z": 6.0}
+        deployment["bounds"]["size"] = {"x": 2.0, "y": 2.0, "z": 2.0}
+        bridge = FakeKillTeamBridge(
+            objects,
+            setup_roster_cards={
+                "aefe3b": [save_131_roster_card("card-warrior", "Plague Marine Warrior")]
+            },
+        )
+        runtime = KillTeamRuntime(
+            bridge,
+            KillTeamConfig(fixture_profile=SAVE_131_FIXTURE_PROFILE.name),
+        )
+
+        plan = runtime.plan_setup_board()
+
+        placement = plan["placements"][0]
+        self.assertEqual(placement["support_height"], 5.0)
+        self.assertEqual(placement["target_position"]["y"], 6.0)
+        self.assertEqual(placement["support_sources"][0]["guid"], "blue-platform")
+
+    def test_plan_setup_board_raises_y_over_blocks_los_terrain_support_surface(self):
+        objects = save_131_native_objects()
+        deployment = next(item for item in objects if item["guid"] == "865d5c")
+        deployment["position"] = {"x": -18.0, "y": 1.0, "z": 6.0}
+        deployment["bounds"]["center"] = {"x": -18.0, "y": 1.0, "z": 6.0}
+        deployment["bounds"]["size"] = {"x": 2.0, "y": 2.0, "z": 2.0}
+        platform = next(item for item in objects if item["guid"] == "blue-platform")
+        platform["tags"] = tag("blocks_los=true")
+        bridge = FakeKillTeamBridge(
+            objects,
+            setup_roster_cards={
+                "aefe3b": [save_131_roster_card("card-warrior", "Plague Marine Warrior")]
+            },
+        )
+        runtime = KillTeamRuntime(
+            bridge,
+            KillTeamConfig(fixture_profile=SAVE_131_FIXTURE_PROFILE.name),
+        )
+
+        plan = runtime.plan_setup_board()
+
+        placement = plan["placements"][0]
+        self.assertEqual(placement["support_height"], 5.0)
+        self.assertEqual(placement["target_position"]["y"], 6.0)
+        self.assertEqual(placement["support_sources"][0]["guid"], "blue-platform")
 
     def test_execute_setup_board_unlocks_renames_and_moves_frozen_plan(self):
         objects = save_131_native_objects()
@@ -1372,16 +1920,11 @@ class KillTeamRuntimeTests(unittest.TestCase):
 
     def test_plan_setup_board_fails_when_geometry_blocks_all_slots(self):
         objects = save_131_native_objects()
-        objects.append({
-            "guid": "huge-wall",
-            "name": "Huge Wall",
-            "tags": ["KT_MISSION_TERRAIN"],
-            "position": {"x": -18.0, "y": 1.0, "z": -8.0},
-            "bounds": {
-                "center": {"x": -18.0, "y": 1.0, "z": -8.0},
-                "size": {"x": 40.0, "y": 2.0, "z": 10.0},
-            },
-        })
+        blocker = mission_objective("huge-blocker", name="Huge Objective", x=-18.0, z=-8.0, size=40.0)
+        blocker["position"]["y"] = 3.0
+        blocker["bounds"]["center"]["y"] = 3.0
+        blocker["bounds"]["size"]["y"] = 10.0
+        objects.append(blocker)
         bridge = FakeKillTeamBridge(
             objects,
             setup_roster_cards={
@@ -1419,6 +1962,34 @@ class KillTeamRuntimeTests(unittest.TestCase):
         self.assertEqual(result["failed_phase"], "preflight")
         self.assertIn("stale", result["error"])
         self.assertFalse(any(call[0] == "move_object" for call in bridge.calls))
+
+    def test_execute_setup_board_rejects_stale_support_height_change(self):
+        objects = save_131_native_objects()
+        deployment = next(item for item in objects if item["guid"] == "865d5c")
+        deployment["position"] = {"x": -18.0, "y": 1.0, "z": 6.0}
+        deployment["bounds"]["center"] = {"x": -18.0, "y": 1.0, "z": 6.0}
+        deployment["bounds"]["size"] = {"x": 2.0, "y": 2.0, "z": 2.0}
+        bridge = FakeKillTeamBridge(
+            objects,
+            setup_roster_cards={
+                "aefe3b": [save_131_roster_card("card-warrior", "Plague Marine Warrior")]
+            },
+        )
+        runtime = KillTeamRuntime(
+            bridge,
+            KillTeamConfig(fixture_profile=SAVE_131_FIXTURE_PROFILE.name),
+        )
+        plan = runtime.plan_setup_board()
+
+        platform = next(item for item in bridge.objects.values() if item.get("guid") == "blue-platform")
+        platform["position"]["y"] += 1.0
+        platform["bounds"]["center"]["y"] += 1.0
+
+        result = runtime.execute_setup_board(plan["plan_id"])
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["failed_phase"], "preflight")
+        self.assertIn("stale", result["error"])
 
     def test_save_131_validation_shot_pauses_for_red_then_applies_real_wounds(self):
         bridge = FakeKillTeamBridge(
@@ -1523,6 +2094,32 @@ class KillTeamRuntimeTests(unittest.TestCase):
             "query_tags": list(_GENERIC_SETUP_QUERY_TAGS),
         }])
 
+    def test_setup_model_from_container_item_uses_provided_side_context(self):
+        runtime = KillTeamRuntime(FakeKillTeamBridge([]))
+
+        item = {
+            "guid": "model-1",
+            "name": "Plague Marine Warrior",
+            "tags": [
+                "tts_mcp:entity=operative",
+                "tts_mcp:operative_type_id=plague-warrior",
+                "tts_mcp:instance_id=01",
+                "tts_mcp:faction_id=death-guard",
+                "tts_mcp:role=gunner",
+            ],
+            "object": {
+                "type": "Figurine",
+                "position": {"x": 1.0, "y": 2.0, "z": 3.0},
+                "bounds": {"size": {"x": 1.0, "y": 1.0, "z": 1.0}},
+            },
+        }
+
+        model = runtime._setup_model_from_container_item(item, "opponent")
+
+        self.assertEqual(model["side_id"], "opponent")
+        self.assertEqual(model["operative_id"], "plague-warrior#01")
+        self.assertEqual(model["faction_id"], "death-guard")
+
     def test_setup_falls_back_to_a_raw_generic_scan_when_the_canonical_generic_scan_is_empty(self):
         from tts_mcp.runtime.killteam_runtime import _GENERIC_SETUP_QUERY_TAGS
 
@@ -1611,6 +2208,39 @@ class KillTeamRuntimeTests(unittest.TestCase):
             "compact": True,
         }])
 
+    def test_test_deployment_raises_y_over_elevated_terrain(self):
+        objects = save_131_native_objects()
+        objects.append(
+            elevated_terrain(
+                "blue-platform",
+                name="Blue Platform",
+                x=-18.0,
+                z=-8.0,
+                size_x=10.0,
+                size_z=8.0,
+                center_y=3.0,
+                size_y=4.0,
+            )
+        )
+        model = next(item for item in objects if item["guid"] == "96fe20")
+        model["guid"] = "aa11bb"
+        bridge = FakeKillTeamBridge(objects)
+        runtime = KillTeamRuntime(bridge)
+
+        result = runtime.deploy_test_model()
+
+        self.assertEqual(result["status"], "verified")
+        self.assertEqual(bridge.objects["aa11bb"]["position"], {
+            "x": -18.0,
+            "y": 6.0,
+            "z": -8.0,
+        })
+        self.assertEqual(result["position"], {
+            "x": -18.0,
+            "y": 6.0,
+            "z": -8.0,
+        })
+
     def test_roster_request_returns_dedicated_container_contents(self):
         bridge = FakeKillTeamBridge(fixture_objects())
         runtime = KillTeamRuntime(bridge)
@@ -1629,7 +2259,7 @@ class KillTeamRuntimeTests(unittest.TestCase):
         observation = runtime.observe()
 
         self.assertEqual(observation["observation_id"], 1)
-        self.assertEqual(observation["map_revision"], 0)
+        self.assertGreater(observation["map_revision"], 0)
         self.assertEqual(observation["roller_guid"], "roller")
         self.assertEqual(observation["dice"]["ai"], ["die-a", "die-b", "die-c", "die-d"])
         self.assertEqual(observation["counters"]["cp"]["guid"], "cp")
@@ -1670,7 +2300,11 @@ class KillTeamRuntimeTests(unittest.TestCase):
     def test_place_activate_and_shoot_resolves_physical_attack_and_damage(self):
         bridge = FakeKillTeamBridge(
             fixture_objects(),
-            rolls=[[5, 4, 2, 1], [2, 1, 4]],
+            rolls=[
+                [5, 4, 2, 1], [2, 1, 4],
+                [5, 4, 2, 1], [2, 1, 4],
+                [5, 4, 2, 1], [2, 1, 4],
+            ],
         )
         runtime = KillTeamRuntime(bridge)
         runtime.setup()
@@ -1703,6 +2337,33 @@ class KillTeamRuntimeTests(unittest.TestCase):
                 "plague-warrior-01",
                 [{"x": 1.0, "y": 1.0, "z": 0.0}],
             )
+
+    def test_take_tactical_turn_activates_attacks_and_passes_initiative(self):
+        bridge = FakeKillTeamBridge(
+            fixture_objects(),
+            rolls=[[5, 4, 2, 1], [2, 1, 4]],
+        )
+        runtime = KillTeamRuntime(bridge)
+        runtime.setup()
+        runtime._state["phase"] = "command"
+
+        result = runtime.take_tactical_turn(trigger="Your turn")
+        observation = runtime.observe()
+
+        self.assertEqual(result["status"], "passed")
+        self.assertEqual(result["initiative_side"], "opponent")
+        self.assertEqual(result["turn_owner"], "opponent")
+        self.assertEqual(result["turn_status"], "passed")
+        self.assertEqual(result["turn_sequence"], 1)
+        self.assertEqual(observation["initiative_side"], "opponent")
+        self.assertEqual(observation["turn_owner"], "opponent")
+        self.assertEqual(observation["turn_status"], "passed")
+        self.assertIsNone(observation["active_operative_id"])
+        self.assertEqual(result["actions"][0]["action"], "activate_operative")
+        self.assertTrue(any(item["action"] == "shoot" for item in result["actions"]))
+        self.assertEqual(result["revision"], observation["revision"])
+        self.assertTrue(any(call[0] == "probe_line_of_sight" for call in bridge.calls))
+        self.assertTrue(any(call[0] == "roll_dice" for call in bridge.calls))
 
     def test_hidden_target_cannot_be_selected(self):
         runtime = KillTeamRuntime(FakeKillTeamBridge(fixture_objects(), rolls=[]))

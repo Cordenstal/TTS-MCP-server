@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import copy
+from typing import Any
 import unittest
 from unittest.mock import patch
 import json
 
 from tts_mcp.app.http_gateway import ChatBackend, _public_ai_text
+from tts_mcp.runtime.gameplay_runtime import ParsedCommand
 
 
 def _load_tts_server():
@@ -246,7 +249,7 @@ class PublicAITextTests(unittest.TestCase):
             "kind": "http",
             "url": "http://127.0.0.1:11434/api/chat",
             "format": "ollama",
-            "model": "gemma4:12b",
+            "model": "gemma4:26b-a4b-it-qat",
         })
         backend.controller_provider = lambda: {}
         backend.configure_observation_tools({
@@ -339,7 +342,7 @@ class PublicAITextTests(unittest.TestCase):
             "kind": "http",
             "url": "http://127.0.0.1:11434/api/chat",
             "format": "ollama",
-            "model": "gemma4:12b",
+            "model": "gemma4:26b-a4b-it-qat",
         })
         captures = []
         backend.configure_observation_tools({
@@ -363,7 +366,7 @@ class PublicAITextTests(unittest.TestCase):
             "kind": "http",
             "url": "http://127.0.0.1:11434/api/chat",
             "format": "ollama",
-            "model": "gemma4:12b",
+            "model": "gemma4:26b-a4b-it-qat",
         })
         backend.controller_provider = lambda: {}
         backend.configure_observation_tools({
@@ -435,13 +438,51 @@ class PublicAITextTests(unittest.TestCase):
         self.assertTrue(result["execution"]["stopped"])
         self.assertFalse(any(action == "move_object" and args["guid"] == "123456" for action, args in calls))
 
+    def test_killteam_your_turn_request_invokes_autonomous_tactical_turn(self) -> None:
+        backend = ChatBackend()
+        request_calls = []
+        turn_completed = []
+
+        def request(action: str, args: dict) -> dict:
+            request_calls.append((action, args))
+            return {
+                "status": "passed",
+                "trigger": args.get("trigger", ""),
+                "actions": [
+                    {"action": "activate_operative", "result": {"operative_id": "plague-warrior-01"}},
+                    {"action": "shoot", "result": {"target_id": "target-01", "weapon_id": "boltgun"}},
+                    {"action": "end_activation", "result": {"status": "ended"}},
+                ],
+                "initiative_side": "opponent",
+                "initiative_token": {"status": "moved"},
+                "turn_owner": "opponent",
+                "turn_status": "passed",
+                "turn_sequence": 1,
+                "revision": 7,
+            }
+
+        backend.configure_gameplay(
+            controller_provider=lambda: {"state": "running", "active_game": "killteam"},
+            request=request,
+            propose=lambda _: "unused",
+            turn_completed=lambda side: turn_completed.append(side),
+        )
+
+        result = backend.complete({"message": "Your turn", "conversation_id": "killteam-turn-test"})
+
+        self.assertTrue(result["autonomous"])
+        self.assertTrue(result["initiative_passed"])
+        self.assertIn("passed initiative", result["text"].lower())
+        self.assertEqual(request_calls, [("killteam_take_tactical_turn", {"trigger": "Your turn"})])
+        self.assertEqual(turn_completed, ["ai"])
+
     def test_large_move_failure_gets_model_visible_ollama_image_review(self) -> None:
         backend = ChatBackend()
         backend.reload({
             "kind": "http",
             "url": "http://127.0.0.1:11434/api/chat",
             "format": "ollama",
-            "model": "gemma4:12b",
+            "model": "gemma4:26b-a4b-it-qat",
         })
         backend.controller_provider = lambda: {"state": "running", "active_game": ""}
         backend.configure_observation_tools({
@@ -580,6 +621,47 @@ class PublicAITextTests(unittest.TestCase):
                 "compact": True,
             }),
         ])
+
+    def test_setup_turn_exposes_only_placement_context_tools(self) -> None:
+        backend = ChatBackend()
+        backend.controller_provider = lambda: {"active_game": "killteam"}
+
+        names = {
+            item["function"]["name"]
+            for item in backend._observation_tool_specs(setup_turn=True)
+        }
+
+        self.assertEqual(names, {
+            "tts_killteam_setup_ping",
+            "tts_killteam_setup_context",
+        })
+        with self.assertRaises(ValueError):
+            backend._validate_observation_call(
+                {"name": "tts_killteam_plan_setup_board", "arguments": {}},
+                setup_turn=True,
+            )
+
+    def test_setup_context_receives_persisted_placed_guids_for_planning(self) -> None:
+        backend = ChatBackend()
+        backend.controller_provider = lambda: {
+            "active_game": "killteam",
+            "killteam_setup_history": {"placed_guids": ["placed-b", "placed-a", "placed-a"]},
+        }
+        calls: list[dict] = []
+        backend.configure_observation_tools({
+            "tts_killteam_setup_context": lambda args: calls.append(dict(args)) or {
+                "categories": {"operatives": []},
+                "setup_plan": {"batch_size": 2, "recommended_batch": [], "candidates": []},
+            },
+        })
+
+        result = backend._invoke_observation(
+            {"name": "tts_killteam_setup_context", "arguments": {}},
+            setup_turn=True,
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(calls, [{"max_results": 200, "exclude_guids": ["placed-a", "placed-b"]}])
 
     def test_ai_can_dispatch_killteam_objective_move_planner(self) -> None:
         backend = ChatBackend()
@@ -1103,7 +1185,7 @@ class PublicAITextTests(unittest.TestCase):
             "kind": "http",
             "url": "http://127.0.0.1:11434/api/chat",
             "format": "ollama",
-            "model": "gemma4:12b",
+            "model": "gemma4:26b-a4b-it-qat",
         })
 
         class Response:
@@ -1128,7 +1210,7 @@ class PublicAITextTests(unittest.TestCase):
             "kind": "http",
             "url": "http://127.0.0.1:11434/api/chat",
             "format": "ollama",
-            "model": "gemma4:12b",
+            "model": "gemma4:26b-a4b-it-qat",
         })
 
         class Response:
@@ -1237,7 +1319,57 @@ class KillTeamDefenseAcknowledgmentTests(unittest.TestCase):
 
 
 class KillTeamSetupBoardCommandTests(unittest.TestCase):
-    def test_autorun_setup_is_forwarded_for_ai_reasoning(self) -> None:
+    def test_autorun_setup_is_left_for_the_ai_placement_turn(self) -> None:
+        backend = ChatBackend()
+        calls: list[tuple[str, dict]] = []
+        backend.configure_gameplay(
+            controller_provider=lambda: {"active_game": "killteam", "state": "running"},
+            request=lambda action, args: calls.append((action, args)) or {
+                "executed": [{
+                    "action": "killteam_autorun_setup",
+                    "status": "executed",
+                    "result": {"final_state": {"stage": "deployment"}},
+                }],
+                "approval_required": [],
+                "stopped": False,
+            },
+            propose=lambda _proposal: "unused",
+        )
+
+        result = backend.handle_killteam_setup_board_command(
+            "KILLTEAM_AUTORUN_SETUP",
+            is_host=False,
+        )
+
+        self.assertIsNone(result)
+        self.assertEqual(calls, [])
+
+    def test_autorun_setup_does_not_report_a_runtime_batch_stop(self) -> None:
+        backend = ChatBackend()
+        backend.configure_gameplay(
+            controller_provider=lambda: {"active_game": "killteam", "state": "running"},
+            request=lambda action, args: {
+                "executed": [{
+                    "action": action,
+                    "status": "failed",
+                    "reason": "no legal setup slot",
+                }],
+                "approval_required": [],
+                "blocked": [],
+                "stopped": True,
+                "stop_reason": "no legal setup slot",
+            },
+            propose=lambda _proposal: "unused",
+        )
+
+        result = backend.handle_killteam_setup_board_command(
+            "KILLTEAM_AUTORUN_SETUP",
+            is_host=False,
+        )
+
+        self.assertIsNone(result)
+
+    def test_autorun_setup_falls_back_without_gameplay_execution(self) -> None:
         backend = ChatBackend()
         backend.controller_provider = lambda: {"active_game": "killteam", "state": "running"}
 
@@ -1295,6 +1427,598 @@ class KillTeamSetupBoardCommandTests(unittest.TestCase):
         self.assertEqual(len(result["parsed_commands"]), 2)
         self.assertIn("rejected", result["text"].lower())
 
+    def test_backend_executes_setup_batch_and_records_each_placement(self) -> None:
+        backend = ChatBackend()
+        saved: list[dict] = []
+        backend.controller_provider = lambda: {
+            "active_game": "killteam",
+            "state": "paused",
+            "killteam_setup_history": {},
+        }
+        backend._setup_history_saver = lambda placement: saved.append(dict(placement))
+        backend.command_execution = type(
+            "Executor",
+            (),
+            {
+                "execute": lambda _self, commands, **_kwargs: {
+                    "executed": [
+                        {
+                            "action": command.action,
+                            "status": "executed",
+                            "result": {"guid": command.args["guid"], "position": command.args},
+                        }
+                        for command in commands
+                    ],
+                    "approval_required": [],
+                    "blocked": [],
+                    "stopped": False,
+                },
+            },
+        )()
+        backend._context_local.setup_batch = {"batch_size": 2, "batch_target": 2}
+
+        result = backend._finalize_result(
+            {"text": "MOVE[a1b2c3,1,4.25,2]\nMOVE[d4e5f6,5,1.5,6]"},
+            {"message": "KILLTEAM_AUTORUN_SETUP"},
+        )
+
+        self.assertEqual([item["action"] for item in result["execution"]["executed"]], [
+            "killteam_setup_place_model",
+            "killteam_setup_place_model",
+        ])
+        self.assertEqual([item["guid"] for item in saved], ["a1b2c3", "d4e5f6"])
+        self.assertEqual([item["batch_size"] for item in saved], [2, 2])
+
+    def test_backend_completes_underfilled_second_round_from_authoritative_batch(self) -> None:
+        backend = ChatBackend()
+        controller = {
+            "active_game": "killteam",
+            "state": "paused",
+            "killteam_setup_history": {
+                "placed_guids": ["0e43c7", "7506bd"],
+                "batch_size": 2,
+            },
+        }
+        backend.controller_provider = lambda: controller
+        candidates = [
+            {
+                "candidate_id": "setup-883c89-00",
+                "guid": "883c89",
+                "source_position": {"x": 19.06101, "y": 1.5067, "z": -37.56811},
+                "position": {"x": -32.36769, "y": 1.5067, "z": -9.50513},
+                "footprint": {"min_x": -32.99356, "max_x": -31.74182, "min_z": -10.131, "max_z": -8.87926},
+            },
+            {
+                "candidate_id": "setup-96fe20-01",
+                "guid": "96fe20",
+                "source_position": {"x": -19.42437, "y": 1.50487, "z": -15.42729},
+                "position": {"x": -3.79303, "y": 1.50487, "z": -6.78668},
+                "footprint": {"min_x": -4.41887, "max_x": -3.16719, "min_z": -7.41252, "max_z": -6.16084},
+            },
+        ]
+        backend._enrich_setup_context(
+            {
+                "categories": {
+                    "operatives": [
+                        {"guid": candidate["guid"], "position": candidate["source_position"]}
+                        for candidate in candidates
+                    ] + [
+                        {"guid": "remaining-a", "position": {"x": 30, "y": 1.5, "z": -30}},
+                        {"guid": "remaining-b", "position": {"x": 31, "y": 1.5, "z": -31}},
+                    ],
+                },
+                "setup_plan": {
+                    "batch_size": 2,
+                    "recommended_batch": candidates,
+                    "candidates": candidates,
+                },
+            },
+            controller,
+        )
+        dispatched: list[list[ParsedCommand]] = []
+        backend.command_execution = type(
+            "Executor",
+            (),
+            {
+                "execute": lambda _self, commands, **_kwargs: dispatched.append(commands) or {
+                    "executed": [
+                        {"action": command.action, "status": "executed", "result": {"guid": command.args["guid"]}}
+                        for command in commands
+                    ],
+                    "approval_required": [],
+                    "blocked": [],
+                    "stopped": False,
+                },
+            },
+        )()
+        traces: list[tuple[str, dict]] = []
+
+        with patch(
+            "tts_mcp.app.http_gateway._record_trace",
+            side_effect=lambda kind, **payload: traces.append((kind, payload)),
+        ):
+            result = backend._finalize_result(
+                {"text": "SETUP_MOVE[setup-883c89-00]"},
+                {"message": "Place your next model"},
+            )
+
+        self.assertFalse(result["execution"]["stopped"])
+        self.assertEqual(
+            [command.args["guid"] for command in dispatched[0]],
+            ["883c89", "96fe20"],
+        )
+        completion = [payload for kind, payload in traces if kind == "ai_setup_batch_completed"]
+        self.assertEqual(len(completion), 1)
+        self.assertEqual(completion[0]["model_candidate_ids"], ["setup-883c89-00"])
+        self.assertEqual(completion[0]["supplied_candidate_ids"], ["setup-96fe20-01"])
+
+    def test_backend_completes_empty_setup_response_only_with_fresh_exact_batch(self) -> None:
+        backend = ChatBackend()
+        backend.controller_provider = lambda: {
+            "active_game": "killteam",
+            "state": "paused",
+            "killteam_setup_history": {},
+        }
+        backend._context_local.setup_batch = {"batch_size": 1, "batch_target": 1}
+        backend._context_local.setup_candidates = {
+            "setup-a-00": {
+                "candidate_id": "setup-a-00",
+                "guid": "a1b2c3",
+                "source_position": {"x": 10, "y": 1.5, "z": 10},
+                "position": {"x": 1, "y": 4.25, "z": 2},
+                "footprint": {"min_x": 0.5, "max_x": 1.5, "min_z": 1.5, "max_z": 2.5},
+            },
+        }
+        backend._context_local.setup_batch_candidate_ids = {"setup-a-00"}
+        backend._context_local.setup_batch_candidate_order = ["setup-a-00"]
+        backend._context_local.setup_context_ready = True
+        dispatched: list[list[ParsedCommand]] = []
+        backend.command_execution = type(
+            "Executor",
+            (),
+            {
+                "execute": lambda _self, commands, **_kwargs: dispatched.append(commands) or {
+                    "executed": [],
+                    "approval_required": [],
+                    "blocked": [],
+                    "stopped": False,
+                },
+            },
+        )()
+
+        result = backend._finalize_result(
+            {"text": "I could not produce a placement."},
+            {"message": "KILLTEAM_AUTORUN_SETUP"},
+        )
+
+        self.assertFalse(result["execution"]["stopped"])
+        self.assertEqual([command.args["guid"] for command in dispatched[0]], ["a1b2c3"])
+
+    def test_backend_preserves_first_setup_placement_when_second_fails(self) -> None:
+        backend = ChatBackend()
+        saved: list[dict] = []
+        backend.controller_provider = lambda: {
+            "active_game": "killteam",
+            "state": "paused",
+            "killteam_setup_history": {},
+        }
+        backend._setup_history_saver = lambda placement: saved.append(dict(placement))
+        backend.command_execution = type(
+            "Executor",
+            (),
+            {
+                "execute": lambda _self, commands, **_kwargs: {
+                    "executed": [
+                        {"action": "killteam_setup_place_model", "status": "executed", "result": {"guid": commands[0].args["guid"]}},
+                        {"action": "killteam_setup_place_model", "status": "failed", "reason": "overlap"},
+                    ],
+                    "approval_required": [],
+                    "blocked": [],
+                    "stopped": True,
+                },
+            },
+        )()
+        backend._context_local.setup_batch = {"batch_size": 2, "batch_target": 2}
+
+        result = backend._finalize_result(
+            {"text": "MOVE[a1b2c3,1,4.25,2]\nMOVE[d4e5f6,5,1.5,6]"},
+            {"message": "KILLTEAM_AUTORUN_SETUP"},
+        )
+
+        self.assertEqual([item["guid"] for item in saved], ["a1b2c3"])
+        self.assertTrue(result["execution"]["stopped"])
+
+    def test_backend_rejects_setup_guid_coordinate_cross_pair_before_dispatch(self) -> None:
+        backend = ChatBackend()
+        backend.controller_provider = lambda: {
+            "active_game": "killteam",
+            "state": "paused",
+            "killteam_setup_history": {},
+        }
+        calls: list[list[ParsedCommand]] = []
+        backend.command_execution = type(
+            "Executor",
+            (),
+            {"execute": lambda _self, commands, **_kwargs: calls.append(commands)},
+        )()
+        backend._context_local.setup_batch = {"batch_size": 2, "batch_target": 2}
+        backend._context_local.setup_candidates = {
+            "setup-a-00": {
+                "candidate_id": "setup-a-00",
+                "guid": "a1b2c3",
+                "source_position": {"x": 10, "y": 1.5, "z": 10},
+                "position": {"x": 1, "y": 4.25, "z": 2},
+                "footprint": {"min_x": 0.5, "max_x": 1.5, "min_z": 1.5, "max_z": 2.5},
+            },
+            "setup-b-00": {
+                "candidate_id": "setup-b-00",
+                "guid": "d4e5f6",
+                "source_position": {"x": 20, "y": 1.5, "z": 20},
+                "position": {"x": 5, "y": 1.5, "z": 6},
+                "footprint": {"min_x": 4.5, "max_x": 5.5, "min_z": 5.5, "max_z": 6.5},
+            },
+        }
+
+        result = backend._finalize_result(
+            {"text": "MOVE[a1b2c3,5,1.5,6]\nMOVE[d4e5f6,5,1.5,6]"},
+            {"message": "KILLTEAM_AUTORUN_SETUP"},
+        )
+
+        self.assertEqual(calls, [])
+        self.assertTrue(result["execution"]["stopped"])
+        self.assertIn("did not match", result["text"])
+        self.assertEqual(result["execution"]["blocked"][0]["candidate_validation"]["guid"], "a1b2c3")
+
+    def test_backend_normalizes_setup_y_from_matching_candidate(self) -> None:
+        backend = ChatBackend()
+        backend.controller_provider = lambda: {
+            "active_game": "killteam",
+            "state": "paused",
+            "killteam_setup_history": {},
+        }
+        dispatched: list[list[ParsedCommand]] = []
+        backend.command_execution = type(
+            "Executor",
+            (),
+            {
+                "execute": lambda _self, commands, **_kwargs: dispatched.append(commands) or {
+                    "executed": [
+                        {"action": command.action, "status": "executed", "result": {"guid": command.args["guid"]}}
+                        for command in commands
+                    ],
+                    "approval_required": [],
+                    "blocked": [],
+                    "stopped": False,
+                },
+            },
+        )()
+        backend._context_local.setup_batch = {"batch_size": 1, "batch_target": 1}
+        backend._context_local.setup_candidates = {
+            "setup-a-00": {
+                "candidate_id": "setup-a-00",
+                "guid": "a1b2c3",
+                "source_position": {"x": 10, "y": 1.5, "z": 10},
+                "position": {"x": 1, "y": 4.25, "z": 2},
+                "footprint": {"min_x": 0.5, "max_x": 1.5, "min_z": 1.5, "max_z": 2.5},
+            },
+        }
+
+        result = backend._finalize_result(
+            {"text": "MOVE[a1b2c3,1,1.5,2]"},
+            {"message": "KILLTEAM_AUTORUN_SETUP"},
+        )
+
+        self.assertFalse(result["execution"]["stopped"])
+        self.assertEqual(dispatched[0][0].args, {"guid": "a1b2c3", "x": 1.0, "y": 4.25, "z": 2.0})
+
+    def test_backend_resolves_setup_candidate_id_without_coordinate_transcription(self) -> None:
+        backend = ChatBackend()
+        backend.controller_provider = lambda: {
+            "active_game": "killteam",
+            "state": "paused",
+            "killteam_setup_history": {},
+        }
+        dispatched: list[list[ParsedCommand]] = []
+        backend.command_execution = type(
+            "Executor",
+            (),
+            {
+                "execute": lambda _self, commands, **_kwargs: dispatched.append(commands) or {
+                    "executed": [
+                        {"action": command.action, "status": "executed", "result": {"guid": command.args["guid"]}}
+                        for command in commands
+                    ],
+                    "approval_required": [],
+                    "blocked": [],
+                    "stopped": False,
+                },
+            },
+        )()
+        backend._context_local.setup_batch = {"batch_size": 1, "batch_target": 1}
+        backend._context_local.setup_candidates = {
+            "setup-a-00": {
+                "candidate_id": "setup-a-00",
+                "guid": "a1b2c3",
+                "source_position": {"x": 10, "y": 1.5, "z": 10},
+                "position": {"x": -3.793, "y": 1.50982, "z": -9.50521},
+                "footprint": {"min_x": -4.3, "max_x": -3.3, "min_z": -10.0, "max_z": -9.0},
+            },
+        }
+
+        result = backend._finalize_result(
+            {"text": "SETUP_MOVE[setup-a-00]"},
+            {"message": "KILLTEAM_AUTORUN_SETUP"},
+        )
+
+        self.assertFalse(result["execution"]["stopped"])
+        self.assertEqual(dispatched[0][0].args, {
+            "guid": "a1b2c3",
+            "x": -3.793,
+            "y": 1.50982,
+            "z": -9.50521,
+        })
+
+    def test_setup_rejects_candidates_outside_the_recommended_batch(self) -> None:
+        backend = ChatBackend()
+        backend.controller_provider = lambda: {
+            "active_game": "killteam",
+            "state": "paused",
+            "killteam_setup_history": {},
+        }
+        calls: list[list[ParsedCommand]] = []
+        backend.command_execution = type(
+            "Executor",
+            (),
+            {"execute": lambda _self, commands, **_kwargs: calls.append(commands)},
+        )()
+        backend._context_local.setup_batch = {"batch_size": 2, "batch_target": 2}
+        backend._context_local.setup_batch_candidate_ids = {"setup-a-00"}
+        backend._context_local.setup_candidates = {
+            "setup-a-00": {
+                "candidate_id": "setup-a-00",
+                "guid": "a1b2c3",
+                "source_position": {"x": 10, "y": 1.5, "z": 10},
+                "position": {"x": 1, "y": 4.25, "z": 2},
+                "footprint": {"min_x": 0.5, "max_x": 1.5, "min_z": 1.5, "max_z": 2.5},
+            },
+            "setup-b-00": {
+                "candidate_id": "setup-b-00",
+                "guid": "d4e5f6",
+                "source_position": {"x": 20, "y": 1.5, "z": 20},
+                "position": {"x": 1, "y": 4.25, "z": 2},
+                "footprint": {"min_x": 0.5, "max_x": 1.5, "min_z": 1.5, "max_z": 2.5},
+            },
+        }
+
+        result = backend._finalize_result(
+            {"text": "SETUP_MOVE[setup-b-00]\nSETUP_MOVE[setup-c-00]"},
+            {"message": "KILLTEAM_AUTORUN_SETUP"},
+        )
+
+        self.assertEqual(calls, [])
+        self.assertTrue(result["execution"]["stopped"])
+        validation = result["execution"]["blocked"][0]["candidate_validation"]
+        self.assertEqual(validation["reason"], "setup candidate is not in the recommended legal batch")
+        self.assertEqual(validation["allowed_candidate_ids"], ["setup-a-00"])
+
+    def test_natural_language_setup_resume_uses_the_placement_bridge(self) -> None:
+        backend = ChatBackend()
+        backend.controller_provider = lambda: {
+            "active_game": "killteam",
+            "state": "paused",
+            "killteam_setup_history": {},
+        }
+        dispatched: list[list[ParsedCommand]] = []
+        backend.command_execution = type(
+            "Executor",
+            (),
+            {
+                "execute": lambda _self, commands, **_kwargs: dispatched.append(commands) or {
+                    "executed": [
+                        {"action": command.action, "status": "executed", "result": {"guid": command.args["guid"]}}
+                        for command in commands
+                    ],
+                    "approval_required": [],
+                    "blocked": [],
+                    "stopped": False,
+                },
+            },
+        )()
+        backend._context_local.setup_batch = {"batch_size": 1, "batch_target": 1}
+        backend._context_local.setup_candidates = {
+            "setup-a-00": {
+                "candidate_id": "setup-a-00",
+                "guid": "a1b2c3",
+                "source_position": {"x": 10, "y": 1.5, "z": 10},
+                "position": {"x": 1, "y": 4.25, "z": 2},
+                "footprint": {"min_x": 0.5, "max_x": 1.5, "min_z": 1.5, "max_z": 2.5},
+            },
+        }
+
+        result = backend._finalize_result(
+            {"text": "SETUP_MOVE[setup-a-00]"},
+            {"message": "Place your next model"},
+        )
+
+        self.assertFalse(result["execution"]["stopped"])
+        self.assertEqual(dispatched[0][0].action, "killteam_setup_place_model")
+        self.assertEqual(dispatched[0][0].args["guid"], "a1b2c3")
+
+    def test_setup_guid_aliases_and_invalid_ids_repair_to_the_legal_batch(self) -> None:
+        backend = ChatBackend()
+        backend.controller_provider = lambda: {
+            "active_game": "killteam",
+            "state": "paused",
+            "killteam_setup_history": {},
+        }
+        dispatched: list[list[ParsedCommand]] = []
+        backend.command_execution = type(
+            "Executor",
+            (),
+            {
+                "execute": lambda _self, commands, **_kwargs: dispatched.append(commands) or {
+                    "executed": [
+                        {"action": command.action, "status": "executed", "result": {"guid": command.args["guid"]}}
+                        for command in commands
+                    ],
+                    "approval_required": [],
+                    "blocked": [],
+                    "stopped": False,
+                },
+            },
+        )()
+        backend._context_local.setup_batch = {"batch_size": 2, "batch_target": 2}
+        backend._context_local.setup_batch_candidate_ids = {"setup-a-00", "setup-b-00"}
+        backend._context_local.setup_candidates = {
+            "setup-a-00": {
+                "candidate_id": "setup-a-00",
+                "guid": "a1b2c3",
+                "source_position": {"x": 10, "y": 1.5, "z": 10},
+                "position": {"x": 1, "y": 4.25, "z": 2},
+                "footprint": {"min_x": 0.5, "max_x": 1.5, "min_z": 1.5, "max_z": 2.5},
+            },
+            "setup-b-00": {
+                "candidate_id": "setup-b-00",
+                "guid": "d4e5f6",
+                "source_position": {"x": 20, "y": 1.5, "z": 20},
+                "position": {"x": 5, "y": 1.5, "z": 6},
+                "footprint": {"min_x": 4.5, "max_x": 5.5, "min_z": 5.5, "max_z": 6.5},
+            },
+        }
+
+        result = backend._finalize_result(
+            {"text": "SETUP_MOVE[not-a-candidate]\nSETUP_MOVE[d4e5f6]"},
+            {"message": "KILLTEAM_AUTORUN_SETUP"},
+        )
+
+        self.assertFalse(result["execution"]["stopped"])
+        self.assertEqual(
+            [command.args["guid"] for command in dispatched[0]],
+            ["a1b2c3", "d4e5f6"],
+        )
+
+    def test_setup_context_reconciles_a_pending_physical_commit(self) -> None:
+        backend = ChatBackend()
+        saved: list[dict] = []
+        backend._setup_history_saver = lambda placement: saved.append(dict(placement))
+        result = backend._enrich_setup_context(
+            {
+                "categories": {
+                    "operatives": [
+                        {
+                            "guid": "a1b2c3",
+                            "position": {"x": -3.793, "y": 1.50982, "z": -9.50521},
+                        },
+                    ],
+                },
+                "setup_plan": {
+                    "batch_size": 2,
+                    "candidates": [],
+                    "recommended_batch": [],
+                },
+            },
+            {
+                "killteam_setup_history": {
+                    "placements": [],
+                    "pending_placements": [{
+                        "guid": "a1b2c3",
+                        "target_position": {"x": -3.793, "y": 1.60023, "z": -9.50521},
+                        "batch_size": 2,
+                    }],
+                },
+            },
+        )
+
+        self.assertEqual(result["setup_batch"]["placed_guids"], ["a1b2c3"])
+        self.assertEqual(result["setup_batch"]["remaining_models"], 0)
+        self.assertTrue(saved[0]["reconciled_from_pending"])
+
+    def test_setup_context_refills_batch_after_planner_recommends_placed_models(self) -> None:
+        backend = ChatBackend()
+        result = backend._enrich_setup_context(
+            {
+                "categories": {
+                    "operatives": [
+                        {"guid": "placed-a", "position": {"x": 0, "y": 1.5, "z": 0}},
+                        {"guid": "placed-b", "position": {"x": 0, "y": 1.5, "z": 0}},
+                        {"guid": "new-model-a", "position": {"x": 0, "y": 1.5, "z": 0}},
+                        {"guid": "new-model-b", "position": {"x": 0, "y": 1.5, "z": 0}},
+                    ],
+                },
+                "setup_plan": {
+                    "batch_size": 2,
+                    "recommended_batch": [
+                        {
+                            "guid": "placed-a",
+                            "candidate_id": "setup-placed-a-00",
+                            "position": {"x": 0, "y": 1.5, "z": 0},
+                        },
+                        {
+                            "guid": "placed-b",
+                            "candidate_id": "setup-placed-b-00",
+                            "position": {"x": 0, "y": 1.5, "z": 0},
+                        },
+                    ],
+                    "candidates": [
+                        {
+                            "guid": "new-model-a",
+                            "candidate_id": "setup-new-model-a-00",
+                            "position": {"x": 1, "y": 4.25, "z": 2},
+                            "footprint": {"min_x": 0, "max_x": 1, "min_z": 1, "max_z": 2},
+                        },
+                        {
+                            "guid": "new-model-b",
+                            "candidate_id": "setup-new-model-b-00",
+                            "position": {"x": 5, "y": 1.5, "z": 6},
+                            "footprint": {"min_x": 4, "max_x": 5, "min_z": 5, "max_z": 6},
+                        },
+                    ],
+                },
+            },
+            {"killteam_setup_history": {"placed_guids": ["placed-a", "placed-b"]}},
+        )
+
+        self.assertEqual(
+            [item["candidate_id"] for item in result["setup_plan"]["recommended_batch"]],
+            ["setup-new-model-a-00", "setup-new-model-b-00"],
+        )
+        self.assertEqual(result["setup_batch"]["batch_target"], 2)
+
+    def test_setup_context_refill_uses_remaining_count_for_final_partial_batch(self) -> None:
+        backend = ChatBackend()
+        result = backend._enrich_setup_context(
+            {
+                "categories": {
+                    "operatives": [
+                        {"guid": f"model-{index}", "position": {"x": 0, "y": 1.5, "z": 0}}
+                        for index in range(6)
+                    ],
+                },
+                "setup_plan": {
+                    "batch_size": 2,
+                    "recommended_batch": [],
+                    "candidates": [{
+                        "guid": "model-5",
+                        "candidate_id": "setup-model-5-00",
+                        "position": {"x": 8, "y": 1.5, "z": 8},
+                        "footprint": {"min_x": 7, "max_x": 9, "min_z": 7, "max_z": 9},
+                    }],
+                },
+            },
+            {
+                "killteam_setup_history": {
+                    "placed_guids": [f"model-{index}" for index in range(5)],
+                    "batch_size": 2,
+                },
+            },
+        )
+
+        self.assertEqual(result["setup_batch"]["batch_target"], 1)
+        self.assertEqual(
+            [item["candidate_id"] for item in result["setup_plan"]["recommended_batch"]],
+            ["setup-model-5-00"],
+        )
+
     def test_setup_ping_returns_reload_verification_payload(self) -> None:
         tts_server = _load_tts_server()
         traces: list[tuple[str, dict]] = []
@@ -1323,8 +2047,9 @@ class KillTeamSetupBoardCommandTests(unittest.TestCase):
         self.assertEqual(result["verification_source"], "fresh")
         self.assertEqual(result["loaded_script_identity"], "Global")
         self.assertEqual(result["bridge_version"], "2026-07-29-setup-placement-v1")
-        self.assertEqual(traces[0][0], "killteam_setup_reload_check")
-        self.assertTrue(traces[0][1]["reload_verified"])
+        reload_traces = [payload for kind, payload in traces if kind == "killteam_setup_reload_check"]
+        self.assertEqual(len(reload_traces), 1)
+        self.assertTrue(reload_traces[0]["reload_verified"])
 
     def test_setup_ping_fails_closed_on_reload_mismatch_and_traces_reason(self) -> None:
         tts_server = _load_tts_server()
@@ -1349,9 +2074,10 @@ class KillTeamSetupBoardCommandTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 asyncio.run(tts_server.tts_killteam_setup_ping())
 
-        self.assertEqual(traces[0][0], "killteam_setup_reload_check")
-        self.assertFalse(traces[0][1]["reload_verified"])
-        self.assertIn("does not match", traces[0][1]["verification_error"])
+        reload_traces = [payload for kind, payload in traces if kind == "killteam_setup_reload_check"]
+        self.assertEqual(len(reload_traces), 1)
+        self.assertFalse(reload_traces[0]["reload_verified"])
+        self.assertIn("does not match", reload_traces[0]["verification_error"])
 
     def test_setup_prose_reply_is_retried_before_placement(self) -> None:
         backend = ChatBackend()
@@ -1359,7 +2085,7 @@ class KillTeamSetupBoardCommandTests(unittest.TestCase):
         backend.kind = "http"
         backend.format = "ollama"
         backend.url = "http://127.0.0.1:11434/api/chat"
-        backend.model = "gemma4:12b"
+        backend.model = "gemma4:26b-a4b-it-qat"
         backend.observation_max_calls = 4
         backend.observation_timeout = 30.0
         backend.controller_provider = lambda: {"active_game": "killteam", "state": "running"}
@@ -1370,13 +2096,31 @@ class KillTeamSetupBoardCommandTests(unittest.TestCase):
             "tts_killteam_setup_ping": lambda args: observation_calls.append(("ping", dict(args))) or {
                 "bridge_version": "2026-07-29-setup-placement-v1",
             },
-            "tts_killteam_setup_list_objects": lambda args: observation_calls.append(("list", dict(args))) or {
+            "tts_killteam_setup_context": lambda args: observation_calls.append(("context", dict(args))) or {
                 "objects": [{
-                    "guid": "model-1",
+                    "guid": "362d46",
                     "name": "Plague Marine Warrior",
                     "tags": ["Operative"],
                     "position": {"x": -1.0, "y": 1.0, "z": 3.0},
                 }],
+                "categories": {"operatives": [{"guid": "362d46"}]},
+                "setup_plan": {
+                    "batch_size": 1,
+                    "recommended_batch": [{
+                        "candidate_id": "setup-362d46-00",
+                        "guid": "362d46",
+                        "source_position": {"x": -1.0, "y": 1.0, "z": 3.0},
+                        "position": {"x": 1.0, "y": 1.0, "z": 3.0},
+                        "footprint": {"min_x": 0.5, "max_x": 1.5, "min_z": 2.5, "max_z": 3.5},
+                    }],
+                    "candidates": [{
+                        "candidate_id": "setup-362d46-00",
+                        "guid": "362d46",
+                        "source_position": {"x": -1.0, "y": 1.0, "z": 3.0},
+                        "position": {"x": 1.0, "y": 1.0, "z": 3.0},
+                        "footprint": {"min_x": 0.5, "max_x": 1.5, "min_z": 2.5, "max_z": 3.5},
+                    }],
+                },
             },
         })
 
@@ -1419,10 +2163,10 @@ class KillTeamSetupBoardCommandTests(unittest.TestCase):
                     },
                 },
                 {
-                    "id": "list-1",
+                    "id": "context-1",
                     "function": {
-                        "name": "tts_killteam_setup_list_objects",
-                        "arguments": "{\"max_results\":5,\"compact\":true}",
+                        "name": "tts_killteam_setup_context",
+                        "arguments": "{\"max_results\":50}",
                     },
                 },
             ]}},
@@ -1435,7 +2179,7 @@ class KillTeamSetupBoardCommandTests(unittest.TestCase):
         ):
             result = backend.complete({"message": "KILLTEAM_AUTORUN_SETUP"})
 
-        self.assertEqual([name for name, _args in observation_calls], ["ping", "list"])
+        self.assertEqual([name for name, _args in observation_calls], ["ping", "context"])
         self.assertIn("ai_setup_retry_requested", traces)
         self.assertIn("ai_commands_processed", traces)
         self.assertEqual(result["parsed_commands"], [
@@ -1444,6 +2188,325 @@ class KillTeamSetupBoardCommandTests(unittest.TestCase):
         self.assertEqual(result["execution"]["executed"][0]["status"], "executed")
         self.assertEqual(result["execution"]["executed"][0]["action"], "killteam_setup_place_model")
         self.assertEqual(backend.command_execution.calls[0][0][0].action, "killteam_setup_place_model")
+
+    def test_setup_prose_reply_after_observation_budget_exhaustion_uses_move_prompt(self) -> None:
+        backend = ChatBackend()
+        backend.enabled = True
+        backend.kind = "http"
+        backend.format = "ollama"
+        backend.url = "http://127.0.0.1:11434/api/chat"
+        backend.model = "gemma4:26b-a4b-it-qat"
+        backend.observation_max_calls = 1
+        backend.observation_timeout = 30.0
+        backend.controller_provider = lambda: {"active_game": "killteam", "state": "running"}
+
+        observation_calls: list[tuple[str, dict]] = []
+        backend.configure_observation_tools({
+            "tts_killteam_setup_ping": lambda args: observation_calls.append(("ping", dict(args))) or {
+                "bridge_version": "2026-07-29-setup-placement-v1",
+            },
+        })
+
+        class Executor:
+            def __init__(self) -> None:
+                self.calls: list[tuple[list, dict]] = []
+
+            def execute(self, commands, **kwargs):
+                self.calls.append((list(commands), dict(kwargs)))
+                command = commands[0]
+                return {
+                    "executed": [{
+                        "action": command.action,
+                        "status": "executed",
+                        "result": {
+                            "status": "verified",
+                            "guid": command.args["guid"],
+                            "position": {
+                                "x": float(command.args["x"]),
+                                "y": float(command.args["y"]),
+                                "z": float(command.args["z"]),
+                            },
+                        },
+                    }],
+                    "approval_required": [],
+                    "blocked": [],
+                    "stopped": False,
+                }
+
+        backend.command_execution = Executor()
+        traces: list[str] = []
+        requests: list[dict[str, Any]] = []
+        responses = iter([
+            {"message": {"role": "assistant", "tool_calls": [{
+                "id": "ping-1",
+                "function": {
+                    "name": "tts_killteam_setup_ping",
+                    "arguments": "{}",
+                },
+            }]}},
+            {"message": {"role": "assistant", "content": "I need more information to determine the correct placement for this turn."}},
+            {"message": {"role": "assistant", "content": "MOVE[362d46, 1, 1, 3]"}},
+        ])
+
+        def fake_http_request(payload, messages, include_tools=True, setup_turn=False):
+            requests.append({
+                "include_tools": include_tools,
+                "setup_turn": setup_turn,
+                "messages": copy.deepcopy(messages),
+            })
+            return next(responses)
+
+        with (
+            patch("tts_mcp.app.http_gateway._record_trace", side_effect=lambda kind, **payload: traces.append(kind)),
+            patch.object(backend, "_http_request", side_effect=fake_http_request),
+        ):
+            result = backend.complete({"message": "KILLTEAM_AUTORUN_SETUP"})
+
+        self.assertEqual([name for name, _args in observation_calls], ["ping"])
+        self.assertIn("ai_setup_retry_requested", traces)
+        self.assertIn("ai_commands_processed", traces)
+        self.assertEqual(len(requests), 3)
+        self.assertFalse(requests[1]["include_tools"])
+        self.assertIn("The setup observation budget is exhausted", json.dumps(requests[1]["messages"]))
+        self.assertNotIn("please provide further instructions", json.dumps(requests[1]["messages"]).lower())
+
+    def test_setup_placeholder_move_does_not_call_full_setup_planner(self) -> None:
+        backend = ChatBackend()
+        backend.enabled = True
+        backend.kind = "http"
+        backend.format = "ollama"
+        backend.url = "http://127.0.0.1:11434/api/chat"
+        backend.model = "gemma4:26b-a4b-it-qat"
+        backend.observation_max_calls = 4
+        backend.observation_timeout = 30.0
+        backend.controller_provider = lambda: {
+            "active_game": "killteam",
+            "state": "running",
+            "killteam_setup_history": {"placements": []},
+        }
+
+        plan_calls: list[dict] = []
+        backend.configure_observation_tools({
+            "tts_killteam_plan_setup_board": lambda args: plan_calls.append(dict(args)) or {
+                "placements": [{
+                    "model_guid": "96fe20",
+                    "target_position": {"x": -32.25, "y": 6.0, "z": -10.25},
+                }],
+            },
+        })
+
+        class Executor:
+            def __init__(self) -> None:
+                self.calls: list[tuple[list, dict]] = []
+
+            def execute(self, commands, **kwargs):
+                self.calls.append((list(commands), dict(kwargs)))
+                command = commands[0]
+                return {
+                    "executed": [{
+                        "action": command.action,
+                        "status": "executed",
+                        "result": {
+                            "status": "verified",
+                            "guid": command.args["guid"],
+                            "position": {
+                                "x": float(command.args["x"]),
+                                "y": float(command.args["y"]),
+                                "z": float(command.args["z"]),
+                            },
+                        },
+                    }],
+                    "approval_required": [],
+                    "blocked": [],
+                    "stopped": False,
+                }
+
+        backend.command_execution = Executor()
+        traces: list[str] = []
+        responses = [
+            {"message": {"role": "assistant", "content": "I have the evidence I need."}},
+            {"message": {"role": "assistant", "content": "MOVE[96fe20,x,y,z]"}},
+        ]
+
+        with (
+            patch("tts_mcp.app.http_gateway._record_trace", side_effect=lambda kind, **payload: traces.append(kind)),
+            patch.object(backend, "_http_request", side_effect=responses),
+        ):
+            result = backend.complete({"message": "KILLTEAM_AUTORUN_SETUP"})
+
+        self.assertNotIn("ai_setup_placeholder_resolved", traces)
+        self.assertEqual(plan_calls, [])
+        self.assertIn("rejected", result["text"].lower())
+        self.assertNotIn("further instructions", result["text"].lower())
+        self.assertEqual(backend.command_execution.calls, [])
+
+    def test_setup_prose_reply_exhausts_retry_budget_without_asking_for_more_instructions(self) -> None:
+        backend = ChatBackend()
+        backend.enabled = True
+        backend.kind = "http"
+        backend.format = "ollama"
+        backend.url = "http://127.0.0.1:11434/api/chat"
+        backend.model = "gemma4:26b-a4b-it-qat"
+        backend.observation_max_calls = 4
+        backend.observation_timeout = 30.0
+        backend.controller_provider = lambda: {"active_game": "killteam", "state": "running"}
+
+        requests: list[dict[str, Any]] = []
+        responses = [
+            {"message": {"role": "assistant", "content": "I need more information."}},
+            {"message": {"role": "assistant", "content": "I need more information."}},
+            {"message": {"role": "assistant", "content": "I need more information."}},
+            {"message": {"role": "assistant", "content": "I need more information."}},
+        ]
+
+        def fake_http_request(payload, messages, include_tools=True, setup_turn=False):
+            requests.append({
+                "include_tools": include_tools,
+                "setup_turn": setup_turn,
+                "messages": copy.deepcopy(messages),
+            })
+            return responses.pop(0)
+
+        with patch.object(backend, "_http_request", side_effect=fake_http_request):
+            result = backend.complete({"message": "KILLTEAM_AUTORUN_SETUP"})
+
+        self.assertEqual(len(requests), 4)
+        self.assertEqual(result["text"], "I could not complete the setup automatically.")
+        self.assertNotIn("instructions", result["text"].lower())
+        for request in requests[1:]:
+            self.assertNotIn("please provide further instructions", json.dumps(request["messages"]).lower())
+
+    def test_complete_start_fresh_runs_killteam_autorun_setup(self) -> None:
+        backend = ChatBackend()
+        payload = {"message": "!ai start fresh killteam", "conversation_id": "fresh-test"}
+        controller_result = {
+            "text": "[AI] Autonomous play started fresh for killteam as Player 2/Blue.",
+            "commands": [],
+            "fresh_start": True,
+            "selected_game": "killteam",
+            "autostart_setup": True,
+        }
+        setup_result = {
+            "text": "Setup underway.",
+            "commands": [],
+            "execution": {"status": "running"},
+        }
+
+        with (
+            patch.object(backend, "reset", return_value="fresh-test") as reset,
+            patch.object(backend, "complete", return_value=setup_result) as complete,
+        ):
+            result = backend.complete_start_fresh(payload, controller_result)
+
+        reset.assert_called_once_with("fresh-test")
+        complete.assert_called_once()
+        self.assertEqual(complete.call_args.args[0]["message"], "KILLTEAM_AUTORUN_SETUP")
+        self.assertEqual(result["text"], "Setup underway.")
+        self.assertTrue(result["startup"]["fresh_start"])
+        self.assertEqual(result["startup"]["controller"]["selected_game"], "killteam")
+
+    def test_setup_empty_reply_does_not_call_full_setup_planner(self) -> None:
+        backend = ChatBackend()
+        backend.enabled = True
+        backend.kind = "http"
+        backend.format = "ollama"
+        backend.url = "http://127.0.0.1:11434/api/chat"
+        backend.model = "gemma4:26b-a4b-it-qat"
+        backend.observation_max_calls = 4
+        backend.observation_timeout = 30.0
+        backend.controller_provider = lambda: {
+            "active_game": "killteam",
+            "state": "running",
+            "killteam_setup_history": {"placements": []},
+        }
+
+        plan_calls: list[dict] = []
+        backend.configure_observation_tools({
+            "tts_killteam_plan_setup_board": lambda args: plan_calls.append(dict(args)) or {
+                "placements": [{
+                    "model_guid": "96fe20",
+                    "target_position": {"x": -32.25, "y": 6.0, "z": -10.25},
+                }],
+            },
+        })
+
+        class Executor:
+            def __init__(self) -> None:
+                self.calls: list[tuple[list, dict]] = []
+
+            def execute(self, commands, **kwargs):
+                self.calls.append((list(commands), dict(kwargs)))
+                command = commands[0]
+                return {
+                    "executed": [{
+                        "action": command.action,
+                        "status": "executed",
+                        "result": {
+                            "status": "verified",
+                            "guid": command.args["guid"],
+                            "position": {
+                                "x": float(command.args["x"]),
+                                "y": float(command.args["y"]),
+                                "z": float(command.args["z"]),
+                            },
+                        },
+                    }],
+                    "approval_required": [],
+                    "blocked": [],
+                    "stopped": False,
+                }
+
+        backend.command_execution = Executor()
+        traces: list[str] = []
+        responses = [
+            {"message": {"role": "assistant", "content": ""}},
+            {"message": {"role": "assistant", "content": "I could not produce a placement."}},
+        ]
+
+        with (
+            patch("tts_mcp.app.http_gateway._record_trace", side_effect=lambda kind, **payload: traces.append(kind)),
+            patch.object(backend, "_http_request", side_effect=responses),
+        ):
+            result = backend.complete({"message": "KILLTEAM_AUTORUN_SETUP"})
+
+        self.assertNotIn("ai_setup_placeholder_resolved", traces)
+        self.assertEqual(plan_calls, [])
+        self.assertIn("rejected", result["text"].lower())
+        self.assertEqual(backend.command_execution.calls, [])
+
+    def test_setup_autorun_is_not_routed_to_runtime_macro(self) -> None:
+        calls: list[tuple[str, dict]] = []
+        backend = ChatBackend()
+        backend.configure_gameplay(
+            controller_provider=lambda: {
+                "active_game": "killteam",
+                "state": "running",
+            },
+            request=lambda action, args: calls.append((action, args)) or {
+                "executed": [{
+                    "action": "killteam_autorun_setup",
+                    "status": "executed",
+                    "result": {
+                        "final_state": {
+                            "stage": "deployment",
+                            "current_side": "ai",
+                        },
+                        "steps": [{"action": "tts_killteam_observe", "status": "executed"}],
+                    },
+                }],
+                "approval_required": [],
+                "stopped": False,
+            },
+            propose=lambda _proposal: "unused",
+        )
+
+        result = backend.handle_killteam_setup_board_command(
+            "KILLTEAM_AUTORUN_SETUP",
+            is_host=False,
+        )
+
+        self.assertEqual(calls, [])
+        self.assertIsNone(result)
 
     def test_plan_command_requests_runtime_plan(self) -> None:
         calls = []

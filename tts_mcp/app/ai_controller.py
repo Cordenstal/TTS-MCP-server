@@ -85,13 +85,79 @@ class AIController:
             "session_id": self.conversation_id(),
             "active_game": self.state.active_game,
             "placements": [],
+            "pending_placements": [],
         }
+
+    @staticmethod
+    def _normalize_setup_history(history: dict[str, Any]) -> dict[str, Any]:
+        """Collapse legacy duplicate placement records without losing progress."""
+        normalized = copy.deepcopy(history)
+        placements = normalized.get("placements")
+        if not isinstance(placements, list):
+            placements = []
+        by_guid: dict[str, dict[str, Any]] = {}
+        for item in placements:
+            if not isinstance(item, dict):
+                continue
+            guid = str(item.get("guid") or item.get("model_guid") or "").strip()
+            if not guid:
+                continue
+            item = copy.deepcopy(item)
+            item["guid"] = guid
+            key = guid.casefold()
+            by_guid.pop(key, None)
+            by_guid[key] = item
+        normalized["placements"] = list(by_guid.values())
+
+        ordered_guids: list[str] = []
+        seen_guids: set[str] = set()
+        existing_guids = normalized.get("placed_guids")
+        if isinstance(existing_guids, list):
+            for value in existing_guids:
+                guid = str(value).strip()
+                if guid and guid.casefold() not in seen_guids:
+                    ordered_guids.append(guid)
+                    seen_guids.add(guid.casefold())
+        for item in normalized["placements"]:
+            guid = str(item.get("guid", "")).strip()
+            if guid and guid.casefold() not in seen_guids:
+                ordered_guids.append(guid)
+                seen_guids.add(guid.casefold())
+        normalized["placed_guids"] = ordered_guids
+        normalized["placement_count"] = len(normalized["placements"])
+
+        batch_size = normalized.get("batch_size")
+        try:
+            batch_size = int(batch_size)
+        except (TypeError, ValueError):
+            batch_size = 0
+        if batch_size <= 0:
+            for item in normalized["placements"]:
+                try:
+                    candidate_size = int(item.get("batch_size", 0))
+                except (TypeError, ValueError):
+                    candidate_size = 0
+                if candidate_size > 0:
+                    batch_size = candidate_size
+                    break
+        if batch_size > 0:
+            normalized["batch_size"] = batch_size
+            normalized["batch_progress"] = len(normalized["placements"]) % batch_size
+        if normalized["placements"]:
+            normalized["last_placement"] = copy.deepcopy(normalized["placements"][-1])
+        return normalized
 
     def setup_history(self) -> dict[str, Any]:
         """Return the persisted setup history for the active game session."""
         with self._lock:
             history = self.state.setup_history if isinstance(self.state.setup_history, dict) else {}
-            return copy.deepcopy(history) if history else self._empty_setup_history()
+            if not history:
+                return self._empty_setup_history()
+            normalized = self._normalize_setup_history(history)
+            if normalized != history:
+                self.state.setup_history = normalized
+                self._persist()
+            return copy.deepcopy(normalized)
 
     def clear_setup_history(self) -> None:
         with self._lock:
@@ -103,17 +169,61 @@ class AIController:
             history = self.setup_history()
             placements = history.get("placements") if isinstance(history.get("placements"), list) else []
             placements = [copy.deepcopy(item) for item in placements if isinstance(item, dict)]
+            guid = str(placement.get("guid", "")).strip().lower()
+            if guid:
+                placements = [
+                    item
+                    for item in placements
+                    if str(item.get("guid", "")).strip().lower() != guid
+                ]
             placements.append(copy.deepcopy(placement))
             history["session_id"] = self.conversation_id()
             history["active_game"] = self.state.active_game
             history["placements"] = placements
+            pending = history.get("pending_placements")
+            if isinstance(pending, list) and guid:
+                history["pending_placements"] = [
+                    item
+                    for item in pending
+                    if not isinstance(item, dict)
+                    or str(item.get("guid", "")).strip().lower() != guid
+                ]
             history["placement_count"] = len(placements)
+            batch_sizes = [
+                int(item.get("batch_size"))
+                for item in placements
+                if isinstance(item.get("batch_size"), (int, float)) and int(item.get("batch_size")) > 0
+            ]
+            if batch_sizes:
+                history["batch_size"] = batch_sizes[0]
+                history["batch_progress"] = len(placements) % batch_sizes[0]
             history["placed_guids"] = [
                 str(item.get("guid", "")).strip()
                 for item in placements
                 if str(item.get("guid", "")).strip()
             ]
             history["last_placement"] = copy.deepcopy(placements[-1]) if placements else None
+            self.state.setup_history = history
+            self._persist()
+
+    def record_setup_pending(self, placements: list[dict[str, Any]]) -> None:
+        """Persist setup targets before dispatch so partial commits can be reconciled."""
+        with self._lock:
+            history = self.setup_history()
+            pending = history.get("pending_placements")
+            pending_items = [copy.deepcopy(item) for item in pending if isinstance(item, dict)] if isinstance(pending, list) else []
+            by_guid = {
+                str(item.get("guid", "")).strip().lower(): item
+                for item in pending_items
+                if str(item.get("guid", "")).strip()
+            }
+            for placement in placements:
+                if not isinstance(placement, dict):
+                    continue
+                guid = str(placement.get("guid", "")).strip()
+                if guid:
+                    by_guid[guid.lower()] = copy.deepcopy(placement)
+            history["pending_placements"] = list(by_guid.values())
             self.state.setup_history = history
             self._persist()
 
@@ -274,9 +384,22 @@ class AIController:
                 )
 
             if command == "start":
-                fresh = len(parts) == 3 and parts[2].lower() == "fresh"
-                if len(parts) > 2 and not fresh:
+                fresh = len(parts) >= 3 and parts[2].lower() == "fresh"
+                requested_game = ""
+                if len(parts) == 4 and fresh:
+                    requested_game = parts[3].strip()
+                elif len(parts) > 2 and not fresh:
                     return self._public("[AI] Use !ai start or !ai start fresh.")
+                if requested_game:
+                    game_dir = (self.rules_root / requested_game).resolve()
+                    if game_dir.parent != self.rules_root or not game_dir.is_dir():
+                        response = self._public(
+                            f"[AI] I could not find the rules for '{requested_game}'. "
+                            f"Please create game_rules/{requested_game}/ with an appropriate ruleset."
+                        )
+                        self._audit("game_rules_missing", {"game_name": requested_game})
+                        return response
+                    self.state.active_game = requested_game
                 if not self.state.active_game:
                     return self._public("[AI] Select a game first with !ai game <name>.")
                 if fresh:
@@ -292,10 +415,14 @@ class AIController:
                 self.state.state = "running"
                 self.state.pause_reason = ""
                 self._persist()
-                return self._public(
+                response = self._public(
                     f"[AI] Autonomous play {'started fresh' if fresh else 'started/resumed'} "
                     f"for {self.state.active_game} as Player 2/Blue."
                 )
+                response["fresh_start"] = fresh
+                response["selected_game"] = self.state.active_game
+                response["autostart_setup"] = fresh and self.state.active_game.strip().lower() == "killteam"
+                return response
 
             if command == "pause":
                 self.state.state = "paused"

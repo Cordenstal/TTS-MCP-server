@@ -47,7 +47,7 @@ if not exist "tts_mcp_backend.json" (
     echo Configuring direct Ollama backend...
     set "AI_BACKEND_KIND=http"
     set "AI_BACKEND_URL=http://127.0.0.1:11434/api/chat"
-    set "AI_BACKEND_MODEL=gemma4:12b"
+    set "AI_BACKEND_MODEL=gemma4:26b-a4b-it-qat"
     set "AI_BACKEND_FORMAT=ollama"
     set "AI_BACKEND_TIMEOUT=300"
 )

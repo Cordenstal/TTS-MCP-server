@@ -39,6 +39,27 @@ and `spend_cp`. These actions validate rules and state before translating into
 bounded TTS mutations. Raw GUID-based movement and counter writes remain
 bridge primitives, not the gameplay API.
 
+## Kill Team setup contract
+
+Kill Team setup is already partially implemented, but the public contract is
+still staged. Use the following language consistently:
+
+- `setup` for scene bootstrap and canonical state initialization.
+- `deployment` for alternating roster or model placement turns.
+- `placement planner` for the tactical ranking logic that chooses a legal
+  slot.
+- `setup validation` for the Save 131 smoke-test slice that places the test
+  subject and resolves the defense handoff.
+
+KT-016 through KT-020 finish the remaining contract decisions for board
+context, support height, slot ranking, pass advancement, recovery, and
+regression coverage.
+Until those are settled, treat the current setup behavior as an execution
+surface with documented gaps, not a frozen universal Kill Team setup spec.
+The live setup plan also exposes ranked slot evidence in
+`recommended_position_evidence`, including support height and score metadata
+for the next legal slot.
+
 ## Safety classes
 
 | Class | Examples | Handling |
