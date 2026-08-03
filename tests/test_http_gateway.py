@@ -2326,6 +2326,8 @@ class KillTeamSetupBoardCommandTests(unittest.TestCase):
         responses = [
             {"message": {"role": "assistant", "content": "I have the evidence I need."}},
             {"message": {"role": "assistant", "content": "MOVE[96fe20,x,y,z]"}},
+            {"message": {"role": "assistant", "content": "MOVE[96fe20,x,y,z]"}},
+            {"message": {"role": "assistant", "content": "MOVE[96fe20,x,y,z]"}},
         ]
 
         with (
@@ -2357,6 +2359,7 @@ class KillTeamSetupBoardCommandTests(unittest.TestCase):
             {"message": {"role": "assistant", "content": "I need more information."}},
             {"message": {"role": "assistant", "content": "I need more information."}},
             {"message": {"role": "assistant", "content": "I need more information."}},
+            {"message": {"role": "assistant", "content": "I need more information."}},
         ]
 
         def fake_http_request(payload, messages, include_tools=True, setup_turn=False):
@@ -2371,7 +2374,7 @@ class KillTeamSetupBoardCommandTests(unittest.TestCase):
             result = backend.complete({"message": "KILLTEAM_AUTORUN_SETUP"})
 
         self.assertEqual(len(requests), 4)
-        self.assertEqual(result["text"], "I could not complete the setup automatically.")
+        self.assertIn("rejected", result["text"].lower())
         self.assertNotIn("instructions", result["text"].lower())
         for request in requests[1:]:
             self.assertNotIn("please provide further instructions", json.dumps(request["messages"]).lower())
@@ -2491,6 +2494,8 @@ class KillTeamSetupBoardCommandTests(unittest.TestCase):
         traces: list[str] = []
         responses = [
             {"message": {"role": "assistant", "content": ""}},
+            {"message": {"role": "assistant", "content": "I could not produce a placement."}},
+            {"message": {"role": "assistant", "content": "I could not produce a placement."}},
             {"message": {"role": "assistant", "content": "I could not produce a placement."}},
         ]
 
