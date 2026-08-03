@@ -2405,6 +2405,37 @@ class KillTeamSetupBoardCommandTests(unittest.TestCase):
         self.assertTrue(result["startup"]["fresh_start"])
         self.assertEqual(result["startup"]["controller"]["selected_game"], "killteam")
 
+    def test_complete_begin_killteam_runs_killteam_autorun_setup(self) -> None:
+        backend = ChatBackend()
+        payload = {"message": "!ai begin killteam", "conversation_id": "begin-test"}
+        controller_result = {
+            "text": "[AI] Kill Team startup begun fresh for killteam as Player 2/Blue.",
+            "commands": [],
+            "fresh_start": True,
+            "selected_game": "killteam",
+            "autostart_setup": True,
+            "startup_command": "begin",
+        }
+        setup_result = {
+            "text": "Setup underway.",
+            "commands": [],
+            "execution": {"status": "running"},
+        }
+
+        with (
+            patch.object(backend, "reset", return_value="begin-test") as reset,
+            patch.object(backend, "complete", return_value=setup_result) as complete,
+        ):
+            result = backend.complete_start_fresh(payload, controller_result)
+
+        reset.assert_called_once_with("begin-test")
+        complete.assert_called_once()
+        self.assertEqual(complete.call_args.args[0]["message"], "KILLTEAM_AUTORUN_SETUP")
+        self.assertEqual(result["text"], "Setup underway.")
+        self.assertTrue(result["startup"]["fresh_start"])
+        self.assertEqual(result["startup"]["controller"]["selected_game"], "killteam")
+        self.assertEqual(result["startup"]["controller"]["startup_command"], "begin")
+
     def test_setup_empty_reply_does_not_call_full_setup_planner(self) -> None:
         backend = ChatBackend()
         backend.enabled = True

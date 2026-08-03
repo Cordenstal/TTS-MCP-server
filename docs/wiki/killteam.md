@@ -37,7 +37,9 @@ Starting a game is an explicit setup phase:
    deployment areas, objectives, and calibration markers.
 5. Build the role-filtered initial state and report every ambiguity.
 6. Freeze the initial map model and enable semantic gameplay only after setup
-   succeeds.
+   succeeds. When the last legal deployment completes, the runtime hands off
+   into the `command` phase so tactical turns can begin without manual state
+   edits.
 
 Canonical runtime metadata uses the versioned `tts_mcp:` vocabulary, but a
 supported save does not need to be rewritten to contain those tags. A Python
@@ -449,8 +451,9 @@ Semantic pregame setup follows this bounded sequence:
    `tts_killteam_reconcile_setup_step` to detect and validate the human models,
    consumes the batch, and then performs one new AI placement turn.
    Reconciliation is never used to place AI models. For a brand-new game, use
-   `!ai start fresh killteam` to clear controller history, select Kill Team if
-   needed, and immediately enter this autorun setup path.
+   `!ai begin killteam` to clear controller history, select Kill Team if
+   needed, and immediately enter this autorun setup path. `!ai start fresh
+   killteam` remains a compatibility alias.
 6. The AI setup planner derives its play style from faction tags. Teams with
    aggressive melee or pressure tags prefer objective pressure and forward
    lanes; ranged or precision-oriented factions prefer cover and standoff

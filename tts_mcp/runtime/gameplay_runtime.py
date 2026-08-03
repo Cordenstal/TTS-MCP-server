@@ -354,7 +354,7 @@ class GamePromptBuilder:
                     if recent:
                         sections.append(
                             "Persisted Kill Team setup memory for this session. "
-                            "Clear it with !ai start fresh before starting a new setup pass:\n"
+                            "Clear it with !ai begin killteam or !ai start fresh before starting a new setup pass:\n"
                             + "\n".join(recent)
                         )
         if selected_game.lower() == "checkers":
@@ -423,6 +423,7 @@ class GamePromptBuilder:
                 "or place a human model. Stop after that verified batch; if more AI models remain, wait for a new "
                 "KILLTEAM_AUTORUN_SETUP request. The runtime "
                 "only validates and executes your selected GUID and coordinates.\n"
+                "For a fresh top-to-bottom Kill Team test run from chat, prefer `!ai begin killteam`; it clears the controller session, selects Kill Team, and launches the full startup chain. `!ai start fresh killteam` remains a compatibility alias.\n"
                 "Use MOVE[guid,target_x,target_y,target_z] for the live figurine move. The GUID must identify the figurine you are placing, not the roster-card operative ID; for setup deployment, set target_y from the terrain-adjusted placement logic so the model rests on top of the terrain rather than preserving the live y coordinate. "
                 "For the dedicated placement-only setup bridge, use tts_killteam_setup_ping and tts_killteam_setup_context to resolve the live model and tactical candidates, then use "
                 "SETUP_MOVE[candidate_id] for exact setup placement."

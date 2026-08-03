@@ -5,6 +5,7 @@ Simulator game through TTS's External Editor API.
 
 The living project wiki is in [docs/wiki](docs/wiki/README.md). Start with the
 [roadmap](docs/wiki/roadmap.md) for implementation order and ongoing goals.
+The repo command index lives at [COMMANDS.md](COMMANDS.md).
 
 ## Architecture
 
@@ -257,6 +258,9 @@ needed. For chat-driven setup, the AI performs the tactical model selection and
 one-at-a-time placement reasoning from the live placement-bridge observation.
 The runtime validates and executes only the AI's selected GUID and coordinates.
 For the AI-owned Kill Team setup pass, the gateway accepts `KILLTEAM_AUTORUN_SETUP`.
+The preferred master chat launcher is `!ai begin killteam`; it clears the
+controller state, selects Kill Team if needed, and immediately starts that
+autorun setup path. `!ai start fresh killteam` remains a compatibility alias.
 The message is forwarded to the AI as a setup request. The AI owns every
 AI-side model selection and placement; the human only places human models. The
 AI observes the live models and terrain, selects one model and one tactical
@@ -362,7 +366,7 @@ $env:AI_BACKEND_MODEL = "your-model-name"
 ```
 
 The gateway also handles host-only controls in in-game chat: `!ai game <name>`,
-`!ai start`, `!ai start fresh`, `!ai pause`, `!ai resume`, `!ai stop`,
+`!ai begin killteam`, `!ai start`, `!ai start fresh`, `!ai pause`, `!ai resume`, `!ai stop`,
 `!ai status`, `!ai approve ACTION_ID`, and `!ai reject ACTION_ID`. Controls
 use TTS's built-in host identity and persist controller state in SQLite.
 Approval IDs are six-character uppercase alphanumeric codes using only

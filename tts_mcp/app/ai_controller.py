@@ -297,6 +297,7 @@ class AIController:
 
     def _is_host_command(self, command: str) -> bool:
         return command in {
+            "begin",
             "game",
             "start",
             "pause",
@@ -306,6 +307,46 @@ class AIController:
             "approve",
             "reject",
         }
+
+    def _game_rules_available(self, game_name: str) -> bool:
+        game_dir = (self.rules_root / game_name).resolve()
+        return game_dir.parent == self.rules_root and game_dir.is_dir()
+
+    def _start_fresh_game(
+        self,
+        game_name: str,
+        *,
+        command_name: str,
+        validate_rules: bool = True,
+    ) -> dict[str, Any]:
+        if validate_rules and not self._game_rules_available(game_name):
+            response = self._public(
+                f"[AI] I could not find the rules for '{game_name}'. "
+                f"Please create game_rules/{game_name}/ with an appropriate ruleset."
+            )
+            self._audit("game_rules_missing", {"game_name": game_name, "command": command_name})
+            return response
+        self.state.active_game = game_name
+        self.state.current_turn = "unknown"
+        self.state.pending_approvals.clear()
+        self.state.game_position = None
+        self.state.draw_offer_by = ""
+        self.state.draw_agreed = False
+        self.state.setup_history = self._empty_setup_history()
+        self.state.state = "running"
+        self.state.pause_reason = ""
+        self._persist()
+        self._audit("session_start_fresh", {"game_name": game_name, "command": command_name})
+        if command_name == "begin":
+            text = f"[AI] Kill Team startup begun fresh for {game_name} as Player 2/Blue."
+        else:
+            text = f"[AI] Autonomous play started fresh for {game_name} as Player 2/Blue."
+        response = self._public(text)
+        response["fresh_start"] = True
+        response["selected_game"] = game_name
+        response["autostart_setup"] = game_name.strip().lower() == "killteam"
+        response["startup_command"] = command_name
+        return response
 
     def handle_draw_message(self, message: str, *, player_identity: str) -> dict[str, Any] | None:
         """Handle only explicit, player-addressed mutual draw controls."""
@@ -346,7 +387,7 @@ class AIController:
         if len(parts) == 3 and parts[1].lower() == "fresh" and parts[2].lower() == "start":
             parts = [parts[0], "start", "fresh"]
         if len(parts) == 1:
-            return self._public("[AI] Available controls: !ai game, start, pause, resume, stop, status.")
+            return self._public("[AI] Available controls: !ai begin killteam, game, start, pause, resume, stop, status.")
 
         command = parts[1].lower()
         with self._lock:
@@ -362,8 +403,7 @@ class AIController:
                 if len(parts) != 3 or not parts[2].strip():
                     return self._public("[AI] Use !ai game <name>.")
                 game_name = parts[2].strip()
-                game_dir = (self.rules_root / game_name).resolve()
-                if game_dir.parent != self.rules_root or not game_dir.is_dir():
+                if not self._game_rules_available(game_name):
                     response = self._public(
                         f"[AI] I could not find the rules for '{game_name}'. "
                         f"Please create game_rules/{game_name}/ with an appropriate ruleset."
@@ -383,6 +423,11 @@ class AIController:
                     f"[AI] Selected game '{game_name}'. Host must issue !ai start to enable play."
                 )
 
+            if command == "begin":
+                if len(parts) != 3 or parts[2].strip().lower() != "killteam":
+                    return self._public("[AI] Use !ai begin killteam.")
+                return self._start_fresh_game("killteam", command_name="begin", validate_rules=True)
+
             if command == "start":
                 fresh = len(parts) >= 3 and parts[2].lower() == "fresh"
                 requested_game = ""
@@ -391,8 +436,7 @@ class AIController:
                 elif len(parts) > 2 and not fresh:
                     return self._public("[AI] Use !ai start or !ai start fresh.")
                 if requested_game:
-                    game_dir = (self.rules_root / requested_game).resolve()
-                    if game_dir.parent != self.rules_root or not game_dir.is_dir():
+                    if not self._game_rules_available(requested_game):
                         response = self._public(
                             f"[AI] I could not find the rules for '{requested_game}'. "
                             f"Please create game_rules/{requested_game}/ with an appropriate ruleset."
@@ -403,25 +447,21 @@ class AIController:
                 if not self.state.active_game:
                     return self._public("[AI] Select a game first with !ai game <name>.")
                 if fresh:
-                    self.state.current_turn = "unknown"
-                    self.state.pending_approvals.clear()
-                    self.state.game_position = None
-                    self.state.draw_offer_by = ""
-                    self.state.draw_agreed = False
-                    self.state.setup_history = self._empty_setup_history()
-                    self._audit("session_start_fresh", {})
-                else:
-                    self._audit("session_resumed", {})
+                    return self._start_fresh_game(
+                        self.state.active_game,
+                        command_name="start",
+                        validate_rules=bool(requested_game),
+                    )
+                self._audit("session_resumed", {})
                 self.state.state = "running"
                 self.state.pause_reason = ""
                 self._persist()
                 response = self._public(
-                    f"[AI] Autonomous play {'started fresh' if fresh else 'started/resumed'} "
-                    f"for {self.state.active_game} as Player 2/Blue."
+                    f"[AI] Autonomous play started/resumed for {self.state.active_game} as Player 2/Blue."
                 )
-                response["fresh_start"] = fresh
+                response["fresh_start"] = False
                 response["selected_game"] = self.state.active_game
-                response["autostart_setup"] = fresh and self.state.active_game.strip().lower() == "killteam"
+                response["autostart_setup"] = False
                 return response
 
             if command == "pause":

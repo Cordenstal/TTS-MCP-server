@@ -3453,6 +3453,7 @@ class KillTeamRuntime:
         return str(dice[0])
 
     def _setup_update_turn_after_success(self, setup_state: dict[str, Any], side: dict[str, Any]) -> None:
+        state = self._require_state()
         side["pending_operative_id"] = None
         setup_state["pending_side"] = None
         setup_state["pending_operative_id"] = None
@@ -3468,6 +3469,9 @@ class KillTeamRuntime:
             setup_state["current_side"] = None
             setup_state["current_batch_target"] = 0
             setup_state["current_batch_progress"] = 0
+            state["phase"] = "command"
+            state["turn_status"] = "waiting"
+            state["turn_owner"] = setup_state.get("initiative_side") or state.get("turn_owner", "")
             return
 
         side_remaining = len(side["selected_operatives"]) - len(side["deployed_operatives"])
@@ -3489,6 +3493,9 @@ class KillTeamRuntime:
             setup_state["current_side"] = None
             setup_state["current_batch_target"] = 0
             setup_state["current_batch_progress"] = 0
+            state["phase"] = "command"
+            state["turn_status"] = "waiting"
+            state["turn_owner"] = setup_state.get("initiative_side") or state.get("turn_owner", "")
             return
         next_state = setup_state["sides"][next_side]
         remaining = len(next_state["selected_operatives"]) - len(next_state["deployed_operatives"])

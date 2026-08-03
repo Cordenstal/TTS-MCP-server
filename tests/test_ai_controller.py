@@ -103,6 +103,26 @@ class AIControllerTests(unittest.TestCase):
             self.assertEqual(controller.state.state, "running")
             self.assertEqual(controller.setup_history()["placements"], [])
 
+    def test_begin_killteam_starts_fresh_and_requests_autorun_setup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            rules_root = Path(directory) / "rules"
+            (rules_root / "killteam").mkdir(parents=True)
+            controller = AIController(
+                rules_root,
+                SessionStore(Path(directory) / "state.sqlite3"),
+            )
+
+            response = controller.handle("!ai begin killteam", is_host=True)
+
+            self.assertIsNotNone(response)
+            self.assertIn("Kill Team startup begun fresh", response["text"])
+            self.assertEqual(response["selected_game"], "killteam")
+            self.assertEqual(response["startup_command"], "begin")
+            self.assertTrue(response["autostart_setup"])
+            self.assertEqual(controller.state.active_game, "killteam")
+            self.assertEqual(controller.state.state, "running")
+            self.assertEqual(controller.setup_history()["placements"], [])
+
 
 class DrawAgreementTests(unittest.TestCase):
     def controller(self) -> AIController:

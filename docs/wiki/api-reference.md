@@ -99,10 +99,11 @@ Each AI setup turn resolves a fixed `ceil(N/3)` batch of live models, emits one
 The setup path also supports `KILLTEAM_SELECT_SETUP[card_guid]` for bounded
 non-operative setup-card selection when the AI is choosing equipment, ploys,
 or tactical-op cards before deployment.
-For a brand-new Kill Team game, `!ai start fresh killteam` clears the controller
+For a brand-new Kill Team game, `!ai begin killteam` clears the controller
 state, selects Kill Team if needed, and immediately triggers that autorun
-setup path. If Kill Team is already the active game, `!ai start fresh` performs
-the same fresh-start reset.
+setup path. `!ai start fresh killteam` remains a compatibility alias. If Kill
+Team is already the active game, `!ai start fresh` performs the same fresh-start
+reset.
 The gateway filters persisted placed GUIDs from each live context and refills
 an undersized `recommended_batch` from the bridge-provided candidate pool,
 preserving distinct models and non-overlapping footprints. The final turn uses

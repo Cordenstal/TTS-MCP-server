@@ -1434,6 +1434,113 @@ class KillTeamRuntimeTests(unittest.TestCase):
         self.assertEqual(observation["setup"]["current_batch_target"], 2)
         self.assertEqual(observation["setup"]["current_batch_progress"], 0)
 
+    def test_full_roster_setup_hands_off_to_command_phase_and_allows_a_turning_point(self):
+        runtime, bridge = self._runtime_with_roster_setup()
+        runtime.setup()
+
+        setup = runtime.observe()["setup"]
+        for entry in setup["ai_plan"]["selection_order"]:
+            runtime.select_roster_card(entry["card_guid"])
+
+        opponent_card_guids = (
+            "card-op-chosen-1",
+            "card-op-warrior-1",
+            "card-op-warrior-2",
+            "card-op-butcher-1",
+            "card-op-balefire-1",
+            "card-op-icon-1",
+        )
+        for index, contained_guid in enumerate(opponent_card_guids):
+            bridge.take_from_container(
+                "deck-op",
+                item_guid=contained_guid,
+                position={
+                    "x": 18.0 + (index % 3),
+                    "y": 1.0,
+                    "z": -12.0 + (index // 3),
+                },
+            )
+
+        locked = runtime.lock_rosters()
+        self.assertEqual(locked["setup"]["stage"], "deployment")
+        self.assertEqual(locked["setup"]["current_side"], "ai")
+
+        ai_order = [entry["operative_id"] for entry in locked["setup"]["ai_plan"]["deployment_order"]]
+        ai_positions = [
+            {"x": -20.0, "y": 1.0, "z": 6.0},
+            {"x": -17.5, "y": 1.0, "z": 6.0},
+            {"x": -15.0, "y": 1.0, "z": 6.0},
+            {"x": -20.0, "y": 1.0, "z": 8.0},
+            {"x": -17.5, "y": 1.0, "z": 8.0},
+            {"x": -15.0, "y": 1.0, "z": 8.0},
+        ]
+        opponent_model_guids = [
+            "model-op-chosen-1",
+            "model-op-warrior-1",
+            "model-op-warrior-2",
+            "model-op-butcher-1",
+            "model-op-balefire-1",
+            "model-op-icon-1",
+        ]
+        opponent_positions = [
+            {"x": 16.0, "y": 1.0, "z": 5.0},
+            {"x": 18.0, "y": 1.0, "z": 5.0},
+            {"x": 20.0, "y": 1.0, "z": 5.0},
+            {"x": 16.0, "y": 1.0, "z": 7.0},
+            {"x": 18.0, "y": 1.0, "z": 7.0},
+            {"x": 20.0, "y": 1.0, "z": 7.0},
+        ]
+
+        batch_size = int(locked["setup"]["sides"]["ai"]["batch_size"])
+        for batch_start in range(0, len(ai_order), batch_size):
+            for position, operative_id in zip(
+                ai_positions[batch_start:batch_start + batch_size],
+                ai_order[batch_start:batch_start + batch_size],
+            ):
+                started = runtime.start_setup_deployment(operative_id)
+                self.assertEqual(started["status"], "pending_model")
+                deployed = runtime.deploy_setup_operative(
+                    started["model_guid"],
+                    position,
+                )
+                self.assertEqual(deployed["status"], "deployed")
+
+            if runtime.observe()["setup"]["stage"] == "complete":
+                break
+
+            for model_guid, position in zip(
+                opponent_model_guids[batch_start:batch_start + batch_size],
+                opponent_positions[batch_start:batch_start + batch_size],
+            ):
+                bridge.take_from_container(
+                    "roster-op",
+                    item_guid=model_guid,
+                    position=position,
+                )
+
+            result = runtime.reconcile_setup_step("opponent")
+            self.assertEqual(result["status"], "deployed")
+
+        observation = runtime.observe()
+        self.assertEqual(observation["setup"]["stage"], "complete")
+        self.assertEqual(observation["phase"], "command")
+        self.assertIsNone(observation["setup"]["current_side"])
+
+        turn = runtime.take_tactical_turn(trigger="Your turn")
+        after_turn = runtime.observe()
+        self.assertEqual(turn["status"], "passed")
+        self.assertTrue(any(action["action"] in {"move_operative", "shoot"} for action in turn["actions"]))
+        self.assertEqual(after_turn["turn_owner"], "opponent")
+        self.assertEqual(after_turn["turn_sequence"], 1)
+        self.assertEqual(after_turn["phase"], "command")
+
+        turning_point = runtime.advance_turning_point()
+        final_observation = runtime.observe()
+        self.assertEqual(turning_point["turning_point"], 2)
+        self.assertEqual(turning_point["phase"], "command")
+        self.assertEqual(final_observation["turning_point"], 2)
+        self.assertEqual(final_observation["counters"]["cp"]["value"], 3)
+
     def test_deploy_setup_operative_adjusts_y_for_elevated_terrain(self):
         objects, containers = setup_fixture_with_rosters()
         objects.append(

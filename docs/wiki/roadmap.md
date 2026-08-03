@@ -286,8 +286,9 @@ slice covers operative tokens, equipment, and other non-model fixtures.
 placement-only bridge, not a full-runtime batch macro. The gateway advertises
 only setup ping and compact setup context, and the runtime verifies one
 terrain-aware placement before stopping. The fresh-start launcher for a new
-game is `!ai start fresh killteam`; it selects Kill Team if needed and then
-starts the autorun setup path.
+game is `!ai begin killteam`; it selects Kill Team if needed and then starts
+the autorun setup path. `!ai start fresh killteam` remains a compatibility
+alias.
 
 - `[done]` Define the deployment-context snapshot and occupancy rules that the
   setup planner will trust before it scores any slot. This is the

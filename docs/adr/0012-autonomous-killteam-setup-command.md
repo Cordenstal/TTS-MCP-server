@@ -85,9 +85,11 @@ through it.
 - Setup targets are recorded before dispatch. If TTS commits a placement but
   the request ends during readback, the next live setup context reconciles the
   pending model before selecting another batch.
-- The host lifecycle command `!ai start fresh killteam` starts a brand-new
-  Kill Team game, clears the controller's setup history, and immediately
-  requests `KILLTEAM_AUTORUN_SETUP` so initial setup begins from scratch.
+- The host lifecycle command `!ai begin killteam` starts a brand-new Kill Team
+  game, clears the controller's setup history, and immediately requests
+  `KILLTEAM_AUTORUN_SETUP` so initial setup begins from scratch.
+- `!ai start fresh killteam` remains a compatibility alias for the same full
+  Kill Team startup path.
 - The host lifecycle command `!ai start fresh` still clears the controller's
   setup history for a game that is already selected.
 - Lower-level setup commands remain available for manual control, debugging,
